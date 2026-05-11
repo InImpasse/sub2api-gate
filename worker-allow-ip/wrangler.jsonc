@@ -1,0 +1,37 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "sub2api-allow-ip",
+  "main": "src/index.js",
+  "compatibility_date": "2026-05-08",
+  "workers_dev": false,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "kv_namespaces": [
+    {
+      "binding": "INVITE_STORE",
+      "id": "YOUR_KV_NAMESPACE_ID"
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "api.example.com/allow-ip*",
+      "zone_name": "example.com"
+    }
+  ],
+  "triggers": {
+    "crons": [
+      "17 3 * * *"
+    ]
+  },
+  "vars": {
+    "ALLOWED_HOSTNAMES": "api.example.com",
+    "ACCOUNT_ID": "YOUR_CLOUDFLARE_ACCOUNT_ID",
+    "IP_LIST_ID": "YOUR_CLOUDFLARE_IP_LIST_ID",
+    "TURNSTILE_SITE_KEY": "YOUR_TURNSTILE_SITE_KEY",
+    "ADMIN_USERNAME": "admin",
+    "SUB2API_DEFAULT_BASE_URL": "https://api.example.com/v1",
+    "SUB2API_SYNC_URL": "https://api.example.com/_sub2api-sync/provision"
+  }
+}
