@@ -1,0 +1,17 @@
+.env
+.wrangler/
+.claude/
+node_modules/
+__pycache__/
+*.pyc
+data/
+logs/
+*.bak
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+worker-allow-ip/.wrangler/
+worker-allow-ip/wrangler.local.jsonc
+worker-allow-ip/wrangler.private.jsonc
