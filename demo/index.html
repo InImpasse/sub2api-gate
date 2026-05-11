@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sub2API Stack Demo</title>
+  <style>
+    :root {
+      --bg: #f4efe7;
+      --card: rgba(255, 251, 245, 0.82);
+      --text: #1e1a16;
+      --muted: #6b6258;
+      --line: rgba(30, 26, 22, 0.12);
+      --accent: #0d6b5d;
+      --accent-2: #c96d38;
+      --danger: #b9382f;
+      --shadow: 0 20px 60px rgba(58, 42, 28, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(201, 109, 56, 0.12), transparent 32%),
+        radial-gradient(circle at top right, rgba(13, 107, 93, 0.12), transparent 28%),
+        linear-gradient(180deg, #fbf7f0, var(--bg));
+    }
+    .shell {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 28px 0 56px;
+      display: grid;
+      gap: 20px;
+    }
+    .hero, .panel {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+    .hero {
+      padding: 28px;
+      display: grid;
+      gap: 16px;
+    }
+    .eyebrow {
+      margin: 0;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: clamp(32px, 5vw, 56px); line-height: 1.02; }
+    h2 { font-size: 24px; }
+    h3 { font-size: 16px; }
+    p { line-height: 1.6; color: var(--muted); }
+    .hero-grid, .main-grid, .cards, .admin-grid, .form-grid {
+      display: grid;
+      gap: 16px;
+    }
+    .hero-grid { grid-template-columns: 1.3fr 0.9fr; align-items: start; }
+    .cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .card, .mini-card, .user-card {
+      background: rgba(255,255,255,0.74);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+      display: grid;
+      gap: 8px;
+    }
+    .main-grid { grid-template-columns: 1fr 1fr; }
+    .panel { padding: 22px; display: grid; gap: 18px; }
+    .pillbar { display: flex; flex-wrap: wrap; gap: 8px; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      background: rgba(255,255,255,0.7);
+      font-size: 13px;
+    }
+    .status {
+      border-left: 4px solid var(--accent);
+      padding: 12px 14px;
+      background: rgba(13, 107, 93, 0.08);
+      border-radius: 14px;
+      color: var(--text);
+    }
+    .status.error {
+      border-left-color: var(--danger);
+      background: rgba(185, 56, 47, 0.08);
+    }
+    .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .field { display: grid; gap: 6px; }
+    .span-2 { grid-column: 1 / -1; }
+    label {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    input, textarea, button {
+      font: inherit;
+    }
+    input, textarea {
+      width: 100%;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.9);
+      padding: 12px 14px;
+      color: var(--text);
+      outline: none;
+    }
+    input:focus, textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 4px rgba(13, 107, 93, 0.12);
+    }
+    button {
+      border: 0;
+      border-radius: 14px;
+      padding: 12px 16px;
+      cursor: pointer;
+      background: var(--accent);
+      color: white;
+      font-weight: 700;
+    }
+    button.secondary {
+      background: rgba(30, 26, 22, 0.08);
+      color: var(--text);
+    }
+    button.warn {
+      background: var(--accent-2);
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .admin-grid {
+      grid-template-columns: 0.95fr 1.05fr;
+      align-items: start;
+    }
+    .user-list {
+      display: grid;
+      gap: 12px;
+      max-height: 420px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+    .user-card strong {
+      font-size: 18px;
+    }
+    .user-card small, .hint, code {
+      color: var(--muted);
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      word-break: break-all;
+    }
+    .flow {
+      display: grid;
+      gap: 10px;
+    }
+    .flow-step {
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.72);
+      border: 1px solid var(--line);
+    }
+    .flow-step strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+    @media (max-width: 980px) {
+      .hero-grid, .main-grid, .admin-grid, .cards, .form-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <p class="eyebrow">Frontend-only Demo</p>
+      <div class="hero-grid">
+        <div style="display:grid;gap:14px;">
+          <h1>Explore the stack without deploying any backend.</h1>
+          <p>This demo mimics the public allowlist flow and the Worker admin panel. It is safe to publish as a static page and does not talk to Cloudflare, Sub2API, Redis, or PostgreSQL.</p>
+          <div class="pillbar">
+            <span class="pill">No backend</span>
+            <span class="pill">No secrets</span>
+            <span class="pill">Good for GitHub Pages / Cloudflare Pages later</span>
+          </div>
+        </div>
+        <div class="cards">
+          <article class="card">
+            <h3>Allow-IP flow</h3>
+            <p>Mock a user submitting an invite UUID and IP address for access approval.</p>
+          </article>
+          <article class="card">
+            <h3>Admin validation</h3>
+            <p>Try creating users and see how duplicate username validation works in the UI.</p>
+          </article>
+          <article class="card">
+            <h3>Architecture tour</h3>
+            <p>Read the high-level request flow behind the real production stack.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="main-grid">
+      <section class="panel">
+        <div style="display:grid;gap:8px;">
+          <p class="eyebrow">Demo A</p>
+          <h2>Mock allow-ip request</h2>
+          <p>Simulate the end-user journey. In production this would be handled by the Cloudflare Worker and Turnstile verification.</p>
+        </div>
+        <form id="allowForm" class="form-grid">
+          <div class="field span-2">
+            <label for="invite">Invite UUID / key</label>
+            <input id="invite" value="demo-invite-001" />
+          </div>
+          <div class="field">
+            <label for="clientIp">Client IP</label>
+            <input id="clientIp" value="203.0.113.42" />
+          </div>
+          <div class="field">
+            <label for="network">Stored network</label>
+            <input id="network" value="203.0.113.0/24" />
+          </div>
+          <div class="field span-2">
+            <label for="note">Request note</label>
+            <textarea id="note" rows="3">Developer laptop access request.</textarea>
+          </div>
+          <div class="actions span-2">
+            <button type="submit">Simulate approval</button>
+            <button type="button" class="secondary" id="randomizeIp">Randomize sample IP</button>
+          </div>
+        </form>
+        <div id="allowStatus" class="status">Submit the form to simulate an allowlist write.</div>
+      </section>
+
+      <section class="panel">
+        <div style="display:grid;gap:8px;">
+          <p class="eyebrow">Architecture</p>
+          <h2>How the real stack works</h2>
+          <p>These are the pieces represented by the sanitized repository.</p>
+        </div>
+        <div class="flow">
+          <div class="flow-step">
+            <strong>1. Cloudflare Worker</strong>
+            Handles `/allow-ip`, admin actions, UUID records, and Rules List writes.
+          </div>
+          <div class="flow-step">
+            <strong>2. Origin sync service</strong>
+            Receives signed provisioning requests and updates Sub2API users and API keys.
+          </div>
+          <div class="flow-step">
+            <strong>3. Sub2API runtime</strong>
+            Runs behind Docker Compose with PostgreSQL and Redis.
+          </div>
+          <div class="flow-step">
+            <strong>4. Nginx + WAF</strong>
+            Restricts the API to approved IPs while keeping the allowlist page public.
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <section class="panel">
+      <div style="display:grid;gap:8px;">
+        <p class="eyebrow">Demo B</p>
+        <h2>Mock admin panel</h2>
+        <p>Add or edit users locally in your browser. The username field uses the same normalization idea as the real Worker admin page and rejects duplicates.</p>
+      </div>
+      <section class="admin-grid">
+        <div style="display:grid;gap:16px;">
+          <form id="userForm" class="form-grid">
+            <div class="field">
+              <label for="username">Username</label>
+              <input id="username" maxlength="100" placeholder="alice" required />
+            </div>
+            <div class="field">
+              <label for="email">Email</label>
+              <input id="email" type="email" placeholder="alice@sub2api.local" />
+            </div>
+            <div class="field span-2">
+              <label for="uuid">UUID</label>
+              <input id="uuid" value="123e4567-e89b-12d3-a456-426614174000" required />
+            </div>
+            <div class="field span-2">
+              <label for="remark">Remark</label>
+              <input id="remark" placeholder="Engineering sandbox" />
+            </div>
+            <div class="actions span-2">
+              <button type="submit">Add mock user</button>
+              <button type="button" class="warn" id="loadConflict">Load duplicate example</button>
+            </div>
+          </form>
+          <div id="userStatus" class="status">Try adding a user like <code>alice</code>, then try another variation such as <code>Alice</code> or <code>alice!!</code>.</div>
+        </div>
+        <div class="user-list" id="userList"></div>
+      </section>
+      <p class="hint">Everything here is browser-local only. Refreshing the page resets the demo.</p>
+    </section>
+  </main>
+
+  <script>
+    const demoUsers = [
+      {
+        username: "alice",
+        email: "alice@sub2api.local",
+        uuid: "c1f3d8f0-7d2e-4a67-8e1b-7a3c6b7d1111",
+        remark: "Core team access",
+      },
+      {
+        username: "qa-team",
+        email: "qa-team@sub2api.local",
+        uuid: "2fd53e5e-4b7c-43d2-9b72-5a7a52c72222",
+        remark: "Shared validation account",
+      },
+    ];
+
+    const normalizeUsername = (value) =>
+      String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9._-]+/g, "-")
+        .replace(/^[._-]+|[._-]+$/g, "")
+        .slice(0, 100);
+
+    const userList = document.getElementById("userList");
+    const userStatus = document.getElementById("userStatus");
+    const userForm = document.getElementById("userForm");
+    const usernameInput = document.getElementById("username");
+    const emailInput = document.getElementById("email");
+    const uuidInput = document.getElementById("uuid");
+    const remarkInput = document.getElementById("remark");
+
+    function renderUsers() {
+      userList.innerHTML = demoUsers
+        .map((user) => `
+          <article class="user-card">
+            <strong>${user.username}</strong>
+            <small>${user.email || "No email set"}</small>
+            <code>${user.uuid}</code>
+            <small>${user.remark || "No remark"}</small>
+          </article>
+        `)
+        .join("");
+    }
+
+    function setUserStatus(message, isError = false) {
+      userStatus.textContent = message;
+      userStatus.className = isError ? "status error" : "status";
+    }
+
+    usernameInput.addEventListener("input", () => {
+      usernameInput.value = normalizeUsername(usernameInput.value);
+      usernameInput.setCustomValidity("");
+    });
+
+    userForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const username = normalizeUsername(usernameInput.value);
+      usernameInput.value = username;
+
+      if (!username) {
+        usernameInput.setCustomValidity("Username is required.");
+        usernameInput.reportValidity();
+        setUserStatus("The demo blocked submission because the username is empty.", true);
+        return;
+      }
+
+      const duplicate = demoUsers.some((user) => normalizeUsername(user.username) === username);
+      if (duplicate) {
+        usernameInput.setCustomValidity("Username already exists.");
+        usernameInput.reportValidity();
+        setUserStatus(`The demo blocked "${username}" because a normalized duplicate already exists.`, true);
+        return;
+      }
+
+      const email = emailInput.value.trim() || `${username}@sub2api.local`;
+      demoUsers.unshift({
+        username,
+        email,
+        uuid: uuidInput.value.trim() || crypto.randomUUID(),
+        remark: remarkInput.value.trim(),
+      });
+      userForm.reset();
+      uuidInput.value = crypto.randomUUID();
+      renderUsers();
+      setUserStatus(`Added mock user "${username}". In the real stack this would also provision the matching Sub2API user and API key.`);
+    });
+
+    document.getElementById("loadConflict").addEventListener("click", () => {
+      usernameInput.value = "Alice!!";
+      emailInput.value = "alice2@sub2api.local";
+      uuidInput.value = crypto.randomUUID();
+      remarkInput.value = "Intentional duplicate demo";
+      usernameInput.focus();
+      setUserStatus("The form has been filled with a value that normalizes to an existing username. Submit to see the validation message.");
+    });
+
+    document.getElementById("allowForm").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const invite = document.getElementById("invite").value.trim();
+      const clientIp = document.getElementById("clientIp").value.trim();
+      const network = document.getElementById("network").value.trim();
+      const status = document.getElementById("allowStatus");
+      status.className = "status";
+      status.innerHTML = `Mock approval complete. In production the Worker would validate the request, write <code>${network}</code> for client IP <code>${clientIp}</code>, and associate it with invite <code>${invite}</code>.`;
+    });
+
+    document.getElementById("randomizeIp").addEventListener("click", () => {
+      const octet = Math.floor(Math.random() * 200) + 20;
+      document.getElementById("clientIp").value = `203.0.113.${octet}`;
+      document.getElementById("network").value = "203.0.113.0/24";
+    });
+
+    uuidInput.value = crypto.randomUUID();
+    renderUsers();
+  </script>
+</body>
+</html>
