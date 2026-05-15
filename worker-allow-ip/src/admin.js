@@ -1466,11 +1466,19 @@ function renderInviteRow(invite, csrf, request, env) {
   const groups = invite.records || [];
   const apiConfigs = normalizeApiConfigs(invite.apiConfigs || []);
   const editorId = `api-${invite.uuid}`;
+  const totalIps = groups.reduce((count, group) => count + (group.ips || []).length, 0);
+  const latestGroup = groups[0] || null;
+  const latestPlace = latestGroup ? formatGroupPlace(latestGroup) : "";
   return `
     <article class="panel invite-card">
       <div class="invite-meta">
-        <div>
+        <div class="invite-heading">
           <strong>${escapeHtml(inviteUsername(invite) || invite.uuid)}</strong>
+          <div class="stat-row">
+            <span class="stat-pill">${groups.length} group${groups.length === 1 ? "" : "s"}</span>
+            <span class="stat-pill">${totalIps} IP${totalIps === 1 ? "" : "s"}</span>
+            ${latestPlace ? `<span class="stat-pill">${escapeHtml(latestPlace)}</span>` : ""}
+          </div>
           ${invite.email ? `<small>${escapeHtml(invite.email)}</small>` : ""}
           ${invite.remark ? `<small>${escapeHtml(invite.remark)}</small>` : ""}
         </div>
@@ -1488,7 +1496,7 @@ function renderInviteRow(invite, csrf, request, env) {
             <h3>IP groups</h3>
             <span class="muted">${groups.length} active group${groups.length === 1 ? "" : "s"}</span>
           </div>
-          ${groups.length ? groups.map((group) => renderIpGroup(group, invite.uuid, csrf)).join("") : `<span class="muted">No IP groups yet</span>`}
+          ${groups.length ? groups.map((group, index) => renderIpGroup(group, invite.uuid, csrf, index === 0)).join("") : `<span class="muted">No IP groups yet</span>`}
         </section>
       </div>
     </article>
@@ -1572,25 +1580,45 @@ function renderApiConfigInputRow(config) {
   `;
 }
 
-function renderIpGroup(group, uuid, csrf) {
-  const place = [group.country, group.region, group.city].filter(Boolean).join(" / ") || "Unknown location";
+function renderIpGroup(group, uuid, csrf, isInitiallyOpen = false) {
+  const place = formatGroupPlace(group) || "Unknown location";
   const meta = [group.asOrganization, group.colo, group.geoSource ? `geo: ${group.geoSource}` : ""].filter(Boolean).join(" · ");
   const expiresInDays = daysUntil(group.expiresAt);
+  const ipCount = (group.ips || []).length;
+  const previewItems = (group.ips || []).slice(0, 3);
   return `
-    <div class="ip-group">
-      <div class="ip-group-head">
-        <strong>IP group</strong>
-        <form method="post" action="${ADMIN_PATH}" onsubmit="return confirm('Delete this IP group from the Cloudflare list?')">
-          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
-          <input type="hidden" name="action" value="delete_ip_group" />
-          <input type="hidden" name="uuid" value="${escapeHtml(uuid)}" />
-          <input type="hidden" name="group_id" value="${escapeHtml(group.id)}" />
-          <button class="danger compact" type="submit">Delete group</button>
-        </form>
-      </div>
-      <div class="time-grid">
-        <span><b>Added</b>${escapeHtml(formatDate(group.addedAt) || "Unknown")}</span>
-        ${group.updatedAt ? `<span><b>Updated</b>${escapeHtml(formatDate(group.updatedAt))}</span>` : ""}
+    <details class="ip-group"${isInitiallyOpen ? " open" : ""}>
+      <summary class="ip-group-summary">
+        <div class="ip-group-summary-main">
+          <strong>${escapeHtml(place)}</strong>
+          <div class="stat-row">
+            <span class="stat-pill">${ipCount} IP${ipCount === 1 ? "" : "s"}</span>
+            <span class="stat-pill">${escapeHtml(expiresInDays)} day${Number(expiresInDays) === 1 ? "" : "s"} left</span>
+            ${group.colo ? `<span class="stat-pill">${escapeHtml(group.colo)}</span>` : ""}
+          </div>
+          <small>${escapeHtml(formatDate(group.addedAt) || "Unknown")}${group.updatedAt ? ` · Updated ${escapeHtml(formatDate(group.updatedAt))}` : ""}</small>
+        </div>
+        <div class="ip-preview-list">
+          ${previewItems.map(renderIpPreviewItem).join("")}
+          ${ipCount > previewItems.length ? `<span class="ip-preview-more">+${ipCount - previewItems.length}</span>` : ""}
+        </div>
+      </summary>
+      <div class="ip-group-body">
+        <div class="ip-group-toolbar">
+          <form method="post" action="${ADMIN_PATH}" onsubmit="return confirm('Delete this IP group from the Cloudflare list?')">
+            <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
+            <input type="hidden" name="action" value="delete_ip_group" />
+            <input type="hidden" name="uuid" value="${escapeHtml(uuid)}" />
+            <input type="hidden" name="group_id" value="${escapeHtml(group.id)}" />
+            <button class="danger compact" type="submit">Delete group</button>
+          </form>
+        </div>
+        <div class="time-grid">
+          <span><b>Added</b>${escapeHtml(formatDate(group.addedAt) || "Unknown")}</span>
+          ${group.updatedAt ? `<span><b>Updated</b>${escapeHtml(formatDate(group.updatedAt))}</span>` : ""}
+          <span><b>Location</b>${escapeHtml(place)}</span>
+          ${meta ? `<span><b>Network</b>${escapeHtml(meta)}</span>` : ""}
+        </div>
         <form class="expiry-form" method="post" action="${ADMIN_PATH}">
           <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
           <input type="hidden" name="action" value="update_ip_group_expiration" />
@@ -1607,13 +1635,11 @@ function renderIpGroup(group, uuid, csrf) {
           </label>
           <button class="secondary compact" type="submit">Update</button>
         </form>
+        <div class="ip-list">
+          ${(group.ips || []).map(renderIpItem).join("")}
+        </div>
       </div>
-      <div class="ip-list">
-        ${(group.ips || []).map(renderIpItem).join("")}
-      </div>
-      <span>${escapeHtml(place)}</span>
-      ${meta ? `<small>${escapeHtml(meta)}</small>` : ""}
-    </div>
+    </details>
   `;
 }
 
@@ -1625,6 +1651,14 @@ function renderIpItem(item) {
       <code>Net ${escapeHtml(item.cidr || item.listValue || item.ip)}</code>
     </span>
   `;
+}
+
+function renderIpPreviewItem(item) {
+  return `<code class="ip-preview">${escapeHtml(item.cidr || item.ip)}</code>`;
+}
+
+function formatGroupPlace(group) {
+  return [group.country, group.region, group.city].filter(Boolean).join(" / ");
 }
 
 function formatDate(value) {
@@ -2272,6 +2306,7 @@ function page(title, body, layout = "narrow") {
       border-bottom: 0.5px solid rgba(0, 0, 0, 0.08);
     }
     .invite-meta > div { min-width: 0; }
+    .invite-heading { display: grid; gap: 8px; }
     .trash-card { display: grid; gap: 12px; }
     .trash-meta {
       display: flex;
@@ -2460,20 +2495,82 @@ function page(title, body, layout = "narrow") {
     .hint { color: #86868b; font-size: 12px; line-height: 1.4; }
     .invite-meta strong { display: block; overflow-wrap: anywhere; }
     td > strong, td > small { display: block; overflow-wrap: anywhere; }
-    .ip-group {
-      display: grid;
-      gap: 10px;
-      min-width: 220px;
-      margin-bottom: 16px;
-      padding-bottom: 16px;
-      border-bottom: 0.5px solid rgba(0, 0, 0, 0.08);
-    }
-    .ip-group:last-child { margin-bottom: 0; padding-bottom: 0; border-bottom: 0; }
-    .ip-group-head {
+    .stat-row {
       display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .stat-pill {
+      display: inline-flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 10px;
+      min-height: 28px;
+      padding: 0 10px;
+      border-radius: 999px;
+      background: rgba(0, 0, 0, 0.045);
+      color: #4f4f53;
+      font-size: 12px;
+      font-weight: 600;
+      line-height: 1;
+    }
+    .ip-group {
+      min-width: 220px;
+      border: 0.5px solid rgba(0, 0, 0, 0.08);
+      border-radius: 14px;
+      background: rgba(0, 0, 0, 0.02);
+      overflow: hidden;
+    }
+    .ip-group + .ip-group { margin-top: 12px; }
+    .ip-group-summary {
+      list-style: none;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: start;
+      padding: 14px 16px;
+      cursor: pointer;
+    }
+    .ip-group-summary::-webkit-details-marker { display: none; }
+    .ip-group-summary-main {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+    }
+    .ip-group-summary-main strong,
+    .ip-group-summary-main small { overflow-wrap: anywhere; }
+    .ip-group-body {
+      display: grid;
+      gap: 14px;
+      padding: 0 16px 16px;
+      border-top: 0.5px solid rgba(0, 0, 0, 0.06);
+    }
+    .ip-group-toolbar {
+      display: flex;
+      justify-content: flex-end;
+      padding-top: 14px;
+    }
+    .ip-preview-list {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 6px;
+      max-width: 100%;
+    }
+    .ip-preview,
+    .ip-preview-more {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 0 9px;
+      border-radius: 999px;
+      background: rgba(0, 0, 0, 0.045);
+      color: #4f4f53;
+      font-size: 12px;
+    }
+    .ip-preview {
+      max-width: min(100%, 280px);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .ip-list { display: flex; flex-wrap: wrap; gap: 8px; }
     .time-grid {
@@ -2508,7 +2605,7 @@ function page(title, body, layout = "narrow") {
     .empty { color: #86868b; text-align: center; padding: 24px 0; }
     @media (max-width: 680px) {
       body { place-items: start; padding: 20px 16px; }
-      .topbar, .section-head, .subhead, .invite-meta, .trash-meta, .form-footer { display: grid; }
+      .topbar, .section-head, .subhead, .invite-meta, .trash-meta, .form-footer, .ip-group-summary { display: grid; }
       .inline, .form-grid, .invite-main, .api-config-labels, .api-config-row {
         grid-template-columns: minmax(0, 1fr);
       }
@@ -2516,6 +2613,12 @@ function page(title, body, layout = "narrow") {
       .api-key-field { grid-template-columns: minmax(0, 1fr); }
       .uuid-cell { grid-template-columns: minmax(0, 1fr); }
       .time-grid, .expiry-form { grid-template-columns: minmax(0, 1fr); }
+      .ip-group-summary { padding: 14px; }
+      .ip-group-body { padding: 0 14px 14px; }
+      .ip-group-toolbar { justify-content: stretch; }
+      .ip-group-toolbar form, .ip-group-toolbar button { width: 100%; }
+      .ip-preview-list { justify-content: flex-start; }
+      .ip-preview { max-width: 100%; }
       th, td { padding: 10px 8px; }
       h1 { font-size: 28px; }
       .panel, .message { padding: 16px; border-radius: 14px; }
@@ -2558,10 +2661,11 @@ function page(title, body, layout = "narrow") {
         background: rgba(255, 255, 255, 0.04);
       }
       .api-config-labels { color: #98989d; }
-      .ip-pill { background: rgba(255, 255, 255, 0.08); }
+      .ip-pill, .stat-pill, .ip-preview, .ip-preview-more { background: rgba(255, 255, 255, 0.08); color: #d2d2d7; }
       th, td { border-color: rgba(255, 255, 255, 0.08); }
       th, .topbar p, .muted, small { color: #98989d; }
-      .ip-group { border-color: rgba(255, 255, 255, 0.08); }
+      .ip-group { border-color: rgba(255, 255, 255, 0.08); background: rgba(255, 255, 255, 0.04); }
+      .ip-group-body { border-color: rgba(255, 255, 255, 0.08); }
       .empty { color: #636366; }
     }
   </style>

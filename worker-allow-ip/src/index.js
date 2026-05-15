@@ -919,6 +919,9 @@ function page(title, body) {
       border-radius: 12px;
       background: rgba(0, 0, 0, 0.02);
     }
+    .api-card strong {
+      overflow-wrap: anywhere;
+    }
     .api-card label { color: #86868b; font-size: 12px; font-weight: 500; }
     .copy-line {
       display: grid;
@@ -934,6 +937,14 @@ function page(title, body) {
       gap: 8px;
       min-width: 0;
     }
+    .copy-line code,
+    .secret-format {
+      display: block;
+      min-width: 0;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(0, 0, 0, 0.04);
+    }
     .copy-secret {
       height: 36px;
       border: 1px solid rgba(0, 0, 0, 0.1);
@@ -946,6 +957,11 @@ function page(title, body) {
       h1 { font-size: 32px; }
       .panel, .message { padding: 20px; border-radius: 14px; }
       .copy-line, .secret-copy-line { grid-template-columns: minmax(0, 1fr); }
+      button, a { width: 100%; }
+      button.ghost, button.compact { width: auto; }
+      .secret-copy-line button,
+      .copy-line button { width: 100%; }
+      .copy-secret { height: 40px; }
     }
     @media (prefers-color-scheme: dark) {
       :root { background: #000; color: #f5f5f7; }
@@ -972,6 +988,10 @@ function page(title, body) {
       }
       .copy-secret {
         border-color: rgba(255, 255, 255, 0.15);
+        background: rgba(255, 255, 255, 0.06);
+      }
+      .copy-line code,
+      .secret-format {
         background: rgba(255, 255, 255, 0.06);
       }
       button, a { background: #0a84ff; }
