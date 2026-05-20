@@ -4,333 +4,1351 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>sub2api-gate Demo</title>
+  <meta
+    name="description"
+    content="Demo interface for Sub2API allowlist access and UUID-based user administration."
+  />
   <style>
     :root {
-      color-scheme: light dark;
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif;
-      background: #f5f5f7;
-      color: #1d1d1f;
-      -webkit-font-smoothing: antialiased;
-      -moz-osx-font-smoothing: grayscale;
+      color-scheme: light;
+      --bg: #f4efe7;
+      --bg-strong: #efe4d4;
+      --surface: rgba(255, 251, 245, 0.84);
+      --surface-strong: #fffaf3;
+      --surface-muted: rgba(109, 82, 52, 0.08);
+      --text: #21160d;
+      --text-soft: #6b5846;
+      --text-faint: #8a7662;
+      --line: rgba(84, 57, 31, 0.14);
+      --line-strong: rgba(84, 57, 31, 0.24);
+      --accent: #b6542e;
+      --accent-strong: #8f3f21;
+      --accent-soft: rgba(182, 84, 46, 0.12);
+      --success: #237253;
+      --success-soft: rgba(35, 114, 83, 0.12);
+      --error: #a33422;
+      --error-soft: rgba(163, 52, 34, 0.12);
+      --shadow-lg: 0 24px 80px rgba(59, 35, 14, 0.12);
+      --shadow-md: 0 14px 36px rgba(59, 35, 14, 0.08);
+      --radius-xl: 28px;
+      --radius-lg: 20px;
+      --radius-md: 14px;
+      --radius-sm: 10px;
+      --font-display: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, Georgia, serif;
+      --font-body: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+      --font-mono: "SFMono-Regular", "Cascadia Code", "Fira Code", Consolas, monospace;
     }
-    * { box-sizing: border-box; }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --bg: #19130e;
+        --bg-strong: #241b13;
+        --surface: rgba(39, 29, 20, 0.84);
+        --surface-strong: #2a2018;
+        --surface-muted: rgba(255, 232, 212, 0.06);
+        --text: #f7ecde;
+        --text-soft: #d6c4b0;
+        --text-faint: #ac9884;
+        --line: rgba(255, 233, 212, 0.12);
+        --line-strong: rgba(255, 233, 212, 0.22);
+        --accent: #ff8e5f;
+        --accent-strong: #ffaf8e;
+        --accent-soft: rgba(255, 142, 95, 0.14);
+        --success: #67d6aa;
+        --success-soft: rgba(103, 214, 170, 0.12);
+        --error: #ff8d7c;
+        --error-soft: rgba(255, 141, 124, 0.14);
+        --shadow-lg: 0 28px 90px rgba(0, 0, 0, 0.36);
+        --shadow-md: 0 16px 44px rgba(0, 0, 0, 0.24);
+      }
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
     body {
       min-height: 100vh;
       margin: 0;
+      font-family: var(--font-body);
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(255, 223, 183, 0.42), transparent 32%),
+        radial-gradient(circle at 85% 18%, rgba(182, 84, 46, 0.14), transparent 26%),
+        linear-gradient(180deg, var(--bg-strong) 0%, var(--bg) 48%, var(--bg) 100%);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    a {
+      color: inherit;
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    button,
+    a,
+    input,
+    [role="button"] {
+      transition:
+        background-color 180ms ease,
+        border-color 180ms ease,
+        color 180ms ease,
+        box-shadow 180ms ease,
+        transform 180ms ease,
+        opacity 180ms ease;
+    }
+
+    button:focus-visible,
+    a:focus-visible,
+    input:focus-visible,
+    .tab:focus-visible {
+      outline: 3px solid var(--accent-soft);
+      outline-offset: 2px;
+    }
+
+    .skip-link {
+      position: absolute;
+      left: 16px;
+      top: 16px;
+      transform: translateY(-160%);
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: var(--accent);
+      color: #fff;
+      text-decoration: none;
+      z-index: 200;
+    }
+
+    .skip-link:focus {
+      transform: translateY(0);
+    }
+
+    .page-shell {
+      position: relative;
+      width: min(1160px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 48px;
+    }
+
+    .demo-badge {
+      position: fixed;
+      top: 18px;
+      right: 18px;
+      z-index: 100;
+      padding: 8px 14px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255, 250, 243, 0.55);
+      backdrop-filter: blur(14px);
+      color: var(--text-soft);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .ambient-orb,
+    .ambient-grid {
+      position: fixed;
+      inset: auto;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    .ambient-orb {
+      width: 320px;
+      height: 320px;
+      right: -80px;
+      bottom: -80px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(182, 84, 46, 0.18), transparent 68%);
+      filter: blur(8px);
+    }
+
+    .ambient-grid {
+      inset: 0;
+      opacity: 0.26;
+      background-image:
+        linear-gradient(var(--line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--line) 1px, transparent 1px);
+      background-size: 36px 36px;
+      mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.24), transparent 80%);
+    }
+
+    .app-layout {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: minmax(0, 1.08fr) minmax(0, 0.92fr);
+      gap: 24px;
+      align-items: start;
+    }
+
+    .intro-panel,
+    .workspace {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      backdrop-filter: blur(18px) saturate(135%);
+      box-shadow: var(--shadow-lg);
+    }
+
+    .intro-panel {
+      position: sticky;
+      top: 24px;
+      overflow: hidden;
+      border-radius: var(--radius-xl);
+      min-height: 760px;
+      padding: 28px;
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      gap: 28px;
+    }
+
+    .intro-panel::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        radial-gradient(circle at 18% 16%, rgba(255, 214, 178, 0.38), transparent 24%),
+        linear-gradient(135deg, transparent 0%, rgba(182, 84, 46, 0.06) 100%);
+      pointer-events: none;
+    }
+
+    .workspace {
+      border-radius: var(--radius-xl);
+      padding: 24px;
+      display: grid;
+      gap: 20px;
+    }
+
+    .brand-row,
+    .hero-head,
+    .section-stack,
+    .metric-grid,
+    .step-list,
+    .panel-stack,
+    .dashboard-grid,
+    .user-list,
+    .action-row,
+    .field,
+    .message,
+    .helper-callout,
+    .status-strip,
+    .api-card,
+    .tab-panel {
+      display: grid;
+      gap: 12px;
+    }
+
+    .brand-row {
+      grid-template-columns: auto 1fr;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .brand-mark {
+      width: 64px;
+      height: 64px;
+      border-radius: 20px;
       display: grid;
       place-items: center;
-      padding: 40px 20px;
       background:
-        radial-gradient(ellipse at 50% 0%, rgba(255,255,255,0.9), transparent 50%),
-        linear-gradient(180deg, #fbfbfd 0%, #f5f5f7 100%);
+        linear-gradient(145deg, rgba(255, 255, 255, 0.92), rgba(255, 239, 223, 0.72));
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.6),
+        0 16px 34px rgba(123, 67, 37, 0.18);
+      border: 1px solid rgba(255, 255, 255, 0.55);
     }
-    main { width: min(100%, 480px); }
-    .hero, form, .message, .dashboard { display: grid; gap: 20px; }
-    .hero { margin-bottom: 32px; text-align: center; }
-    .sub2api-icon {
-      width: 72px; height: 72px; margin: 0 auto 6px;
-      border-radius: 20px; display: inline-grid; place-items: center;
-      overflow: hidden; background: #111;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.08), 0 20px 48px rgba(0,0,0,0.12);
-    }
-    .sub2api-icon svg { width: 40px; height: 40px; }
-    .eyebrow { color: #86868b; font-size: 13px; font-weight: 600; letter-spacing: 0.02em; text-transform: uppercase; }
-    .lede { color: #86868b; font-size: 17px; margin: 0; line-height: 1.47; font-weight: 400; }
-    .panel, .message {
-      padding: 24px; border: 0.5px solid rgba(0,0,0,0.06);
-      border-radius: 16px; background: rgba(255,255,255,0.72);
-      box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.06);
-      backdrop-filter: saturate(180%) blur(20px);
-      -webkit-backdrop-filter: saturate(180%) blur(20px);
-    }
-    h1 { margin: 0; font-size: 40px; font-weight: 700; line-height: 1.1; letter-spacing: -0.025em; }
-    p { margin: 0; line-height: 1.53; }
-    label { color: #1d1d1f; font-size: 13px; font-weight: 600; letter-spacing: -0.01em; }
-    .secret-field {
-      display: grid; grid-template-columns: minmax(0,1fr) auto;
-      align-items: center; height: 44px;
-      border: 1px solid rgba(0,0,0,0.1); border-radius: 10px;
-      background: rgba(255,255,255,0.9);
-      transition: border-color 200ms, box-shadow 200ms;
-    }
-    .secret-field:focus-within {
-      border-color: #0071e3;
-      box-shadow: 0 0 0 3.5px rgba(0,113,227,0.16);
-    }
-    input {
-      width: 100%; height: 44px; border: 0; border-radius: 10px;
-      padding: 0 14px; font: inherit; font-size: 15px;
-      background: transparent; color: #1d1d1f; outline: 0;
-    }
-    button, a.btn {
-      min-height: 44px; border: 0; border-radius: 10px;
-      display: inline-grid; place-items: center; padding: 0 20px;
-      background: #0071e3; color: #fff; font: inherit; font-weight: 600; font-size: 15px;
-      text-decoration: none; cursor: pointer;
-      transition: transform 120ms, background 120ms, box-shadow 120ms, opacity 120ms;
-      -webkit-tap-highlight-color: transparent;
-    }
-    button:hover, a.btn:hover {
-      background: #0077ed;
-      box-shadow: 0 4px 16px rgba(0,113,227,0.24);
-    }
-    button:active, a.btn:active { transform: scale(0.98); opacity: 0.9; }
-    button.ghost {
-      min-height: 32px; margin-right: 6px; padding: 0 12px;
-      border-radius: 8px; background: transparent; color: #0071e3;
-      box-shadow: none; font-size: 14px; font-weight: 500;
-    }
-    button.ghost:hover { background: rgba(0,113,227,0.08); box-shadow: none; }
-    button.ghost:active { background: rgba(0,113,227,0.12); transform: none; }
-    button.ghost-wide {
-      width: 100%; background: rgba(0,0,0,0.05); color: #1d1d1f; box-shadow: none; font-weight: 500;
-    }
-    button.ghost-wide:hover { background: rgba(0,0,0,0.08); box-shadow: none; }
-    button.ghost-wide:active { background: rgba(0,0,0,0.1); transform: none; }
-    button.compact { min-height: 30px; border-radius: 8px; padding: 0 12px; font-size: 13px; }
-    button:disabled { background: #d2d2d7; color: #86868b; box-shadow: none; cursor: not-allowed; transform: none; opacity: 1; }
-    button:disabled:hover { background: #d2d2d7; box-shadow: none; transform: none; }
-    code {
-      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-      font-size: 12px; overflow-wrap: anywhere;
-    }
-    .success { color: #248a3d; font-weight: 600; }
-    .warning { color: #c77c11; font-weight: 600; }
-    .api-list, .api-card { display: grid; gap: 12px; }
-    .api-card {
-      padding: 16px; border: 0.5px solid rgba(0,0,0,0.06);
-      border-radius: 12px; background: rgba(0,0,0,0.02);
-    }
-    .api-card label { color: #86868b; font-size: 12px; font-weight: 500; }
-    .copy-line {
-      display: grid; grid-template-columns: minmax(0,1fr) auto;
-      align-items: center; gap: 8px; min-width: 0;
-    }
-    .secret-copy-line {
-      display: grid; grid-template-columns: minmax(0,1fr) auto auto;
-      align-items: center; gap: 8px; min-width: 0;
-    }
-    .copy-secret {
-      height: 36px; border: 1px solid rgba(0,0,0,0.1); background: rgba(255,255,255,0.8);
-      border-radius: 8px; padding: 0 10px; font: inherit; font-size: 13px; color: #1d1d1f;
-    }
-    .cf-turnstile-mock {
-      min-height: 65px; border: 1px dashed rgba(0,0,0,0.15); border-radius: 10px;
-      display: grid; place-items: center; color: #86868b; font-size: 13px;
-      background: rgba(0,0,0,0.02);
-    }
-    .cf-turnstile-mock.checked { border-color: #248a3d; color: #248a3d; background: rgba(36,138,61,0.04); }
-    .demo-badge {
-      position: fixed; top: 14px; right: 14px; padding: 6px 14px;
-      border-radius: 999px; background: rgba(0,0,0,0.05);
-      color: #86868b; font-size: 12px; font-weight: 600;
-      backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); z-index: 100;
-    }
-    .tabs {
-      display: flex; gap: 0; border-bottom: 0.5px solid rgba(0,0,0,0.08);
-      margin-bottom: 20px;
-    }
-    .tab {
-      padding: 10px 16px; border: 0; background: transparent;
-      color: #86868b; font-size: 14px; font-weight: 600;
-      cursor: pointer; border-bottom: 2px solid transparent;
-      border-radius: 0; min-height: auto;
-      transition: color 200ms, border-color 200ms;
-    }
-    .tab.active { color: #1d1d1f; border-bottom-color: #0071e3; }
-    .tab:hover { background: transparent; box-shadow: none; transform: none; color: #1d1d1f; }
-    .tab-panel { display: none; }
-    .tab-panel.active { display: grid; gap: 18px; }
-    .admin-form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    .admin-form .span-2 { grid-column: 1 / -1; }
-    .field { display: grid; gap: 6px; }
-    .user-list { display: grid; gap: 10px; max-height: 300px; overflow: auto; }
-    .user-card {
-      padding: 14px; border: 0.5px solid rgba(0,0,0,0.06); border-radius: 12px;
-      background: rgba(0,0,0,0.02); display: grid; gap: 4px;
-    }
-    .user-card strong { font-size: 15px; font-weight: 600; }
-    .user-card small { color: #86868b; }
-    .admin-status {
-      border-left: 3px solid #0071e3; padding: 12px 14px;
-      background: rgba(0,113,227,0.04); border-radius: 10px; font-size: 14px; line-height: 1.47;
-    }
-    .admin-status.error { border-left-color: #d70015; background: rgba(215,0,21,0.04); }
-    @media (max-width: 560px) {
-      body { padding: 24px 16px; }
-      h1 { font-size: 32px; }
-      .panel, .message { padding: 20px; border-radius: 14px; }
-      .copy-line, .secret-copy-line { grid-template-columns: minmax(0,1fr); }
-      .admin-form { grid-template-columns: 1fr; }
-      .admin-form .span-2 { grid-column: 1; }
-    }
+
     @media (prefers-color-scheme: dark) {
-      :root { background: #000; color: #f5f5f7; }
-      body {
+      .brand-mark {
         background:
-          radial-gradient(ellipse at 50% 0%, rgba(44,44,46,0.6), transparent 50%),
-          linear-gradient(180deg, #1c1c1e 0%, #000 100%);
+          linear-gradient(145deg, rgba(255, 255, 255, 0.08), rgba(255, 170, 122, 0.14));
+        border-color: rgba(255, 255, 255, 0.08);
       }
-      .panel, .message {
-        border-color: rgba(255,255,255,0.08); background: rgba(28,28,30,0.72);
-        box-shadow: 0 1px 3px rgba(0,0,0,0.2), 0 8px 24px rgba(0,0,0,0.3);
+    }
+
+    .brand-mark svg {
+      width: 34px;
+      height: 34px;
+    }
+
+    .eyebrow {
+      margin: 0;
+      color: var(--text-faint);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+
+    .brand-title {
+      margin: 0;
+      font-family: var(--font-display);
+      font-size: 24px;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      line-height: 1;
+    }
+
+    .hero-title,
+    h1 {
+      margin: 0;
+      font-family: var(--font-display);
+      font-size: clamp(2.7rem, 5vw, 4.5rem);
+      line-height: 0.96;
+      letter-spacing: -0.05em;
+      font-weight: 700;
+      max-width: 10ch;
+    }
+
+    .hero-copy,
+    .lede,
+    p {
+      margin: 0;
+      color: var(--text-soft);
+      line-height: 1.65;
+    }
+
+    .hero-copy {
+      max-width: 46ch;
+      font-size: 1.02rem;
+    }
+
+    .hero-tags,
+    .step-pills,
+    .support-links,
+    .top-nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .tag,
+    .step-pill,
+    .micro-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 34px;
+      padding: 0 12px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.38);
+      color: var(--text-soft);
+      font-size: 13px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .metric-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .metric-card {
+      padding: 16px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--line);
+      background: var(--surface-muted);
+    }
+
+    .metric-value {
+      margin: 0;
+      font-family: var(--font-display);
+      font-size: 1.7rem;
+      line-height: 1;
+      letter-spacing: -0.04em;
+    }
+
+    .metric-label {
+      margin: 0;
+      color: var(--text-faint);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .section-card,
+    .panel,
+    .message {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--surface-strong);
+      box-shadow: var(--shadow-md);
+    }
+
+    .section-card {
+      padding: 18px;
+    }
+
+    .section-title {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+    }
+
+    .step-list {
+      gap: 10px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+
+    .step-index {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .step strong,
+    .section-card strong,
+    .api-card strong,
+    .user-card strong {
+      color: var(--text);
+      font-size: 15px;
+    }
+
+    .step small,
+    .section-card small,
+    .user-card small,
+    .helper-note {
+      color: var(--text-faint);
+      line-height: 1.5;
+    }
+
+    .trust-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .workspace-header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+    }
+
+    .workspace-copy h1 {
+      max-width: none;
+      font-size: clamp(2rem, 4vw, 3.3rem);
+    }
+
+    .workspace-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .panel {
+      padding: 22px;
+    }
+
+    .panel-stack {
+      gap: 18px;
+    }
+
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: start;
+      gap: 14px;
+    }
+
+    .panel-title {
+      margin: 0;
+      font-family: var(--font-display);
+      font-size: 1.55rem;
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+    }
+
+    .panel-subtitle {
+      margin: 0;
+      color: var(--text-soft);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .helper-callout,
+    .status-strip {
+      padding: 14px 16px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--line);
+      background: var(--surface-muted);
+    }
+
+    .helper-callout strong,
+    .status-strip strong {
+      font-size: 13px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .field label {
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .field-hint {
+      margin-top: -6px;
+      color: var(--text-faint);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .secret-field,
+    .copy-line,
+    .secret-copy-line {
+      display: grid;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .secret-field {
+      grid-template-columns: minmax(0, 1fr) auto;
+      min-height: 56px;
+      padding: 6px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.54);
+    }
+
+    .secret-field:focus-within {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 4px var(--accent-soft);
+    }
+
+    input {
+      width: 100%;
+      min-height: 44px;
+      border: 0;
+      outline: 0;
+      color: var(--text);
+      background: transparent;
+      font-size: 15px;
+      padding: 0 14px;
+    }
+
+    input::placeholder {
+      color: var(--text-faint);
+    }
+
+    button,
+    a.btn {
+      min-height: 48px;
+      border: 0;
+      border-radius: 999px;
+      padding: 0 18px;
+      display: inline-flex;
+      justify-content: center;
+      align-items: center;
+      gap: 10px;
+      cursor: pointer;
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+    }
+
+    button:hover,
+    a.btn:hover {
+      transform: translateY(-1px);
+    }
+
+    button:active,
+    a.btn:active {
+      transform: translateY(0);
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      box-shadow: 0 12px 26px rgba(182, 84, 46, 0.22);
+    }
+
+    .btn-primary:hover {
+      background: var(--accent-strong);
+    }
+
+    .btn-secondary,
+    button.ghost,
+    button.ghost-wide,
+    a.btn-secondary {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--line);
+      box-shadow: none;
+    }
+
+    .btn-secondary:hover,
+    button.ghost:hover,
+    button.ghost-wide:hover,
+    a.btn-secondary:hover {
+      background: var(--surface-muted);
+    }
+
+    button.ghost {
+      min-height: 40px;
+      padding: 0 14px;
+      color: var(--text-soft);
+    }
+
+    button.ghost-wide {
+      width: 100%;
+      min-height: 46px;
+    }
+
+    button.compact {
+      min-height: 36px;
+      padding: 0 12px;
+      font-size: 13px;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.45;
+      transform: none;
+      box-shadow: none;
+    }
+
+    .action-row {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .cf-turnstile-mock {
+      padding: 16px;
+      border-radius: 16px;
+      border: 1px dashed var(--line-strong);
+      background: var(--surface-muted);
+    }
+
+    .cf-turnstile-mock.checked {
+      border-style: solid;
+      border-color: rgba(35, 114, 83, 0.28);
+      background: var(--success-soft);
+      color: var(--success);
+    }
+
+    .turnstile-label {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      cursor: pointer;
+      color: inherit;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .turnstile-label input {
+      width: 18px;
+      height: 18px;
+      min-height: auto;
+      padding: 0;
+      accent-color: var(--accent);
+    }
+
+    .message {
+      padding: 16px;
+      line-height: 1.58;
+    }
+
+    .message.success,
+    .status-strip.success {
+      border-color: rgba(35, 114, 83, 0.18);
+      background: var(--success-soft);
+      color: var(--success);
+    }
+
+    .message.error,
+    .status-strip.error,
+    .admin-status.error {
+      border-color: rgba(163, 52, 34, 0.2);
+      background: var(--error-soft);
+      color: var(--error);
+    }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .copy-line {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+
+    .secret-copy-line {
+      grid-template-columns: minmax(0, 1fr) auto auto;
+    }
+
+    .copy-secret {
+      min-height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 0 12px;
+      background: transparent;
+    }
+
+    .dashboard-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .api-card {
+      padding: 18px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--line);
+      background: var(--surface-muted);
+    }
+
+    .api-card label {
+      color: var(--text-faint);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .status-banner {
+      display: grid;
+      gap: 10px;
+      padding: 18px;
+      border-radius: var(--radius-lg);
+      border: 1px solid rgba(35, 114, 83, 0.18);
+      background: linear-gradient(180deg, var(--success-soft), rgba(255, 255, 255, 0.03));
+    }
+
+    .status-banner p {
+      color: inherit;
+    }
+
+    .top-nav {
+      justify-content: space-between;
+    }
+
+    .top-nav .nav-left,
+    .top-nav .nav-right {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 6px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface-muted);
+    }
+
+    .tab {
+      min-height: 40px;
+      padding: 0 16px;
+      border-radius: 999px;
+      border: 0;
+      background: transparent;
+      color: var(--text-soft);
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .tab.active {
+      background: var(--surface-strong);
+      color: var(--text);
+      box-shadow: 0 8px 20px rgba(59, 35, 14, 0.08);
+    }
+
+    .tab-panel {
+      display: none;
+    }
+
+    .tab-panel.active {
+      display: grid;
+    }
+
+    .admin-form {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .admin-form .span-2 {
+      grid-column: 1 / -1;
+    }
+
+    .user-list {
+      max-height: 420px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+
+    .user-card {
+      padding: 16px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--line);
+      background: var(--surface-muted);
+    }
+
+    .user-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .admin-status {
+      padding: 15px 16px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--line);
+      background: var(--surface-muted);
+      line-height: 1.58;
+      color: var(--text-soft);
+    }
+
+    .footer-note {
+      color: var(--text-faint);
+      font-size: 13px;
+      line-height: 1.6;
+      text-align: center;
+    }
+
+    .footer-note a {
+      color: var(--accent-strong);
+      text-underline-offset: 3px;
+    }
+
+    .fade-up {
+      opacity: 0;
+      transform: translateY(18px);
+      animation: fadeUp 620ms ease forwards;
+    }
+
+    .delay-1 { animation-delay: 70ms; }
+    .delay-2 { animation-delay: 140ms; }
+    .delay-3 { animation-delay: 210ms; }
+    .delay-4 { animation-delay: 280ms; }
+
+    @keyframes fadeUp {
+      to {
+        opacity: 1;
+        transform: translateY(0);
       }
-      label, input, .copy-secret { color: #f5f5f7; }
-      .secret-field { border-color: rgba(255,255,255,0.15); background: rgba(255,255,255,0.06); }
-      .secret-field:focus-within { border-color: #0a84ff; box-shadow: 0 0 0 3.5px rgba(10,132,255,0.2); }
-      .copy-secret { border-color: rgba(255,255,255,0.15); background: rgba(255,255,255,0.06); }
-      button, a.btn { background: #0a84ff; }
-      button:hover, a.btn:hover { background: #409cff; }
-      button.ghost-wide { background: rgba(255,255,255,0.1); color: #f5f5f7; }
-      button.ghost-wide:hover { background: rgba(255,255,255,0.16); }
-      .success { color: #32d74b; }
-      .warning { color: #ffd60a; }
-      .api-card { border-color: rgba(255,255,255,0.08); background: rgba(255,255,255,0.04); }
-      .cf-turnstile-mock { border-color: rgba(255,255,255,0.15); background: rgba(255,255,255,0.04); color: #98989d; }
-      .cf-turnstile-mock.checked { border-color: #32d74b; color: #32d74b; background: rgba(50,215,75,0.06); }
-      .demo-badge { background: rgba(255,255,255,0.06); color: #98989d; }
-      .tabs { border-bottom-color: rgba(255,255,255,0.08); }
-      .tab { color: #98989d; }
-      .tab.active { color: #f5f5f7; border-bottom-color: #0a84ff; }
-      .tab:hover { color: #f5f5f7; }
-      .admin-status { background: rgba(10,132,255,0.1); }
-      .admin-status.error { background: rgba(255,69,58,0.1); }
-      .user-card { border-color: rgba(255,255,255,0.08); background: rgba(255,255,255,0.04); }
-      .user-card small { color: #98989d; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html {
+        scroll-behavior: auto;
+      }
+
+      *,
+      *::before,
+      *::after {
+        animation: none !important;
+        transition: none !important;
+      }
+    }
+
+    @media (max-width: 980px) {
+      .app-layout {
+        grid-template-columns: 1fr;
+      }
+
+      .intro-panel {
+        position: static;
+        min-height: auto;
+      }
+    }
+
+    @media (max-width: 680px) {
+      .page-shell {
+        width: min(100%, calc(100% - 20px));
+        padding-top: 20px;
+      }
+
+      .demo-badge {
+        top: 12px;
+        right: 12px;
+      }
+
+      .intro-panel,
+      .workspace,
+      .panel {
+        padding: 18px;
+      }
+
+      .metric-grid,
+      .dashboard-grid,
+      .action-row,
+      .admin-form {
+        grid-template-columns: 1fr;
+      }
+
+      .copy-line,
+      .secret-copy-line,
+      .secret-field {
+        grid-template-columns: 1fr;
+      }
+
+      .workspace-header,
+      .panel-head,
+      .top-nav {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
 <body>
+  <a class="skip-link" href="#app">Skip to content</a>
   <span class="demo-badge">Demo</span>
-  <main id="app"></main>
+  <div class="ambient-grid" aria-hidden="true"></div>
+  <div class="ambient-orb" aria-hidden="true"></div>
+  <main class="page-shell" id="app"></main>
 
   <script>
-    // ── State ──
-    let view = "form"; // form | dashboard | admin
+    let view = "form";
     let turnstilePassed = false;
     let currentInvite = null;
+    let adminStatusMessage = 'Try adding a user, then test a duplicate like <code>Alice!!</code> to see normalization and conflict handling.';
+    let adminStatusKind = "";
     let adminUsers = [
-      { username: "alice", email: "alice@sub2api.local", uuid: "c1f3d8f0-7d2e-4a67-8e1b-7a3c6b7d1111", remark: "Core team" },
-      { username: "qa-team", email: "qa-team@sub2api.local", uuid: "2fd53e5e-4b7c-43d2-9b72-5a7a52c72222", remark: "Shared account" },
+      {
+        username: "alice",
+        email: "alice@sub2api.local",
+        uuid: "c1f3d8f1-3d45-4de8-8a1d-2f8c1d4c1022",
+        remark: "Engineering sandbox"
+      },
+      {
+        username: "ops-oncall",
+        email: "ops@sub2api.local",
+        uuid: "df0d3ec4-45b0-4aa8-a1d5-b1a4f62ef114",
+        remark: "Temporary incident access"
+      },
+      {
+        username: "research.demo",
+        email: "research@sub2api.local",
+        uuid: "96d54165-f38d-4f80-9888-5d78b8263f9c",
+        remark: "Product evaluation account"
+      }
     ];
 
     const MOCK_INVITES = {
-      "demo-key-001": { uuid: "c1f3d8f0-7d2e-4a67-8e1b-7a3c6b7d1111", name: "Alice", username: "alice", email: "alice@sub2api.local", loginPassword: "aB3$xK9m" },
-      "demo-invite-001": { uuid: "2fd53e5e-4b7c-43d2-9b72-5a7a52c72222", name: "QA Team", username: "qa-team", email: "qa-team@sub2api.local", loginPassword: "qW7#nR2p" },
+      "demo-key-001": {
+        name: "Northwind Lab",
+        uuid: "7c484f74-6d93-43d1-9441-00c7d8d4ab11"
+      },
+      "demo-invite-001": {
+        name: "Studio Relay",
+        uuid: "ac48b7f7-0d47-4be1-b2d2-9070c1fd85b4"
+      }
     };
 
-    const ICON_SVG = `<svg viewBox="0 0 41 41" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M37.5324 16.8707C37.9808 15.5241 38.1363 14.0974 37.9886 12.6859C37.8409 11.2744 37.3934 9.91076 36.676 8.68622C35.6126 6.83404 33.9882 5.3676 32.0373 4.4985C30.0864 3.62941 27.9098 3.40259 25.8215 3.85078C24.8796 2.7893 23.7219 1.94125 22.4257 1.36341C21.1295 0.785575 19.7249 0.491269 18.3058 0.500197C16.1708 0.495044 14.0893 1.16803 12.3614 2.42214C10.6335 3.67624 9.34853 5.44666 8.6917 7.47815C7.30085 7.76286 5.98686 8.3414 4.8377 9.17505C3.68854 10.0087 2.73073 11.0782 2.02839 12.312C0.956464 14.1591 0.498905 16.2988 0.721698 18.4228C0.944492 20.5467 1.83612 22.5449 3.268 24.1293C2.81966 25.4759 2.66413 26.9026 2.81182 28.3141C2.95951 29.7256 3.40701 31.0892 4.12437 32.3138C5.18791 34.1659 6.8123 35.6322 8.76321 36.5013C10.7141 37.3704 12.8907 37.5973 14.9789 37.1492C15.9208 38.2107 17.0786 39.0587 18.3747 39.6366C19.6709 40.2144 21.0755 40.5087 22.4946 40.4998C24.6307 40.5054 26.7133 39.8321 28.4418 38.5772C30.1704 37.3223 31.4556 35.5506 32.1119 33.5179C33.5027 33.2332 34.8167 32.6547 35.9659 31.821C37.115 30.9874 38.0728 29.9178 38.7752 28.684C39.8458 26.8371 40.3023 24.6979 40.0789 22.5748C39.8556 20.4517 38.9639 18.4544 37.5324 16.8707ZM22.4978 37.8849C20.7443 37.8874 19.0459 37.2733 17.6994 36.1501C17.7601 36.117 17.8666 36.0586 17.936 36.016L25.9004 31.4156C26.1003 31.3019 26.2663 31.137 26.3813 30.9378C26.4964 30.7386 26.5563 30.5124 26.5549 30.2825V19.0542L29.9213 20.998C29.9389 21.0068 29.9541 21.0198 29.9656 21.0359C29.977 21.052 29.9842 21.0707 29.9867 21.0902V30.3889C29.9842 32.375 29.1946 34.2791 27.7909 35.6841C26.3872 37.0892 24.4838 37.8806 22.4978 37.8849ZM6.39227 31.0064C5.51397 29.4888 5.19742 27.7107 5.49804 25.9832C5.55718 26.0187 5.66048 26.0818 5.73461 26.124L13.699 30.7248C13.8975 30.8408 14.1233 30.902 14.3532 30.902C14.583 30.902 14.8088 30.8408 15.0073 30.7248L24.731 25.1103V28.9979C24.7321 29.0177 24.7283 29.0376 24.7199 29.0556C24.7115 29.0736 24.6988 29.0893 24.6829 29.1012L16.6317 33.7497C14.9096 34.7416 12.8643 35.0097 10.9447 34.4954C9.02506 33.9811 7.38785 32.7263 6.39227 31.0064ZM4.29707 13.6194C5.17156 12.0998 6.55279 10.9364 8.19885 10.3327C8.19885 10.4013 8.19491 10.5228 8.19491 10.6071V19.808C8.19351 20.0378 8.25334 20.2638 8.36823 20.4629C8.48312 20.6619 8.64893 20.8267 8.84863 20.9404L18.5723 26.5542L15.206 28.4979C15.1894 28.5089 15.1703 28.5155 15.1505 28.5173C15.1307 28.5191 15.1107 28.516 15.0924 28.5082L7.04046 23.8557C5.32135 22.8601 4.06716 21.2235 3.55289 19.3046C3.03862 17.3858 3.30624 15.3413 4.29707 13.6194ZM31.955 20.0556L22.2312 14.4411L25.5976 12.4981C25.6142 12.4872 25.6333 12.4805 25.6531 12.4787C25.6729 12.4769 25.6928 12.4801 25.7111 12.4879L33.7631 17.1364C34.9967 17.849 36.0017 18.8982 36.6606 20.1613C37.3194 21.4244 37.6047 22.849 37.4832 24.2684C37.3617 25.6878 36.8382 27.0432 35.9743 28.1759C35.1103 29.3086 33.9415 30.1717 32.6047 30.6641C32.6047 30.5947 32.6047 30.4733 32.6047 30.3889V21.188C32.6066 20.9586 32.5474 20.7328 32.4332 20.5338C32.319 20.3348 32.154 20.1698 31.955 20.0556ZM35.3055 15.0128C35.2464 14.9765 35.1431 14.9142 35.069 14.8717L27.1045 10.2712C26.906 10.1554 26.6803 10.0943 26.4504 10.0943C26.2206 10.0943 25.9948 10.1554 25.7963 10.2712L16.0726 15.8858V11.9982C16.0715 11.9783 16.0753 11.9585 16.0837 11.9405C16.0921 11.9225 16.1048 11.9068 16.1207 11.8949L24.1719 7.25025C25.4053 6.53903 26.8158 6.19376 28.2383 6.25482C29.6608 6.31589 31.0364 6.78077 32.2044 7.59508C33.3723 8.40939 34.2842 9.53945 34.8334 10.8531C35.3826 12.1667 35.5464 13.6095 35.3055 15.0128ZM14.2424 21.9419L10.8752 19.9981C10.8576 19.9893 10.8423 19.9763 10.8309 19.9602C10.8195 19.9441 10.8122 19.9254 10.8098 19.9058V10.6071C10.8107 9.18295 11.2173 7.78848 11.9819 6.58696C12.7466 5.38544 13.8377 4.42659 15.1275 3.82264C16.4173 3.21869 17.8524 2.99464 19.2649 3.1767C20.6775 3.35876 22.0089 3.93941 23.1034 4.85067C23.0427 4.88379 22.937 4.94215 22.8668 4.98473L14.9024 9.58517C14.7025 9.69878 14.5366 9.86356 14.4215 10.0626C14.3065 10.2616 14.2466 10.4877 14.2479 10.7175L14.2424 21.9419ZM16.071 17.9991L20.4018 15.4978L24.7325 17.9975V22.9985L20.4018 25.4983L16.071 22.9985V17.9991Z" fill="#111"/></svg>`;
+    const ICON_SVG = `<svg viewBox="0 0 41 41" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M37.5324 16.8707C37.9808 15.5241 38.1363 14.0974 37.9886 12.6859C37.8409 11.2744 37.3934 9.91076 36.676 8.68622C35.6126 6.83404 33.9882 5.3676 32.0373 4.4985C30.0864 3.62941 27.9098 3.40259 25.8215 3.85078C24.8796 2.7893 23.7219 1.94125 22.4257 1.36341C21.1295 0.785575 19.7249 0.491269 18.3058 0.500197C16.1708 0.495044 14.0893 1.16803 12.3614 2.42214C10.6335 3.67624 9.34853 5.44666 8.6917 7.47815C7.30085 7.76286 5.98686 8.3414 4.8377 9.17505C3.68854 10.0087 2.73073 11.0782 2.02839 12.312C0.956464 14.1591 0.498905 16.2988 0.721698 18.4228C0.944492 20.5467 1.83612 22.5449 3.268 24.1293C2.81966 25.4759 2.66413 26.9026 2.81182 28.3141C2.95951 29.7256 3.40701 31.0892 4.12437 32.3138C5.18791 34.1659 6.8123 35.6322 8.76321 36.5013C10.7141 37.3704 12.8907 37.5973 14.9789 37.1492C15.9208 38.2107 17.0786 39.0587 18.3747 39.6366C19.6709 40.2144 21.0755 40.5087 22.4946 40.4998C24.6307 40.5054 26.7133 39.8321 28.4418 38.5772C30.1704 37.3223 31.4556 35.5506 32.1119 33.5179C33.5027 33.2332 34.8167 32.6547 35.9659 31.821C37.115 30.9874 38.0728 29.9178 38.7752 28.684C39.8458 26.8371 40.3023 24.6979 40.0789 22.5748C39.8556 20.4517 38.9639 18.4544 37.5324 16.8707ZM22.4978 37.8849C20.7443 37.8874 19.0459 37.2733 17.6994 36.1501C17.7601 36.117 17.8666 36.0586 17.936 36.016L25.9004 31.4156C26.1003 31.3019 26.2663 31.137 26.3813 30.9378C26.4964 30.7386 26.5563 30.5124 26.5549 30.2825V19.0542L29.9213 20.998C29.9389 21.0068 29.9541 21.0198 29.9656 21.0359C29.977 21.052 29.9842 21.0707 29.9867 21.0902V30.3889C29.9842 32.375 29.1946 34.2791 27.7909 35.6841C26.3872 37.0892 24.4838 37.8806 22.4978 37.8849ZM6.39227 31.0064C5.51397 29.4888 5.19742 27.7107 5.49804 25.9832C5.55718 26.0187 5.66048 26.0818 5.73461 26.124L13.699 30.7248C13.8975 30.8408 14.1233 30.902 14.3532 30.902C14.583 30.902 14.8088 30.8408 15.0073 30.7248L24.731 25.1103V28.9979C24.7321 29.0177 24.7283 29.0376 24.7199 29.0556C24.7115 29.0736 24.6988 29.0893 24.6829 29.1012L16.6317 33.7497C14.9096 34.7416 12.8643 35.0097 10.9447 34.4954C9.02506 33.9811 7.38785 32.7263 6.39227 31.0064ZM4.29707 13.6194C5.17156 12.0998 6.55279 10.9364 8.19885 10.3327C8.19885 10.4013 8.19491 10.5228 8.19491 10.6071V19.808C8.19351 20.0378 8.25334 20.2638 8.36823 20.4629C8.48312 20.6619 8.64893 20.8267 8.84863 20.9404L18.5723 26.5542L15.206 28.4979C15.1894 28.5089 15.1703 28.5155 15.1505 28.5173C15.1307 28.5191 15.1107 28.516 15.0924 28.5082L7.04046 23.8557C5.32135 22.8601 4.06716 21.2235 3.55289 19.3046C3.03862 17.3858 3.30624 15.3413 4.29707 13.6194ZM31.955 20.0556L22.2312 14.4411L25.5976 12.4981C25.6142 12.4872 25.6333 12.4805 25.6531 12.4787C25.6729 12.4769 25.6928 12.4801 25.7111 12.4879L33.7631 17.1364C34.9967 17.849 36.0017 18.8982 36.6606 20.1613C37.3194 21.4244 37.6047 22.849 37.4832 24.2684C37.3617 25.6878 36.8382 27.0432 35.9743 28.1759C35.1103 29.3086 33.9415 30.1717 32.6047 30.6641C32.6047 30.5947 32.6047 30.4733 32.6047 30.3889V21.188C32.6066 20.9586 32.5474 20.7328 32.4332 20.5338C32.319 20.3348 32.154 20.1698 31.955 20.0556ZM35.3055 15.0128C35.2464 14.9765 35.1431 14.9142 35.069 14.8717L27.1045 10.2712C26.906 10.1554 26.6803 10.0943 26.4504 10.0943C26.2206 10.0943 25.9948 10.1554 25.7963 10.2712L16.0726 15.8858V11.9982C16.0715 11.9783 16.0753 11.9585 16.0837 11.9405C16.0921 11.9225 16.1048 11.9068 16.1207 11.8949L24.1719 7.25025C25.4053 6.53903 26.8158 6.19376 28.2383 6.25482C29.6608 6.31589 31.0364 6.78077 32.2044 7.59508C33.3723 8.40939 34.2842 9.53945 34.8334 10.8531C35.3826 12.1667 35.5464 13.6095 35.3055 15.0128ZM14.2424 21.9419L10.8752 19.9981C10.8576 19.9893 10.8423 19.9763 10.8309 19.9602C10.8195 19.9441 10.8122 19.9254 10.8098 19.9058V10.6071C10.8107 9.18295 11.2173 7.78848 11.9819 6.58696C12.7466 5.38544 13.8377 4.42659 15.1275 3.82264C16.4173 3.21869 17.8524 2.99464 19.2649 3.1767C20.6775 3.35876 22.0089 3.93941 23.1034 4.85067C23.0427 4.88379 22.937 4.94215 22.8668 4.98473L14.9024 9.58517C14.7025 9.69878 14.5366 9.86356 14.4215 10.0626C14.3065 10.2616 14.2466 10.4877 14.2479 10.7175L14.2424 21.9419ZM16.071 17.9991L20.4018 15.4978L24.7325 17.9975V22.9985L20.4018 25.4983L16.071 22.9985V17.9991Z" fill="#21160d"/></svg>`;
 
-    const ICON_SVG_WHITE = ICON_SVG.replace('fill="#111"', 'fill="#f5f5f7"');
+    function esc(value) {
+      return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
 
-    // ── Helpers ──
-    function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
-    function maskSecret(v) { if (!v) return "Not configured"; return v.startsWith("sk-") ? "sk-********" : "********"; }
-    function isDark() { return window.matchMedia("(prefers-color-scheme: dark)").matches; }
+    function maskSecret(value) {
+      if (!value) return "Not configured";
+      return value.startsWith("sk-") ? "sk-********" : "********";
+    }
 
-    // ── Render ──
-    function render() {
-      const app = document.getElementById("app");
-      if (view === "form") app.innerHTML = renderForm();
-      else if (view === "dashboard") app.innerHTML = renderDashboard();
-      else if (view === "admin") app.innerHTML = renderAdmin();
-      bindEvents();
+    function normalizeUsername(value) {
+      return String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9._-]+/g, "-")
+        .replace(/^[._-]+|[._-]+$/g, "")
+        .slice(0, 100);
+    }
+
+    function iconMarkup() {
+      return `<span class="brand-mark">${ICON_SVG}</span>`;
+    }
+
+    function renderShell(content, meta = {}) {
+      const summary = meta.summary || "Guard the API edge with a cleaner access flow, clearer trust signals, and faster operator actions.";
+      const activeView = meta.activeView || "Access";
+
+      return `
+        <div class="app-layout">
+          <aside class="intro-panel fade-up">
+            <div class="brand-row">
+              ${iconMarkup()}
+              <div>
+                <p class="eyebrow">Sub2API Gate</p>
+                <p class="brand-title">Access with intent</p>
+              </div>
+            </div>
+
+            <section class="hero-head">
+              <p class="eyebrow">Edge Access Workflow</p>
+              <h2 class="hero-title">A calmer, sharper path to allowlist access.</h2>
+              <p class="hero-copy">${esc(summary)}</p>
+              <div class="hero-tags">
+                <span class="tag">Cloudflare allowlist</span>
+                <span class="tag">UUID-based access</span>
+                <span class="tag">Operator-friendly demo</span>
+              </div>
+            </section>
+
+            <section class="metric-grid fade-up delay-1" aria-label="Key metrics">
+              <article class="metric-card">
+                <p class="metric-value">3</p>
+                <p class="metric-label">Core steps</p>
+              </article>
+              <article class="metric-card">
+                <p class="metric-value">1</p>
+                <p class="metric-label">Primary action</p>
+              </article>
+              <article class="metric-card">
+                <p class="metric-value">${currentInvite ? "Live" : "Demo"}</p>
+                <p class="metric-label">Session state</p>
+              </article>
+            </section>
+
+            <section class="section-stack fade-up delay-2">
+              <article class="section-card">
+                <p class="section-title">What this flow does</p>
+                <div class="step-list">
+                  <div class="step">
+                    <span class="step-index">01</span>
+                    <div>
+                      <strong>Verify the visitor</strong>
+                      <small>Use an access key or UUID before touching the edge allowlist.</small>
+                    </div>
+                  </div>
+                  <div class="step">
+                    <span class="step-index">02</span>
+                    <div>
+                      <strong>Grant the current client IP</strong>
+                      <small>Keep the main action singular so users know exactly what happens next.</small>
+                    </div>
+                  </div>
+                  <div class="step">
+                    <span class="step-index">03</span>
+                    <div>
+                      <strong>Hand off usable API details</strong>
+                      <small>Surface the account, key, and copy actions without exposing extra complexity.</small>
+                    </div>
+                  </div>
+                </div>
+              </article>
+
+              <article class="section-card">
+                <p class="section-title">Trust signals</p>
+                <div class="trust-list">
+                  <span class="micro-badge">Keyboard accessible</span>
+                  <span class="micro-badge">Responsive layout</span>
+                  <span class="micro-badge">Clear status messaging</span>
+                </div>
+              </article>
+            </section>
+
+            <section class="section-card fade-up delay-3">
+              <p class="section-title">Current view</p>
+              <p class="brand-title" style="font-size: 1.85rem;">${esc(activeView)}</p>
+              <p class="hero-copy" style="font-size: 0.95rem;">
+                This demo stays intentionally backend-free, but the interface now explains the workflow and keeps secondary actions out of the way until they matter.
+              </p>
+            </section>
+          </aside>
+
+          <section class="workspace fade-up delay-1">
+            ${content}
+          </section>
+        </div>
+      `;
     }
 
     function renderForm() {
-      return `
-        <section class="hero">
-          <span class="sub2api-icon" aria-hidden="true"><svg viewBox="0 0 41 41" xmlns="http://www.w3.org/2000/svg"><path d="M37.5324 16.8707C37.9808 15.5241 38.1363 14.0974 37.9886 12.6859C37.8409 11.2744 37.3934 9.91076 36.676 8.68622C35.6126 6.83404 33.9882 5.3676 32.0373 4.4985C30.0864 3.62941 27.9098 3.40259 25.8215 3.85078C24.8796 2.7893 23.7219 1.94125 22.4257 1.36341C21.1295 0.785575 19.7249 0.491269 18.3058 0.500197C16.1708 0.495044 14.0893 1.16803 12.3614 2.42214C10.6335 3.67624 9.34853 5.44666 8.6917 7.47815C7.30085 7.76286 5.98686 8.3414 4.8377 9.17505C3.68854 10.0087 2.73073 11.0782 2.02839 12.312C0.956464 14.1591 0.498905 16.2988 0.721698 18.4228C0.944492 20.5467 1.83612 22.5449 3.268 24.1293C2.81966 25.4759 2.66413 26.9026 2.81182 28.3141C2.95951 29.7256 3.40701 31.0892 4.12437 32.3138C5.18791 34.1659 6.8123 35.6322 8.76321 36.5013C10.7141 37.3704 12.8907 37.5973 14.9789 37.1492C15.9208 38.2107 17.0786 39.0587 18.3747 39.6366C19.6709 40.2144 21.0755 40.5087 22.4946 40.4998C24.6307 40.5054 26.7133 39.8321 28.4418 38.5772C30.1704 37.3223 31.4556 35.5506 32.1119 33.5179C33.5027 33.2332 34.8167 32.6547 35.9659 31.821C37.115 30.9874 38.0728 29.9178 38.7752 28.684C39.8458 26.8371 40.3023 24.6979 40.0789 22.5748C39.8556 20.4517 38.9639 18.4544 37.5324 16.8707ZM22.4978 37.8849C20.7443 37.8874 19.0459 37.2733 17.6994 36.1501C17.7601 36.117 17.8666 36.0586 17.936 36.016L25.9004 31.4156C26.1003 31.3019 26.2663 31.137 26.3813 30.9378C26.4964 30.7386 26.5563 30.5124 26.5549 30.2825V19.0542L29.9213 20.998C29.9389 21.0068 29.9541 21.0198 29.9656 21.0359C29.977 21.052 29.9842 21.0707 29.9867 21.0902V30.3889C29.9842 32.375 29.1946 34.2791 27.7909 35.6841C26.3872 37.0892 24.4838 37.8806 22.4978 37.8849ZM6.39227 31.0064C5.51397 29.4888 5.19742 27.7107 5.49804 25.9832C5.55718 26.0187 5.66048 26.0818 5.73461 26.124L13.699 30.7248C13.8975 30.8408 14.1233 30.902 14.3532 30.902C14.583 30.902 14.8088 30.8408 15.0073 30.7248L24.731 25.1103V28.9979C24.7321 29.0177 24.7283 29.0376 24.7199 29.0556C24.7115 29.0736 24.6988 29.0893 24.6829 29.1012L16.6317 33.7497C14.9096 34.7416 12.8643 35.0097 10.9447 34.4954C9.02506 33.9811 7.38785 32.7263 6.39227 31.0064ZM4.29707 13.6194C5.17156 12.0998 6.55279 10.9364 8.19885 10.3327C8.19885 10.4013 8.19491 10.5228 8.19491 10.6071V19.808C8.19351 20.0378 8.25334 20.2638 8.36823 20.4629C8.48312 20.6619 8.64893 20.8267 8.84863 20.9404L18.5723 26.5542L15.206 28.4979C15.1894 28.5089 15.1703 28.5155 15.1505 28.5173C15.1307 28.5191 15.1107 28.516 15.0924 28.5082L7.04046 23.8557C5.32135 22.8601 4.06716 21.2235 3.55289 19.3046C3.03862 17.3858 3.30624 15.3413 4.29707 13.6194ZM31.955 20.0556L22.2312 14.4411L25.5976 12.4981C25.6142 12.4872 25.6333 12.4805 25.6531 12.4787C25.6729 12.4769 25.6928 12.4801 25.7111 12.4879L33.7631 17.1364C34.9967 17.849 36.0017 18.8982 36.6606 20.1613C37.3194 21.4244 37.6047 22.849 37.4832 24.2684C37.3617 25.6878 36.8382 27.0432 35.9743 28.1759C35.1103 29.3086 33.9415 30.1717 32.6047 30.6641C32.6047 30.5947 32.6047 30.4733 32.6047 30.3889V21.188C32.6066 20.9586 32.5474 20.7328 32.4332 20.5338C32.319 20.3348 32.154 20.1698 31.955 20.0556ZM35.3055 15.0128C35.2464 14.9765 35.1431 14.9142 35.069 14.8717L27.1045 10.2712C26.906 10.1554 26.6803 10.0943 26.4504 10.0943C26.2206 10.0943 25.9948 10.1554 25.7963 10.2712L16.0726 15.8858V11.9982C16.0715 11.9783 16.0753 11.9585 16.0837 11.9405C16.0921 11.9225 16.1048 11.9068 16.1207 11.8949L24.1719 7.25025C25.4053 6.53903 26.8158 6.19376 28.2383 6.25482C29.6608 6.31589 31.0364 6.78077 32.2044 7.59508C33.3723 8.40939 34.2842 9.53945 34.8334 10.8531C35.3826 12.1667 35.5464 13.6095 35.3055 15.0128ZM14.2424 21.9419L10.8752 19.9981C10.8576 19.9893 10.8423 19.9763 10.8309 19.9602C10.8195 19.9441 10.8122 19.9254 10.8098 19.9058V10.6071C10.8107 9.18295 11.2173 7.78848 11.9819 6.58696C12.7466 5.38544 13.8377 4.42659 15.1275 3.82264C16.4173 3.21869 17.8524 2.99464 19.2649 3.1767C20.6775 3.35876 22.0089 3.93941 23.1034 4.85067C23.0427 4.88379 22.937 4.94215 22.8668 4.98473L14.9024 9.58517C14.7025 9.69878 14.5366 9.86356 14.4215 10.0626C14.3065 10.2616 14.2466 10.4877 14.2479 10.7175L14.2424 21.9419ZM16.071 17.9991L20.4018 15.4978L24.7325 17.9975V22.9985L20.4018 25.4983L16.071 22.9985V17.9991Z" fill="${isDark() ? '#f5f5f7' : '#111'}"/></svg></span>
-          <p class="eyebrow">Sub2API Access</p>
-          <h1>Join the allowlist</h1>
-          <p class="lede">Verify your key, then add the current client IP to the Cloudflare allowlist.</p>
+      const content = `
+        <header class="workspace-header">
+          <div class="workspace-copy">
+            <p class="eyebrow">Allowlist Entry</p>
+            <h1>Join the edge safely.</h1>
+            <p class="hero-copy">
+              Verify the access credential, confirm the human check, then add the current client IP to the Cloudflare allowlist.
+            </p>
+          </div>
+          <div class="workspace-actions">
+            <button class="ghost" type="button" id="goAdmin">Open admin</button>
+          </div>
+        </header>
+
+        <section class="helper-callout" aria-label="Flow summary">
+          <strong>How this works</strong>
+          <div class="step-pills">
+            <span class="step-pill">1. Enter invite</span>
+            <span class="step-pill">2. Pass Turnstile</span>
+            <span class="step-pill">3. Add current IP</span>
+          </div>
         </section>
-        <form class="panel" id="allowForm">
-          <label for="invite_key">Access key or UUID</label>
-          <div class="secret-field">
-            <input id="invite_key" name="invite_key" type="password" autocomplete="one-time-code" required autofocus placeholder="demo-key-001" />
-            <button class="ghost toggle-secret" type="button" aria-controls="invite_key" aria-pressed="false">Show</button>
+
+        <form class="panel panel-stack" id="allowForm">
+          <div class="panel-head">
+            <div>
+              <h2 class="panel-title">Access verification</h2>
+              <p class="panel-subtitle">
+                Use a short-lived access key or the user UUID tied to this session request.
+              </p>
+            </div>
+            <span class="micro-badge">Primary task</span>
           </div>
-          <div class="cf-turnstile-mock" id="turnstileMock">
-            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:400;font-size:13px;">
-              <input type="checkbox" id="turnstileCheck" style="width:auto;height:auto;" />
-              I'm human (Turnstile mock)
-            </label>
+
+          <div class="field">
+            <label for="invite_key">Access key or UUID</label>
+            <p class="field-hint">
+              Demo values: <code>demo-key-001</code> or <code>demo-invite-001</code>
+            </p>
+            <div class="secret-field">
+              <input
+                id="invite_key"
+                name="invite_key"
+                type="password"
+                autocomplete="one-time-code"
+                required
+                autofocus
+                placeholder="Paste invite key or UUID"
+              />
+              <button class="ghost toggle-secret" type="button" aria-controls="invite_key" aria-pressed="false">
+                Show
+              </button>
+            </div>
           </div>
-          <button id="submitBtn" type="submit" disabled>Add current IP</button>
+
+          <div class="field">
+            <label for="turnstileCheck">Human verification</label>
+            <div class="cf-turnstile-mock" id="turnstileMock">
+              <label class="turnstile-label">
+                <input type="checkbox" id="turnstileCheck" />
+                <span>
+                  I'm human (Turnstile mock)
+                  <span class="helper-note">This demo uses a mock check instead of a real Turnstile token.</span>
+                </span>
+              </label>
+            </div>
+          </div>
+
+          <div class="action-row">
+            <button id="submitBtn" class="btn-primary" type="submit" disabled>Add current IP</button>
+            <button class="ghost-wide" type="button" id="previewDemo">Load demo key</button>
+          </div>
         </form>
-        <p class="lede" style="text-align:center;font-size:13px;margin-top:8px;">
-          Try <code>demo-key-001</code> or <code>demo-invite-001</code>
-          &nbsp;·&nbsp;
-          <a href="#" id="goAdmin" style="color:#0071e3;text-decoration:none;">Admin panel</a>
-        </p>`;
+
+        <section class="message" aria-label="Demo disclaimer">
+          <strong class="section-title" style="color: var(--text-faint);">Transparency</strong>
+          <p>
+            This interface is a frontend-only demo. It does not perform real Cloudflare API calls, Turnstile validation, or Sub2API provisioning.
+          </p>
+        </section>
+
+        <p class="footer-note">
+          Need operator access instead? <a href="#" id="goAdminFooter">Go to the admin panel</a>.
+        </p>
+      `;
+
+      return renderShell(content, {
+        summary: "One clean task: verify the visitor, then let them add the current client IP without hunting through admin controls.",
+        activeView: "Access Form"
+      });
     }
 
     function renderDashboard() {
-      const inv = currentInvite;
+      const invite = currentInvite;
       const baseUrl = "https://api.example.com/v1";
-      const apiKey = "sk-" + inv.uuid.replace(/-/g, "").slice(0, 32);
+      const apiKey = "sk-" + invite.uuid.replace(/-/g, "").slice(0, 32);
       const curl = `curl ${baseUrl}/chat/completions -H "Authorization: Bearer ${apiKey}"`;
       const maskedCurl = `curl ${baseUrl}/chat/completions -H "Authorization: Bearer ${maskSecret(apiKey)}"`;
 
-      return `
-        <section class="hero">
-          <span class="sub2api-icon" aria-hidden="true"><svg viewBox="0 0 41 41" xmlns="http://www.w3.org/2000/svg"><path d="M37.5324 16.8707C37.9808 15.5241 38.1363 14.0974 37.9886 12.6859C37.8409 11.2744 37.3934 9.91076 36.676 8.68622C35.6126 6.83404 33.9882 5.3676 32.0373 4.4985C30.0864 3.62941 27.9098 3.40259 25.8215 3.85078C24.8796 2.7893 23.7219 1.94125 22.4257 1.36341C21.1295 0.785575 19.7249 0.491269 18.3058 0.500197C16.1708 0.495044 14.0893 1.16803 12.3614 2.42214C10.6335 3.67624 9.34853 5.44666 8.6917 7.47815C7.30085 7.76286 5.98686 8.3414 4.8377 9.17505C3.68854 10.0087 2.73073 11.0782 2.02839 12.312C0.956464 14.1591 0.498905 16.2988 0.721698 18.4228C0.944492 20.5467 1.83612 22.5449 3.268 24.1293C2.81966 25.4759 2.66413 26.9026 2.81182 28.3141C2.95951 29.7256 3.40701 31.0892 4.12437 32.3138C5.18791 34.1659 6.8123 35.6322 8.76321 36.5013C10.7141 37.3704 12.8907 37.5973 14.9789 37.1492C15.9208 38.2107 17.0786 39.0587 18.3747 39.6366C19.6709 40.2144 21.0755 40.5087 22.4946 40.4998C24.6307 40.5054 26.7133 39.8321 28.4418 38.5772C30.1704 37.3223 31.4556 35.5506 32.1119 33.5179C33.5027 33.2332 34.8167 32.6547 35.9659 31.821C37.115 30.9874 38.0728 29.9178 38.7752 28.684C39.8458 26.8371 40.3023 24.6979 40.0789 22.5748C39.8556 20.4517 38.9639 18.4544 37.5324 16.8707ZM22.4978 37.8849C20.7443 37.8874 19.0459 37.2733 17.6994 36.1501C17.7601 36.117 17.8666 36.0586 17.936 36.016L25.9004 31.4156C26.1003 31.3019 26.2663 31.137 26.3813 30.9378C26.4964 30.7386 26.5563 30.5124 26.5549 30.2825V19.0542L29.9213 20.998C29.9389 21.0068 29.9541 21.0198 29.9656 21.0359C29.977 21.052 29.9842 21.0707 29.9867 21.0902V30.3889C29.9842 32.375 29.1946 34.2791 27.7909 35.6841C26.3872 37.0892 24.4838 37.8806 22.4978 37.8849ZM6.39227 31.0064C5.51397 29.4888 5.19742 27.7107 5.49804 25.9832C5.55718 26.0187 5.66048 26.0818 5.73461 26.124L13.699 30.7248C13.8975 30.8408 14.1233 30.902 14.3532 30.902C14.583 30.902 14.8088 30.8408 15.0073 30.7248L24.731 25.1103V28.9979C24.7321 29.0177 24.7283 29.0376 24.7199 29.0556C24.7115 29.0736 24.6988 29.0893 24.6829 29.1012L16.6317 33.7497C14.9096 34.7416 12.8643 35.0097 10.9447 34.4954C9.02506 33.9811 7.38785 32.7263 6.39227 31.0064ZM4.29707 13.6194C5.17156 12.0998 6.55279 10.9364 8.19885 10.3327C8.19885 10.4013 8.19491 10.5228 8.19491 10.6071V19.808C8.19351 20.0378 8.25334 20.2638 8.36823 20.4629C8.48312 20.6619 8.64893 20.8267 8.84863 20.9404L18.5723 26.5542L15.206 28.4979C15.1894 28.5089 15.1703 28.5155 15.1505 28.5173C15.1307 28.5191 15.1107 28.516 15.0924 28.5082L7.04046 23.8557C5.32135 22.8601 4.06716 21.2235 3.55289 19.3046C3.03862 17.3858 3.30624 15.3413 4.29707 13.6194ZM31.955 20.0556L22.2312 14.4411L25.5976 12.4981C25.6142 12.4872 25.6333 12.4805 25.6531 12.4787C25.6729 12.4769 25.6928 12.4801 25.7111 12.4879L33.7631 17.1364C34.9967 17.849 36.0017 18.8982 36.6606 20.1613C37.3194 21.4244 37.6047 22.849 37.4832 24.2684C37.3617 25.6878 36.8382 27.0432 35.9743 28.1759C35.1103 29.3086 33.9415 30.1717 32.6047 30.6641C32.6047 30.5947 32.6047 30.4733 32.6047 30.3889V21.188C32.6066 20.9586 32.5474 20.7328 32.4332 20.5338C32.319 20.3348 32.154 20.1698 31.955 20.0556ZM35.3055 15.0128C35.2464 14.9765 35.1431 14.9142 35.069 14.8717L27.1045 10.2712C26.906 10.1554 26.6803 10.0943 26.4504 10.0943C26.2206 10.0943 25.9948 10.1554 25.7963 10.2712L16.0726 15.8858V11.9982C16.0715 11.9783 16.0753 11.9585 16.0837 11.9405C16.0921 11.9225 16.1048 11.9068 16.1207 11.8949L24.1719 7.25025C25.4053 6.53903 26.8158 6.19376 28.2383 6.25482C29.6608 6.31589 31.0364 6.78077 32.2044 7.59508C33.3723 8.40939 34.2842 9.53945 34.8334 10.8531C35.3826 12.1667 35.5464 13.6095 35.3055 15.0128ZM14.2424 21.9419L10.8752 19.9981C10.8576 19.9893 10.8423 19.9763 10.8309 19.9602C10.8195 19.9441 10.8122 19.9254 10.8098 19.9058V10.6071C10.8107 9.18295 11.2173 7.78848 11.9819 6.58696C12.7466 5.38544 13.8377 4.42659 15.1275 3.82264C16.4173 3.21869 17.8524 2.99464 19.2649 3.1767C20.6775 3.35876 22.0089 3.93941 23.1034 4.85067C23.0427 4.88379 22.937 4.94215 22.8668 4.98473L14.9024 9.58517C14.7025 9.69878 14.5366 9.86356 14.4215 10.0626C14.3065 10.2616 14.2466 10.4877 14.2479 10.7175L14.2424 21.9419ZM16.071 17.9991L20.4018 15.4978L24.7325 17.9975V22.9985L20.4018 25.4983L16.071 22.9985V17.9991Z" fill="${isDark() ? '#f5f5f7' : '#111'}"/></svg></span>
-          <p class="eyebrow">Sub2API Access</p>
-          <h1>${esc(inv.name || "Signed in")}</h1>
-          <p class="lede">UUID ${esc(inv.uuid)} is signed in on this browser.</p>
-        </section>
-        <section class="panel dashboard">
-          <p class="success">203.0.113.0/24 has been added to the access allowlist.</p>
-          <p class="success">Current IP already added: 203.0.113.42 (203.0.113.0/24)</p>
-          <div class="api-card">
-            <strong>Sub2API account</strong>
-            <p class="lede">Use the button below to open Sub2API.</p>
-            <button class="ghost-wide" type="button">Open Sub2API</button>
-            <div class="copy-line"><code>${esc("https://api.example.com")}</code><button class="ghost compact copy-value" type="button" data-copy="${esc("https://api.example.com")}">Copy URL</button></div>
+      const content = `
+        <div class="top-nav">
+          <div class="nav-left">
+            <span class="micro-badge">Authenticated session</span>
+            <span class="micro-badge">${esc(invite.name)}</span>
           </div>
-          <div class="api-card">
-            <strong>Sub2API</strong>
+          <div class="nav-right">
+            <button class="ghost" type="button" id="goAdmin">Open admin</button>
+            <button class="ghost" type="button" id="logoutBtn">Log out</button>
+          </div>
+        </div>
+
+        <header class="workspace-header">
+          <div class="workspace-copy">
+            <p class="eyebrow">Allowlist Complete</p>
+            <h1>${esc(invite.name)}</h1>
+            <p class="hero-copy">
+              Your invite is active in this browser. The allowlist action succeeded, and the ready-to-use API details are below.
+            </p>
+          </div>
+        </header>
+
+        <section class="status-banner">
+          <strong class="section-title" style="color: var(--success);">Access granted</strong>
+          <p class="panel-subtitle" style="color: var(--success);">
+            <strong>203.0.113.0/24</strong> has been added to the access allowlist.
+          </p>
+          <p class="panel-subtitle" style="color: var(--success);">
+            Current IP already added: <code>203.0.113.42</code> inside <code>203.0.113.0/24</code>
+          </p>
+        </section>
+
+        <section class="dashboard-grid">
+          <article class="api-card">
+            <strong>Sub2API account</strong>
+            <p class="panel-subtitle">Jump into the product or copy the service root for quick sharing.</p>
+            <button class="ghost-wide" type="button">Open Sub2API</button>
+            <label>Service URL</label>
+            <div class="copy-line">
+              <code>https://api.example.com</code>
+              <button class="ghost compact copy-value" type="button" data-copy="https://api.example.com">Copy URL</button>
+            </div>
+          </article>
+
+          <article class="api-card">
+            <strong>Credentials</strong>
+            <p class="panel-subtitle">Use the OpenAI-compatible base URL and the generated API key.</p>
             <label>Base URL</label>
-            <div class="copy-line"><code>${esc(baseUrl)}</code><button class="ghost compact copy-value" type="button" data-copy="${esc(baseUrl)}">Copy</button></div>
+            <div class="copy-line">
+              <code>${esc(baseUrl)}</code>
+              <button class="ghost compact copy-value" type="button" data-copy="${esc(baseUrl)}">Copy</button>
+            </div>
             <label>API key</label>
             <div class="secret-copy-line">
               <input class="copy-secret" type="password" value="${esc(apiKey)}" readonly autocomplete="off" spellcheck="false" aria-label="API key" />
               <button class="ghost compact toggle-dashboard-secret" type="button" aria-pressed="false">Show</button>
               <button class="ghost compact copy-value" type="button" data-copy="${esc(apiKey)}">Copy</button>
             </div>
-            <label>OpenAI format</label>
-            <div class="copy-line"><code class="secret-format" data-masked-value="${esc(maskedCurl)}" data-full-value="${esc(curl)}">${esc(maskedCurl)}</code><button class="ghost compact copy-value" type="button" data-copy="${esc(curl)}">Copy</button></div>
-          </div>
-          <button class="ghost-wide" type="button" id="logoutBtn">Log out</button>
-        </section>`;
+            <label>CLI example</label>
+            <div class="copy-line">
+              <code class="secret-format" data-masked-value="${esc(maskedCurl)}" data-full-value="${esc(curl)}">${esc(maskedCurl)}</code>
+              <button class="ghost compact copy-value" type="button" data-copy="${esc(curl)}">Copy</button>
+            </div>
+          </article>
+        </section>
+
+        <section class="message">
+          <strong class="section-title">Session details</strong>
+          <p>Invite UUID: <code>${esc(invite.uuid)}</code></p>
+          <p>In production, this step would be backed by a real allowlist mutation and downstream user provisioning.</p>
+        </section>
+      `;
+
+      return renderShell(content, {
+        summary: "Once the primary action succeeds, the page pivots into a compact handoff surface: success first, credentials second, secondary admin actions tucked away.",
+        activeView: "Signed-In Dashboard"
+      });
     }
 
     function renderAdmin() {
-      const userCards = adminUsers.map(u => `
+      const userCards = adminUsers.map((user) => `
         <article class="user-card">
-          <strong>${esc(u.username)}</strong>
-          <small>${esc(u.email)}</small>
-          <code style="font-size:11px;">${esc(u.uuid)}</code>
-          <small>${esc(u.remark || "")}</small>
-        </article>`).join("");
-
-      return `
-        <section class="hero">
-          <span class="sub2api-icon" aria-hidden="true"><svg viewBox="0 0 41 41" xmlns="http://www.w3.org/2000/svg"><path d="M37.5324 16.8707C37.9808 15.5241 38.1363 14.0974 37.9886 12.6859C37.8409 11.2744 37.3934 9.91076 36.676 8.68622C35.6126 6.83404 33.9882 5.3676 32.0373 4.4985C30.0864 3.62941 27.9098 3.40259 25.8215 3.85078C24.8796 2.7893 23.7219 1.94125 22.4257 1.36341C21.1295 0.785575 19.7249 0.491269 18.3058 0.500197C16.1708 0.495044 14.0893 1.16803 12.3614 2.42214C10.6335 3.67624 9.34853 5.44666 8.6917 7.47815C7.30085 7.76286 5.98686 8.3414 4.8377 9.17505C3.68854 10.0087 2.73073 11.0782 2.02839 12.312C0.956464 14.1591 0.498905 16.2988 0.721698 18.4228C0.944492 20.5467 1.83612 22.5449 3.268 24.1293C2.81966 25.4759 2.66413 26.9026 2.81182 28.3141C2.95951 29.7256 3.40701 31.0892 4.12437 32.3138C5.18791 34.1659 6.8123 35.6322 8.76321 36.5013C10.7141 37.3704 12.8907 37.5973 14.9789 37.1492C15.9208 38.2107 17.0786 39.0587 18.3747 39.6366C19.6709 40.2144 21.0755 40.5087 22.4946 40.4998C24.6307 40.5054 26.7133 39.8321 28.4418 38.5772C30.1704 37.3223 31.4556 35.5506 32.1119 33.5179C33.5027 33.2332 34.8167 32.6547 35.9659 31.821C37.115 30.9874 38.0728 29.9178 38.7752 28.684C39.8458 26.8371 40.3023 24.6979 40.0789 22.5748C39.8556 20.4517 38.9639 18.4544 37.5324 16.8707ZM22.4978 37.8849C20.7443 37.8874 19.0459 37.2733 17.6994 36.1501C17.7601 36.117 17.8666 36.0586 17.936 36.016L25.9004 31.4156C26.1003 31.3019 26.2663 31.137 26.3813 30.9378C26.4964 30.7386 26.5563 30.5124 26.5549 30.2825V19.0542L29.9213 20.998C29.9389 21.0068 29.9541 21.0198 29.9656 21.0359C29.977 21.052 29.9842 21.0707 29.9867 21.0902V30.3889C29.9842 32.375 29.1946 34.2791 27.7909 35.6841C26.3872 37.0892 24.4838 37.8806 22.4978 37.8849ZM6.39227 31.0064C5.51397 29.4888 5.19742 27.7107 5.49804 25.9832C5.55718 26.0187 5.66048 26.0818 5.73461 26.124L13.699 30.7248C13.8975 30.8408 14.1233 30.902 14.3532 30.902C14.583 30.902 14.8088 30.8408 15.0073 30.7248L24.731 25.1103V28.9979C24.7321 29.0177 24.7283 29.0376 24.7199 29.0556C24.7115 29.0736 24.6988 29.0893 24.6829 29.1012L16.6317 33.7497C14.9096 34.7416 12.8643 35.0097 10.9447 34.4954C9.02506 33.9811 7.38785 32.7263 6.39227 31.0064ZM4.29707 13.6194C5.17156 12.0998 6.55279 10.9364 8.19885 10.3327C8.19885 10.4013 8.19491 10.5228 8.19491 10.6071V19.808C8.19351 20.0378 8.25334 20.2638 8.36823 20.4629C8.48312 20.6619 8.64893 20.8267 8.84863 20.9404L18.5723 26.5542L15.206 28.4979C15.1894 28.5089 15.1703 28.5155 15.1505 28.5173C15.1307 28.5191 15.1107 28.516 15.0924 28.5082L7.04046 23.8557C5.32135 22.8601 4.06716 21.2235 3.55289 19.3046C3.03862 17.3858 3.30624 15.3413 4.29707 13.6194ZM31.955 20.0556L22.2312 14.4411L25.5976 12.4981C25.6142 12.4872 25.6333 12.4805 25.6531 12.4787C25.6729 12.4769 25.6928 12.4801 25.7111 12.4879L33.7631 17.1364C34.9967 17.849 36.0017 18.8982 36.6606 20.1613C37.3194 21.4244 37.6047 22.849 37.4832 24.2684C37.3617 25.6878 36.8382 27.0432 35.9743 28.1759C35.1103 29.3086 33.9415 30.1717 32.6047 30.6641C32.6047 30.5947 32.6047 30.4733 32.6047 30.3889V21.188C32.6066 20.9586 32.5474 20.7328 32.4332 20.5338C32.319 20.3348 32.154 20.1698 31.955 20.0556ZM35.3055 15.0128C35.2464 14.9765 35.1431 14.9142 35.069 14.8717L27.1045 10.2712C26.906 10.1554 26.6803 10.0943 26.4504 10.0943C26.2206 10.0943 25.9948 10.1554 25.7963 10.2712L16.0726 15.8858V11.9982C16.0715 11.9783 16.0753 11.9585 16.0837 11.9405C16.0921 11.9225 16.1048 11.9068 16.1207 11.8949L24.1719 7.25025C25.4053 6.53903 26.8158 6.19376 28.2383 6.25482C29.6608 6.31589 31.0364 6.78077 32.2044 7.59508C33.3723 8.40939 34.2842 9.53945 34.8334 10.8531C35.3826 12.1667 35.5464 13.6095 35.3055 15.0128ZM14.2424 21.9419L10.8752 19.9981C10.8576 19.9893 10.8423 19.9763 10.8309 19.9602C10.8195 19.9441 10.8122 19.9254 10.8098 19.9058V10.6071C10.8107 9.18295 11.2173 7.78848 11.9819 6.58696C12.7466 5.38544 13.8377 4.42659 15.1275 3.82264C16.4173 3.21869 17.8524 2.99464 19.2649 3.1767C20.6775 3.35876 22.0089 3.93941 23.1034 4.85067C23.0427 4.88379 22.937 4.94215 22.8668 4.98473L14.9024 9.58517C14.7025 9.69878 14.5366 9.86356 14.4215 10.0626C14.3065 10.2616 14.2466 10.4877 14.2479 10.7175L14.2424 21.9419ZM16.071 17.9991L20.4018 15.4978L24.7325 17.9975V22.9985L20.4018 25.4983L16.071 22.9985V17.9991Z" fill="${isDark() ? '#f5f5f7' : '#111'}"/></svg></span>
-          <p class="eyebrow">Admin</p>
-          <h1>Manage users</h1>
-          <p class="lede">Create, edit, and manage UUID-based access.</p>
-        </section>
-        <section class="panel">
-          <div class="tabs">
-            <button class="tab active" data-tab="users">Users</button>
-            <button class="tab" data-tab="add">Add user</button>
+          <div class="user-meta">
+            <strong>${esc(user.username)}</strong>
+            <span class="micro-badge">UUID access</span>
           </div>
-          <div class="tab-panel active" id="tab-users">
+          <small>${esc(user.email)}</small>
+          <code>${esc(user.uuid)}</code>
+          <small>${esc(user.remark || "No remark provided")}</small>
+        </article>
+      `).join("");
+
+      const content = `
+        <div class="top-nav">
+          <div class="nav-left">
+            <span class="micro-badge">Operator workspace</span>
+            <span class="micro-badge">${adminUsers.length} users</span>
+          </div>
+          <div class="nav-right">
+            <button class="ghost" type="button" id="goBack">Back to access flow</button>
+          </div>
+        </div>
+
+        <header class="workspace-header">
+          <div class="workspace-copy">
+            <p class="eyebrow">Admin Console</p>
+            <h1>Manage access without noise.</h1>
+            <p class="hero-copy">
+              Create and validate UUID-based entries while keeping duplicate username detection visible and understandable.
+            </p>
+          </div>
+        </header>
+
+        <section class="helper-callout">
+          <strong>Operator notes</strong>
+          <div class="step-pills">
+            <span class="step-pill">Normalize usernames</span>
+            <span class="step-pill">Reject duplicates</span>
+            <span class="step-pill">Provision downstream later</span>
+          </div>
+        </section>
+
+        <section class="panel panel-stack">
+          <div class="tabs" role="tablist" aria-label="Admin sections">
+            <button class="tab active" type="button" data-tab="users" role="tab" aria-selected="true">Users</button>
+            <button class="tab" type="button" data-tab="add" role="tab" aria-selected="false">Add user</button>
+          </div>
+
+          <div class="tab-panel active" id="tab-users" role="tabpanel">
+            <div class="panel-head">
+              <div>
+                <h2 class="panel-title">Current UUID users</h2>
+                <p class="panel-subtitle">A simple, scrollable list keeps the main admin view scannable.</p>
+              </div>
+            </div>
             <div class="user-list">${userCards}</div>
           </div>
-          <div class="tab-panel" id="tab-add">
+
+          <div class="tab-panel" id="tab-add" role="tabpanel">
+            <div class="panel-head">
+              <div>
+                <h2 class="panel-title">Create a user</h2>
+                <p class="panel-subtitle">
+                  Usernames are normalized before save. Try the duplicate example to preview validation feedback.
+                </p>
+              </div>
+            </div>
+
             <form id="addUserForm" class="admin-form">
               <div class="field">
                 <label for="a-username">Username</label>
@@ -348,93 +1366,148 @@
                 <label for="a-remark">Remark</label>
                 <input id="a-remark" placeholder="Engineering sandbox" />
               </div>
-              <div class="span-2" style="display:flex;gap:10px;">
-                <button type="submit">Add user</button>
-                <button type="button" class="ghost-wide" id="loadConflict" style="min-height:40px;">Load duplicate example</button>
+              <div class="action-row span-2">
+                <button class="btn-primary" type="submit">Add user</button>
+                <button type="button" class="ghost-wide" id="loadConflict">Load duplicate example</button>
               </div>
             </form>
-            <div id="adminStatus" class="admin-status">Try adding a user, then try a duplicate like <code>Alice!!</code>.</div>
+
+            <div id="adminStatus" class="admin-status${adminStatusKind ? ` ${adminStatusKind}` : ""}">
+              ${adminStatusMessage}
+            </div>
           </div>
         </section>
-        <p class="lede" style="text-align:center;font-size:13px;margin-top:8px;">
-          <a href="#" id="goBack" style="color:#0071e3;text-decoration:none;">Back to allowlist</a>
-        </p>`;
+      `;
+
+      return renderShell(content, {
+        summary: "The admin side now separates scanning from editing, keeps one primary action per panel, and makes validation intent readable before users hit an error.",
+        activeView: "Admin Console"
+      });
     }
 
-    // ── Events ──
-    function bindEvents() {
-      // Toggle secret visibility
-      document.querySelectorAll(".toggle-secret").forEach(btn => {
-        btn.addEventListener("click", () => {
-          const input = document.getElementById("invite_key");
-          const show = input.type === "password";
-          input.type = show ? "text" : "password";
-          btn.textContent = show ? "Hide" : "Show";
-          btn.setAttribute("aria-pressed", String(show));
-        });
-      });
+    function render() {
+      const app = document.getElementById("app");
+      if (view === "form") app.innerHTML = renderForm();
+      if (view === "dashboard") app.innerHTML = renderDashboard();
+      if (view === "admin") app.innerHTML = renderAdmin();
+      bindEvents();
+    }
 
-      // Dashboard secret toggles
-      document.querySelectorAll(".toggle-dashboard-secret").forEach(btn => {
-        btn.addEventListener("click", () => {
-          const card = btn.closest(".api-card");
-          const input = btn.closest(".secret-copy-line")?.querySelector(".copy-secret");
+    function switchTab(tabName) {
+      document.querySelectorAll(".tab").forEach((tab) => {
+        const active = tab.dataset.tab === tabName;
+        tab.classList.toggle("active", active);
+        tab.setAttribute("aria-selected", String(active));
+      });
+      document.querySelectorAll(".tab-panel").forEach((panel) => {
+        panel.classList.toggle("active", panel.id === `tab-${tabName}`);
+      });
+    }
+
+    function bindEvents() {
+      document.querySelectorAll(".toggle-secret").forEach((button) => {
+        button.addEventListener("click", () => {
+          const input = document.getElementById("invite_key");
           if (!input) return;
           const show = input.type === "password";
           input.type = show ? "text" : "password";
-          btn.textContent = show ? "Hide" : "Show";
-          btn.setAttribute("aria-pressed", String(show));
-          card?.querySelectorAll(".secret-format").forEach(code => {
-            code.textContent = show ? code.dataset.fullValue : code.dataset.maskedValue;
+          button.textContent = show ? "Hide" : "Show";
+          button.setAttribute("aria-pressed", String(show));
+        });
+      });
+
+      document.querySelectorAll(".toggle-dashboard-secret").forEach((button) => {
+        button.addEventListener("click", () => {
+          const input = button.closest(".secret-copy-line")?.querySelector(".copy-secret");
+          if (!input) return;
+          const show = input.type === "password";
+          input.type = show ? "text" : "password";
+          button.textContent = show ? "Hide" : "Show";
+          button.setAttribute("aria-pressed", String(show));
+          document.querySelectorAll(".secret-format").forEach((codeEl) => {
+            codeEl.textContent = show ? codeEl.dataset.fullValue : codeEl.dataset.maskedValue;
           });
         });
       });
 
-      // Copy buttons
-      document.querySelectorAll(".copy-value").forEach(btn => {
-        btn.addEventListener("click", async () => {
+      document.querySelectorAll(".copy-value").forEach((button) => {
+        button.addEventListener("click", async () => {
           try {
-            await navigator.clipboard.writeText(btn.dataset.copy);
-            const orig = btn.textContent;
-            btn.textContent = "Copied";
-            setTimeout(() => btn.textContent = orig, 1400);
+            await navigator.clipboard.writeText(button.dataset.copy || "");
+            const original = button.textContent;
+            button.textContent = "Copied";
+            setTimeout(() => {
+              button.textContent = original;
+            }, 1400);
           } catch {}
         });
       });
 
-      // Turnstile mock checkbox
+      const previewDemo = document.getElementById("previewDemo");
+      if (previewDemo) {
+        previewDemo.addEventListener("click", () => {
+          const input = document.getElementById("invite_key");
+          if (!input) return;
+          input.value = "demo-key-001";
+          input.focus();
+        });
+      }
+
       const check = document.getElementById("turnstileCheck");
-      const submitBtn = document.getElementById("submitBtn");
+      const submitButton = document.getElementById("submitBtn");
       const turnstileMock = document.getElementById("turnstileMock");
-      if (check && submitBtn) {
+      if (check && submitButton && turnstileMock) {
         check.addEventListener("change", () => {
           turnstilePassed = check.checked;
-          submitBtn.disabled = !turnstilePassed;
+          submitButton.disabled = !turnstilePassed;
           turnstileMock.classList.toggle("checked", turnstilePassed);
         });
       }
 
-      // Allow form submit
       const allowForm = document.getElementById("allowForm");
       if (allowForm) {
-        allowForm.addEventListener("submit", e => {
-          e.preventDefault();
-          const key = document.getElementById("invite_key").value.trim();
-          const inv = MOCK_INVITES[key];
-          if (!inv) {
+        allowForm.addEventListener("submit", (event) => {
+          event.preventDefault();
+          const key = document.getElementById("invite_key")?.value.trim();
+          const invite = MOCK_INVITES[key];
+          if (!invite) {
             alert("Invalid key. Try demo-key-001 or demo-invite-001.");
             return;
           }
-          currentInvite = { ...inv };
+          currentInvite = { ...invite };
           view = "dashboard";
           render();
         });
       }
 
-      // Logout
-      const logoutBtn = document.getElementById("logoutBtn");
-      if (logoutBtn) {
-        logoutBtn.addEventListener("click", () => {
+      const goAdmin = document.getElementById("goAdmin");
+      if (goAdmin) {
+        goAdmin.addEventListener("click", () => {
+          view = "admin";
+          render();
+        });
+      }
+
+      const goAdminFooter = document.getElementById("goAdminFooter");
+      if (goAdminFooter) {
+        goAdminFooter.addEventListener("click", (event) => {
+          event.preventDefault();
+          view = "admin";
+          render();
+        });
+      }
+
+      const goBack = document.getElementById("goBack");
+      if (goBack) {
+        goBack.addEventListener("click", () => {
+          view = currentInvite ? "dashboard" : "form";
+          render();
+        });
+      }
+
+      const logoutButton = document.getElementById("logoutBtn");
+      if (logoutButton) {
+        logoutButton.addEventListener("click", () => {
           currentInvite = null;
           turnstilePassed = false;
           view = "form";
@@ -442,32 +1515,23 @@
         });
       }
 
-      // Navigation
-      const goAdmin = document.getElementById("goAdmin");
-      if (goAdmin) {
-        goAdmin.addEventListener("click", e => { e.preventDefault(); view = "admin"; render(); });
-      }
-      const goBack = document.getElementById("goBack");
-      if (goBack) {
-        goBack.addEventListener("click", e => { e.preventDefault(); view = currentInvite ? "dashboard" : "form"; render(); });
-      }
-
-      // Admin tabs
-      document.querySelectorAll(".tab").forEach(tab => {
+      document.querySelectorAll(".tab").forEach((tab) => {
         tab.addEventListener("click", () => {
-          document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
-          document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
-          tab.classList.add("active");
-          document.getElementById("tab-" + tab.dataset.tab)?.classList.add("active");
+          switchTab(tab.dataset.tab);
         });
       });
 
-      // Admin add user
       const addUserForm = document.getElementById("addUserForm");
-      const uuidInput = document.getElementById("a-uuid");
-      if (uuidInput && !uuidInput.value) uuidInput.value = crypto.randomUUID();
-
       const usernameInput = document.getElementById("a-username");
+      const uuidInput = document.getElementById("a-uuid");
+      const emailInput = document.getElementById("a-email");
+      const remarkInput = document.getElementById("a-remark");
+      const statusEl = document.getElementById("adminStatus");
+
+      if (uuidInput && !uuidInput.value) {
+        uuidInput.value = crypto.randomUUID();
+      }
+
       if (usernameInput) {
         usernameInput.addEventListener("input", () => {
           usernameInput.value = normalizeUsername(usernameInput.value);
@@ -475,73 +1539,70 @@
         });
       }
 
-      if (addUserForm) {
-        addUserForm.addEventListener("submit", e => {
-          e.preventDefault();
+      if (addUserForm && usernameInput && uuidInput && emailInput && remarkInput && statusEl) {
+        addUserForm.addEventListener("submit", (event) => {
+          event.preventDefault();
           const username = normalizeUsername(usernameInput.value);
           usernameInput.value = username;
-          const statusEl = document.getElementById("adminStatus");
 
           if (!username) {
             usernameInput.setCustomValidity("Username is required.");
             usernameInput.reportValidity();
+            adminStatusKind = "error";
+            adminStatusMessage = "Username cannot be empty.";
             statusEl.className = "admin-status error";
-            statusEl.textContent = "Username cannot be empty.";
+            statusEl.textContent = adminStatusMessage;
             return;
           }
 
-          const dup = adminUsers.some(u => normalizeUsername(u.username) === username);
-          if (dup) {
+          const duplicate = adminUsers.some((user) => normalizeUsername(user.username) === username);
+          if (duplicate) {
             usernameInput.setCustomValidity("Username already exists.");
             usernameInput.reportValidity();
+            adminStatusKind = "error";
+            adminStatusMessage = `"${username}" already exists after normalization.`;
             statusEl.className = "admin-status error";
-            statusEl.textContent = `"${username}" already exists (normalized duplicate).`;
+            statusEl.textContent = adminStatusMessage;
             return;
           }
 
-          const email = document.getElementById("a-email").value.trim() || `${username}@sub2api.local`;
+          const email = emailInput.value.trim() || `${username}@sub2api.local`;
           adminUsers.unshift({
             username,
             email,
             uuid: uuidInput.value.trim() || crypto.randomUUID(),
-            remark: document.getElementById("a-remark").value.trim(),
+            remark: remarkInput.value.trim()
           });
+
           addUserForm.reset();
           uuidInput.value = crypto.randomUUID();
+          adminStatusKind = "";
+          adminStatusMessage = `Added "${username}". In production this would also provision the Sub2API user and API key.`;
           statusEl.className = "admin-status";
-          statusEl.textContent = `Added "${username}". In production this would also provision the Sub2API user and API key.`;
-          // Re-render admin
+          statusEl.textContent = adminStatusMessage;
+
           view = "admin";
           render();
-          // Switch to users tab
-          document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
-          document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
-          document.querySelector('.tab[data-tab="users"]')?.classList.add("active");
-          document.getElementById("tab-users")?.classList.add("active");
+          switchTab("users");
         });
       }
 
-      // Load conflict example
       const loadConflict = document.getElementById("loadConflict");
-      if (loadConflict && usernameInput) {
+      if (loadConflict && usernameInput && uuidInput && emailInput && remarkInput && statusEl) {
         loadConflict.addEventListener("click", () => {
           usernameInput.value = "Alice!!";
-          document.getElementById("a-email").value = "alice2@sub2api.local";
+          emailInput.value = "alice2@sub2api.local";
           uuidInput.value = crypto.randomUUID();
-          document.getElementById("a-remark").value = "Intentional duplicate";
+          remarkInput.value = "Intentional duplicate";
           usernameInput.focus();
-          const statusEl = document.getElementById("adminStatus");
+          adminStatusKind = "";
+          adminStatusMessage = 'Filled with "Alice!!" which normalizes to an existing username. Submit to preview the duplicate check.';
           statusEl.className = "admin-status";
-          statusEl.textContent = 'Filled with "Alice!!" which normalizes to an existing username. Submit to see validation.';
+          statusEl.textContent = adminStatusMessage;
         });
       }
     }
 
-    function normalizeUsername(v) {
-      return String(v || "").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[._-]+|[._-]+$/g, "").slice(0, 100);
-    }
-
-    // ── Init ──
     render();
   </script>
 </body>
