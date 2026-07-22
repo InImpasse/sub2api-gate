@@ -1,9 +1,12 @@
 import importlib.util
 import os
 import pathlib
+import pty
+import stat
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -84,6 +87,54 @@ class PrivateEnvironmentTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn(sentinel, result.stdout + result.stderr)
 
+    def test_private_environment_rejects_noncanonical_line_separators(self):
+        parser = load_python_script(PARSER, "private_env_line_separators")
+        invalid_payloads = {
+            "vertical-tab": b"FIRST=literal\x0bSECOND=literal\n",
+            "form-feed": b"FIRST=literal\x0cSECOND=literal\n",
+            "next-line": "FIRST=literal\u0085SECOND=literal\n".encode("utf-8"),
+            "line-separator": "FIRST=literal\u2028SECOND=literal\n".encode("utf-8"),
+            "paragraph-separator": "FIRST=literal\u2029SECOND=literal\n".encode("utf-8"),
+            "lone-carriage-return": b"FIRST=literal\rSECOND=literal\n",
+            "terminal-carriage-return": b"FIRST=literal\r",
+        }
+        for name, payload in invalid_payloads.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                path = pathlib.Path(directory) / "private.env"
+                path.write_bytes(payload)
+                path.chmod(0o600)
+                with self.assertRaises(parser.PrivateEnvironmentError):
+                    parser.read_private_environment(path)
+
+    def test_private_environment_rejects_controls_and_non_ascii_before_parsing(self):
+        parser = load_python_script(PARSER, "private_env_raw_character_boundary")
+        invalid_fragments = [
+            bytes([value]) for value in range(0x20) if value not in {0x0A, 0x0D}
+        ] + [b"\x7f", b"\x80", "\u00e4".encode("utf-8")]
+        for fragment in invalid_fragments:
+            with self.subTest(fragment=fragment.hex()), tempfile.TemporaryDirectory() as directory:
+                path = pathlib.Path(directory) / "private.env"
+                path.write_bytes(b"# ignored" + fragment + b"text\nVALUE=literal\n")
+                path.chmod(0o600)
+                with self.assertRaises(parser.PrivateEnvironmentError):
+                    parser.read_private_environment(path)
+
+    def test_private_environment_accepts_lf_and_verified_crlf(self):
+        parser = load_python_script(PARSER, "private_env_canonical_line_endings")
+        payloads = (
+            b"  # comment\n\nFIRST=literal\nSECOND=alpha=beta\n",
+            b"  # comment\r\n\r\nFIRST=literal\r\nSECOND=alpha=beta\r\n",
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                path = pathlib.Path(directory) / "private.env"
+                path.write_bytes(payload)
+                path.chmod(0o600)
+                self.assertEqual(
+                    parser.read_private_environment(path),
+                    {"FIRST": "literal", "SECOND": "alpha=beta"},
+                )
+
     def test_private_environment_requires_mode_0600_and_rejects_symlinks(self):
         parser = load_python_script(PARSER, "private_env_file_boundary")
         with tempfile.TemporaryDirectory() as directory:
@@ -95,6 +146,203 @@ class PrivateEnvironmentTests(unittest.TestCase):
             alias.symlink_to(path)
             with self.assertRaisesRegex(parser.PrivateEnvironmentError, "non-symlink"):
                 parser.read_private_environment(alias)
+
+    def test_private_environment_requires_an_absolute_path(self):
+        sentinel = "RELATIVE_PRIVATE_ENV_SENTINEL"
+        with tempfile.TemporaryDirectory() as directory:
+            self.write_environment(directory, f"VALUE={sentinel}\n")
+            result = subprocess.run(
+                [PARSER, "--emit-nul", "private.env"],
+                cwd=directory,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("absolute", result.stderr)
+        self.assertNotIn(sentinel, result.stdout + result.stderr)
+
+    def test_emit_nul_rejects_a_regular_output_file_before_emitting_secrets(self):
+        sentinel = "PRIVATE_ENV_REGULAR_OUTPUT_SENTINEL"
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_environment(directory, f"VALUE={sentinel}\n")
+            output_path = pathlib.Path(directory) / "captured.env"
+            with output_path.open("wb") as output:
+                result = subprocess.run(
+                    [PARSER, "--emit-nul", path],
+                    check=False,
+                    stdout=output,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(output_path.read_bytes(), b"")
+            self.assertIn("protected pipe", result.stderr)
+            self.assertNotIn(sentinel, result.stderr)
+
+    def test_emit_nul_rejects_a_directory_output_descriptor(self):
+        sentinel = "PRIVATE_ENV_DIRECTORY_OUTPUT_SENTINEL"
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_environment(directory, f"VALUE={sentinel}\n")
+            output_descriptor = os.open(
+                directory,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                result = subprocess.run(
+                    [PARSER, "--emit-nul", path],
+                    check=False,
+                    stdout=output_descriptor,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            finally:
+                os.close(output_descriptor)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn(sentinel, result.stderr)
+
+    def test_emit_nul_rejects_a_tty_output_descriptor(self):
+        sentinel = "PRIVATE_ENV_TTY_OUTPUT_SENTINEL"
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_environment(directory, f"VALUE={sentinel}\n")
+            master_descriptor, slave_descriptor = pty.openpty()
+            try:
+                result = subprocess.run(
+                    [PARSER, "--emit-nul", path],
+                    check=False,
+                    stdout=slave_descriptor,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            finally:
+                os.close(slave_descriptor)
+                os.close(master_descriptor)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("protected pipe", result.stderr)
+            self.assertNotIn(sentinel, result.stderr)
+
+    def test_private_environment_rejects_symlinked_ancestor_directories(self):
+        parser = load_python_script(PARSER, "private_env_ancestor_boundary")
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = pathlib.Path(directory)
+            real_directory = directory_path / "real"
+            real_directory.mkdir()
+            path = self.write_environment(real_directory, "VALUE=literal\n")
+            alias_directory = directory_path / "alias"
+            alias_directory.symlink_to(real_directory, target_is_directory=True)
+            aliased_path = alias_directory / path.name
+
+            with self.assertRaisesRegex(
+                parser.PrivateEnvironmentError, "non-symlink"
+            ):
+                parser.read_private_environment(aliased_path)
+
+    def test_private_environment_rejects_multiply_linked_files(self):
+        parser = load_python_script(PARSER, "private_env_hardlink_boundary")
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_environment(directory, "VALUE=literal\n")
+            hardlink = pathlib.Path(directory) / "hardlink.env"
+            os.link(path, hardlink)
+
+            with self.assertRaisesRegex(
+                parser.PrivateEnvironmentError, "single filesystem link"
+            ):
+                parser.read_private_environment(path)
+
+    def test_private_environment_requires_the_expected_operator_owner(self):
+        parser = load_python_script(PARSER, "private_env_owner_boundary")
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_environment(directory, "VALUE=literal\n")
+            real_fstat = os.fstat
+
+            for stat_index, wrong_value in (
+                (4, os.geteuid() + 1),
+                (5, os.getegid() + 1),
+            ):
+                def wrong_file_owner(descriptor, index=stat_index, value=wrong_value):
+                    file_stat = real_fstat(descriptor)
+                    if not stat.S_ISREG(file_stat.st_mode):
+                        return file_stat
+                    changed_fields = list(file_stat)
+                    changed_fields[index] = value
+                    return os.stat_result(changed_fields)
+
+                with self.subTest(stat_index=stat_index), mock.patch.object(
+                    parser.os, "fstat", side_effect=wrong_file_owner
+                ):
+                    with self.assertRaisesRegex(
+                        parser.PrivateEnvironmentError, "expected operator"
+                    ):
+                        parser.read_private_environment(path)
+
+    def test_private_environment_rejects_a_file_changed_during_read(self):
+        parser = load_python_script(PARSER, "private_env_stable_read")
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_environment(directory, "VALUE=literal\n")
+            initial_stat = os.stat(path)
+            changed_fields = list(initial_stat)
+            changed_fields[6] = initial_stat.st_size + 1
+            changed_stat = os.stat_result(changed_fields)
+            real_fstat = os.fstat
+            file_stat_calls = 0
+
+            def changed_after_first_file_stat(descriptor):
+                nonlocal file_stat_calls
+                file_stat = real_fstat(descriptor)
+                if not stat.S_ISREG(file_stat.st_mode):
+                    return file_stat
+                file_stat_calls += 1
+                return initial_stat if file_stat_calls == 1 else changed_stat
+
+            with mock.patch.object(
+                parser.os, "fstat", side_effect=changed_after_first_file_stat
+            ):
+                with self.assertRaisesRegex(
+                    parser.PrivateEnvironmentError, "changed while being read"
+                ):
+                    parser.read_private_environment(path)
+
+    def test_private_environment_rejects_a_writable_parent_directory(self):
+        parser = load_python_script(PARSER, "private_env_parent_mode")
+        with tempfile.TemporaryDirectory() as directory:
+            parent = pathlib.Path(directory) / "private"
+            parent.mkdir(mode=0o700)
+            path = self.write_environment(parent, "VALUE=literal\n")
+
+            for mode in (0o720, 0o702):
+                parent.chmod(mode)
+                with self.subTest(mode=oct(mode)), self.assertRaisesRegex(
+                    parser.PrivateEnvironmentError, "parent directory"
+                ):
+                    parser.read_private_environment(path)
+
+    def test_private_environment_parent_must_belong_to_the_operator(self):
+        parser = load_python_script(PARSER, "private_env_parent_owner")
+        with tempfile.TemporaryDirectory() as directory:
+            parent = pathlib.Path(directory) / "private"
+            parent.mkdir(mode=0o700)
+            path = self.write_environment(parent, "VALUE=literal\n")
+            real_fstat = os.fstat
+
+            def parent_owned_by_another_user(descriptor):
+                file_stat = real_fstat(descriptor)
+                if not stat.S_ISDIR(file_stat.st_mode):
+                    return file_stat
+                changed_fields = list(file_stat)
+                changed_fields[4] = os.geteuid() + 1
+                return os.stat_result(changed_fields)
+
+            with mock.patch.object(
+                parser.os, "fstat", side_effect=parent_owned_by_another_user
+            ):
+                with self.assertRaisesRegex(
+                    parser.PrivateEnvironmentError, "parent directory"
+                ):
+                    parser.read_private_environment(path)
 
     def test_security_preflight_consumes_nul_records_and_checks_parser_status(self):
         source = PREFLIGHT.read_text(encoding="utf-8")

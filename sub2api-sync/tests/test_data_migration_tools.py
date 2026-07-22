@@ -3,6 +3,7 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -11,6 +12,7 @@ from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 POSTGRES_MIGRATION = ROOT / "deploy" / "migrate-sanitized-postgres.sh"
+LOCKED_POSTGRES_STREAM = ROOT / "deploy" / "locked-postgres-stream.py"
 REDIS_MIGRATION = ROOT / "deploy" / "migrate-redis-allowlist.py"
 APP_MIGRATION = ROOT / "deploy" / "migrate-app-metadata.py"
 SAFE_EXPORT = ROOT / "deploy" / "export-safe-metadata.sh"
@@ -66,42 +68,94 @@ class DataMigrationToolTests(unittest.TestCase):
 
     def test_postgres_migration_is_a_deadline_bounded_logical_stream(self):
         script = POSTGRES_MIGRATION.read_text()
+        coordinator = LOCKED_POSTGRES_STREAM.read_text()
         self.assertIn("SUB2API_MIGRATION_WRITES_STOPPED=YES", script)
         self.assertIn("verify_no_conversation_content.sql", script)
-        self.assertIn("pg_dump", script)
-        self.assertIn("| PGDATABASE=", script)
-        self.assertIn("--single-transaction", script)
+        self.assertIn('locked_stream="$repo_dir/deploy/locked-postgres-stream.py"', script)
+        self.assertIn("pg_dump", coordinator)
+        self.assertIn("stdout=self.target.stdin", coordinator)
+        self.assertIn("--single-transaction", coordinator)
         self.assertIn("180", script)
         self.assertIn("checkpoint:", script)
-        self.assertIn("SUB2API_EXPECTED_ROW_COUNTS", script)
-        self.assertIn("SUB2API_EXPECTED_USAGE_AGGREGATE", script)
-        self.assertIn("verify-sanitized-target.sql", script)
-        self.assertIn("verify-postgres-portability.sql", script)
-        self.assertIn("pg_control_system()", script)
+        self.assertIn("sub2api_gate.expected_row_counts", coordinator)
+        self.assertIn("sub2api_gate.expected_usage_aggregate", coordinator)
+        self.assertIn("verify-sanitized-target.sql", coordinator)
+        self.assertIn("verify-postgres-portability.sql", coordinator)
+        self.assertIn("pg_control_system()", coordinator)
         self.assertIn("different physical PostgreSQL clusters", script)
         self.assertIn("sanitized_postgres_portability_gate_failed", script)
         self.assertGreaterEqual(script.count("2>/dev/null"), 2)
         self.assertIn("sanitized_postgres_stream_failed", script)
-        self.assertNotIn("cat $stream_stderr", script)
+        self.assertIn('source_pg_exec="$repo_dir/deploy/source-postgres-exec.py"', script)
+        self.assertIn('"--target-private-env-file"', coordinator)
+        self.assertIn("--source-app-container", script)
+        self.assertIn("--source-app-id", script)
+        self.assertIn("--source-postgres-container", script)
+        self.assertIn("--source-postgres-id", script)
+        self.assertIn("--source-app-state stopped", script)
+        self.assertNotIn("--source-private-env-file", script)
+        self.assertNotIn("SUB2API_SOURCE_DATABASE_URL", script)
+        source_file_function = script.split("run_source_sql_file() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        self.assertIn('< "$sql_file"', source_file_function)
+        self.assertNotIn("--file", source_file_function)
+        self.assertNotIn("cat $stream_stderr", script + coordinator)
+        self.assertIn("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", coordinator)
+        self.assertIn("LOCK TABLE", coordinator)
+        self.assertIn("IN SHARE MODE", coordinator)
+        self.assertIn("pg_terminate_backend", coordinator)
+        self.assertIn("--snapshot=", coordinator)
+        self.assertIn("MAX_CONTROL_OUTPUT_BYTES", coordinator)
+        execute = coordinator.split("    def execute(self):", 1)[1].split(
+            "\n\n\ndef parse_arguments", 1
+        )[0]
+        self.assertLess(execute.index("self.clear_source_clients()"), execute.index("self.commit_target()"))
+        self.assertLess(execute.index("self.commit_target()"), execute.index("self.stop_holder(self.lock_holder"))
         for forbidden in (
             "pg_basebackup",
             "pg_waldump",
             "/var/lib/postgresql/data",
             "--format=custom",
         ):
-            self.assertNotIn(forbidden, script)
+            self.assertNotIn(forbidden, script + coordinator)
+
+    def test_safe_export_hashes_schema_without_persisting_schema_text(self):
+        script = SAFE_EXPORT.read_text()
+        self.assertIn("schema_fingerprint.sha256", script)
+        self.assertIn("pg_dump", script)
+        self.assertIn("sha256sum", script)
+        self.assertNotIn('> "$partial_dir/schema.sql"', script)
+        self.assertNotRegex(script, r"(?m)^\s*schema\.sql\s*$")
+        self.assertIn("idle_in_transaction_session_timeout=600000", script)
+        self.assertIn("snapshot_holder_stop", script)
+        for relation in (
+            "groups",
+            "user_allowed_groups",
+            "user_subscriptions",
+            "api_keys",
+            "usage_logs",
+        ):
+            self.assertIn(f"FROM public.{relation}", script)
 
     def test_postgres_url_wrapper_keeps_credentials_out_of_argv(self):
         wrapper = load_python_script(PG_ENV_EXEC, "pg_env_exec")
         original = {
-            "SUB2API_SOURCE_DATABASE_URL": (
+            "SUB2API_TARGET_DATABASE_URL": (
                 "postgresql://user%40name:password%2Fvalue@db.example:5544/app%2Ddb"
                 "?sslmode=verify-full&sslrootcert=system&connect_timeout=7"
             ),
             "PGHOST": "must-be-replaced",
+            "PGPASSFILE": "/private/must-not-be-inherited",
+            "PGSSLCRLDIR": "/private/must-not-be-inherited",
+            "PGLOADBALANCEHOSTS": "random",
+            "PG_FUTURE_LIBPQ_OPTION": "must-not-be-inherited",
+            "SSL_CERT_FILE": "/private/must-not-be-inherited",
+            "OPENSSL_CONF": "/private/must-not-be-inherited",
+            "SSLKEYLOGFILE": "/private/must-not-be-created",
         }
         result = wrapper.libpq_environment(
-            original, "SUB2API_SOURCE_DATABASE_URL"
+            original, "SUB2API_TARGET_DATABASE_URL"
         )
         self.assertEqual(result["PGHOST"], "db.example")
         self.assertEqual(result["PGPORT"], "5544")
@@ -113,11 +167,486 @@ class DataMigrationToolTests(unittest.TestCase):
         self.assertEqual(result["PGCONNECT_TIMEOUT"], "7")
         self.assertNotIn("SUB2API_SOURCE_DATABASE_URL", result)
         self.assertNotIn("SUB2API_TARGET_DATABASE_URL", result)
+        for inherited_name in (
+            "PGPASSFILE",
+            "PGSSLCRLDIR",
+            "PGLOADBALANCEHOSTS",
+            "PG_FUTURE_LIBPQ_OPTION",
+            "SSL_CERT_FILE",
+            "OPENSSL_CONF",
+            "SSLKEYLOGFILE",
+        ):
+            self.assertNotIn(inherited_name, result)
 
         script = POSTGRES_MIGRATION.read_text()
         self.assertNotIn('--dbname="$SUB2API_SOURCE_DATABASE_URL"', script)
         self.assertNotIn('--dbname="$SUB2API_TARGET_DATABASE_URL"', script)
         self.assertTrue(TARGET_VALIDATOR.exists())
+
+    def test_private_source_database_selector_is_retired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = pathlib.Path(directory) / "private.env"
+            env_file.write_text(
+                "SUB2API_SOURCE_DATABASE_URL="
+                "postgresql://source-user:source-password@172.19.0.2:5432/sub2api"
+                "?sslmode=disable\n"
+                "SUB2API_TARGET_DATABASE_URL="
+                "postgresql://target-user:target-password@127.0.0.1:15432/sub2api"
+                "?sslmode=disable\n"
+                "SUB2API_DATABASE_URL="
+                "postgresql://target-user:target-password@127.0.0.1:15432/sub2api"
+                "?sslmode=disable\n",
+                encoding="ascii",
+            )
+            env_file.chmod(0o600)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    PG_ENV_EXEC,
+                    "--source-private-env-file",
+                    env_file,
+                    sys.executable,
+                    "-c",
+                    "raise SystemExit(99)",
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn("source-password", result.stdout)
+        self.assertNotIn("source-password", result.stderr)
+
+    def test_direct_source_database_selector_is_retired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = pathlib.Path(directory)
+            env_file = directory_path / "private.env"
+            marker = directory_path / "child-ran"
+            environment = os.environ.copy()
+            environment["SUB2API_SOURCE_DATABASE_URL"] = (
+                "postgresql://source-user:private-test-password@172.19.0.2:5432/"
+                "sub2api?sslmode=disable"
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    PG_ENV_EXEC,
+                    "SUB2API_SOURCE_DATABASE_URL",
+                    sys.executable,
+                    "-c",
+                    "import pathlib,sys;pathlib.Path(sys.argv[1]).touch()",
+                    marker,
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+            )
+            marker_was_created = marker.exists()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(marker_was_created)
+        self.assertNotIn("private-test-password", result.stdout)
+        self.assertNotIn("private-test-password", result.stderr)
+
+    def test_ambient_target_database_cli_selectors_are_retired(self):
+        sentinel = "AMBIENT_TARGET_DATABASE_PASSWORD_SENTINEL"
+        for selector in (
+            "SUB2API_DATABASE_URL",
+            "SUB2API_TARGET_DATABASE_URL",
+        ):
+            with self.subTest(selector=selector), tempfile.TemporaryDirectory() as directory:
+                marker = pathlib.Path(directory) / "child-ran"
+                environment = os.environ.copy()
+                environment[selector] = (
+                    "postgresql://target-user:"
+                    + sentinel
+                    + "@127.0.0.1:15432/sub2api?sslmode=disable"
+                )
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        PG_ENV_EXEC,
+                        selector,
+                        sys.executable,
+                        "-c",
+                        "import pathlib,sys;pathlib.Path(sys.argv[1]).touch()",
+                        marker,
+                    ],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=environment,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse(marker.exists())
+                self.assertNotIn(sentinel, result.stdout + result.stderr)
+                self.assertIn("--target-private-env-file", result.stderr)
+
+    def test_private_target_accepts_canonical_source_and_exact_loopback_target(self):
+        wrapper = load_python_script(PG_ENV_EXEC, "pg_env_exec_target_valid")
+        values = {
+            "SUB2API_SOURCE_DATABASE_URL": (
+                "postgresql://source-user:source-password@172.19.0.2:5432/legacy"
+                "?sslmode=disable"
+            ),
+            "SUB2API_TARGET_DATABASE_URL": (
+                "postgres://target-owner:target-password@127.0.0.1:15432/"
+                "sub2api%2Dprod?application_name=owner&sslmode=disable"
+            ),
+            "SUB2API_DATABASE_URL": (
+                "postgresql://app-role:app-password@127.0.0.1:15432/sub2api-prod"
+                "?connect_timeout=9&sslmode=disable"
+            ),
+        }
+
+        with mock.patch.object(wrapper, "_load_private_environment", return_value=values):
+            result = wrapper.private_libpq_environment(
+                {}, "/private/runtime.env", "SUB2API_TARGET_DATABASE_URL"
+            )
+
+        self.assertEqual(result["PGHOST"], "127.0.0.1")
+        self.assertEqual(result["PGPORT"], "15432")
+        self.assertEqual(result["PGDATABASE"], "sub2api-prod")
+
+    def test_private_target_rejects_noncanonical_source_endpoints(self):
+        wrapper = load_python_script(PG_ENV_EXEC, "pg_env_exec_source_endpoint")
+        target = (
+            "postgresql://target-owner:target-password@127.0.0.1:15432/sub2api"
+            "?sslmode=disable"
+        )
+        unsafe_sources = (
+            "postgresql://source:password@localhost:5432/sub2api?sslmode=disable",
+            "postgresql://source:password@127.0.0.1:5432/sub2api?sslmode=disable",
+            "postgresql://source:password@172.19.0.2:5433/sub2api?sslmode=disable",
+            "postgresql://source:password@172.19.0.2:5432/sub2api?sslmode=prefer",
+            "postgresql://source:password@172.019.0.2:5432/sub2api?sslmode=disable",
+            "postgresql://source:password@172.19.0.2:5432/sub2api?sslmode=disable&x=1",
+            (
+                "postgresql://"
+                + ("u" * 64)
+                + ":password@172.19.0.2:5432/sub2api?sslmode=disable"
+            ),
+            (
+                "postgresql://source:password@172.19.0.2:5432/"
+                + ("d" * 64)
+                + "?sslmode=disable"
+            ),
+        )
+        for source in unsafe_sources:
+            values = {
+                "SUB2API_SOURCE_DATABASE_URL": source,
+                "SUB2API_TARGET_DATABASE_URL": target,
+                "SUB2API_DATABASE_URL": target,
+            }
+            with self.subTest(source=source), mock.patch.object(
+                wrapper, "_load_private_environment", return_value=values
+            ), self.assertRaisesRegex(
+                wrapper.ConfigurationError,
+                "source PostgreSQL URL is not a canonical private container endpoint",
+            ):
+                wrapper.private_libpq_environment(
+                    {}, "/private/runtime.env", "SUB2API_TARGET_DATABASE_URL"
+                )
+
+    def test_private_target_rejects_loopback_aliases_and_socket_hosts(self):
+        wrapper = load_python_script(PG_ENV_EXEC, "pg_env_exec_target_aliases")
+        source = (
+            "postgresql://source:password@172.19.0.2:5432/sub2api?sslmode=disable"
+        )
+        aliases = (
+            "localhost",
+            "LOCALHOST.",
+            "db.localhost",
+            "127.0.0.2",
+            "0.0.0.0",
+            "127.1",
+            "2130706433",
+            "0177.0.0.1",
+            "0x7f000001",
+            "[::1]",
+            "[::]",
+            "[::ffff:127.0.0.1]",
+            "%31%32%37.0.0.1",
+            "%2Fvar%2Frun%2Fpostgresql",
+        )
+        for alias in aliases:
+            ssl = (
+                "disable"
+                if alias
+                in {
+                    "127.0.0.2",
+                    "0.0.0.0",
+                    "[::1]",
+                    "[::]",
+                    "[::ffff:127.0.0.1]",
+                }
+                else "verify-full&sslrootcert=system"
+            )
+            url = (
+                f"postgresql://target:password@{alias}:15432/sub2api?sslmode={ssl}"
+            )
+            values = {
+                "SUB2API_SOURCE_DATABASE_URL": source,
+                "SUB2API_TARGET_DATABASE_URL": url,
+                "SUB2API_DATABASE_URL": url,
+            }
+            with self.subTest(alias=alias), mock.patch.object(
+                wrapper, "_load_private_environment", return_value=values
+            ), self.assertRaises(wrapper.ConfigurationError):
+                wrapper.private_libpq_environment(
+                    {}, "/private/runtime.env", "SUB2API_TARGET_DATABASE_URL"
+                )
+
+    def test_private_target_and_application_must_use_the_same_exact_endpoint(self):
+        wrapper = load_python_script(PG_ENV_EXEC, "pg_env_exec_target_mismatch")
+        source = (
+            "postgresql://source:password@172.19.0.2:5432/legacy?sslmode=disable"
+        )
+        target = (
+            "postgresql://owner:password@127.0.0.1:15432/sub2api?sslmode=disable"
+        )
+        mismatched_application_urls = (
+            "postgresql://app:password@127.0.0.2:15432/sub2api?sslmode=disable",
+            "postgresql://app:password@[::1]:15432/sub2api?sslmode=disable",
+            "postgresql://app:password@127.0.0.1:15433/sub2api?sslmode=disable",
+            "postgresql://app:password@127.0.0.1:15432/other?sslmode=disable",
+        )
+        for application_url in mismatched_application_urls:
+            values = {
+                "SUB2API_SOURCE_DATABASE_URL": source,
+                "SUB2API_TARGET_DATABASE_URL": target,
+                "SUB2API_DATABASE_URL": application_url,
+            }
+            with self.subTest(application_url=application_url), mock.patch.object(
+                wrapper, "_load_private_environment", return_value=values
+            ), self.assertRaisesRegex(
+                wrapper.ConfigurationError, "target PostgreSQL identity is invalid"
+            ):
+                wrapper.private_libpq_environment(
+                    {}, "/private/runtime.env", "SUB2API_TARGET_DATABASE_URL"
+                )
+
+    def test_private_database_interface_can_select_only_the_target(self):
+        wrapper = load_python_script(PG_ENV_EXEC, "pg_env_exec_private_selection")
+        values = {
+            "SUB2API_SOURCE_DATABASE_URL": (
+                "postgresql://source-user:source-password@172.19.0.2:5432/legacy"
+                "?sslmode=disable"
+            ),
+            "SUB2API_TARGET_DATABASE_URL": (
+                "postgresql://target-owner:target-password@127.0.0.1:15432/sub2api"
+                "?sslmode=disable"
+            ),
+            "SUB2API_DATABASE_URL": (
+                "postgres://app-role:app-password@127.0.0.1:15432/sub2api"
+                "?application_name=app&sslmode=disable"
+            ),
+        }
+        with mock.patch.object(wrapper, "_load_private_environment", return_value=values):
+            target = wrapper.private_libpq_environment(
+                {"UNRELATED": "preserved"},
+                "/private/runtime.env",
+                "SUB2API_TARGET_DATABASE_URL",
+            )
+            for forbidden_name in (
+                "SUB2API_SOURCE_DATABASE_URL",
+                "SUB2API_DATABASE_URL",
+            ):
+                with self.subTest(forbidden_name=forbidden_name), self.assertRaisesRegex(
+                    wrapper.ConfigurationError,
+                    "private PostgreSQL URL selection is not allowed",
+                ):
+                    wrapper.private_libpq_environment(
+                        {}, "/private/runtime.env", forbidden_name
+                    )
+        with self.assertRaisesRegex(
+            wrapper.ConfigurationError,
+            "PostgreSQL URL environment name is not allowed",
+        ):
+            wrapper.libpq_environment(
+                values, "SUB2API_SOURCE_DATABASE_URL"
+            )
+
+        self.assertEqual(target["PGHOST"], "127.0.0.1")
+        self.assertEqual(target["PGPORT"], "15432")
+        self.assertEqual(target["PGUSER"], "target-owner")
+        self.assertEqual(target["PGPASSWORD"], "target-password")
+        self.assertEqual(target["PGDATABASE"], "sub2api")
+        self.assertEqual(target["UNRELATED"], "preserved")
+        self.assertTrue(wrapper.ALL_URL_ENVIRONMENT_NAMES.isdisjoint(target))
+
+    def test_private_target_cli_mode_executes_with_only_target_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = pathlib.Path(directory) / "private.env"
+            env_file.write_text(
+                "SUB2API_SOURCE_DATABASE_URL="
+                "postgresql://source-user:source-password@172.19.0.2:5432/legacy"
+                "?sslmode=disable\n"
+                "SUB2API_TARGET_DATABASE_URL="
+                "postgresql://target-owner:target-password@127.0.0.1:15432/sub2api"
+                "?sslmode=disable\n"
+                "SUB2API_DATABASE_URL="
+                "postgres://app-role:app-password@127.0.0.1:15432/sub2api"
+                "?application_name=app&sslmode=disable\n",
+                encoding="ascii",
+            )
+            env_file.chmod(0o600)
+            child_check = (
+                "import os,sys;"
+                "expected={'PGHOST':'127.0.0.1','PGPORT':'15432',"
+                "'PGUSER':'target-owner','PGPASSWORD':'target-password',"
+                "'PGDATABASE':'sub2api','PGSSLMODE':'disable'};"
+                "urls={'SUB2API_SOURCE_DATABASE_URL','SUB2API_TARGET_DATABASE_URL',"
+                "'SUB2API_DATABASE_URL'};"
+                "sys.exit(0 if all(os.environ.get(k)==v for k,v in expected.items()) "
+                "and urls.isdisjoint(os.environ) else 9)"
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    PG_ENV_EXEC,
+                    "--target-private-env-file",
+                    env_file,
+                    sys.executable,
+                    "-c",
+                    child_check,
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_private_target_cli_rejects_relative_private_file_before_exec(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = pathlib.Path(directory)
+            env_file = directory_path / "private.env"
+            marker = directory_path / "child-ran"
+            env_file.write_text(
+                "SUB2API_SOURCE_DATABASE_URL="
+                "postgresql://source:source-password@172.19.0.2:5432/sub2api"
+                "?sslmode=disable\n"
+                "SUB2API_TARGET_DATABASE_URL="
+                "postgresql://target:target-password@127.0.0.1:15432/sub2api"
+                "?sslmode=disable\n"
+                "SUB2API_DATABASE_URL="
+                "postgresql://app:app-password@127.0.0.1:15432/sub2api"
+                "?sslmode=disable\n",
+                encoding="ascii",
+            )
+            env_file.chmod(0o600)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    PG_ENV_EXEC,
+                    "--target-private-env-file",
+                    env_file.name,
+                    sys.executable,
+                    "-c",
+                    "import pathlib,sys;pathlib.Path(sys.argv[1]).touch()",
+                    marker,
+                ],
+                cwd=directory_path,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            marker_was_created = marker.exists()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(marker_was_created)
+        self.assertNotIn("source-password", result.stderr)
+        self.assertNotIn("target-password", result.stderr)
+        self.assertNotIn("app-password", result.stderr)
+
+    def test_postgres_url_wrapper_rejects_malformed_percent_encoding(self):
+        wrapper = load_python_script(PG_ENV_EXEC, "pg_env_exec_percent_encoding")
+        malformed_components = (
+            "user%",
+            "user%2",
+            "user%GG",
+            "%FF",
+        )
+        for value in malformed_components:
+            urls = (
+                f"postgresql://{value}:password@127.0.0.1:5432/sub2api?sslmode=disable",
+                f"postgresql://user:{value}@127.0.0.1:5432/sub2api?sslmode=disable",
+                f"postgresql://user:password@127.0.0.1:5432/{value}?sslmode=disable",
+            )
+            for url in urls:
+                with self.subTest(url=url), self.assertRaisesRegex(
+                    wrapper.ConfigurationError, "percent encoding"
+                ):
+                    wrapper.libpq_environment(
+                        {"SUB2API_DATABASE_URL": url}, "SUB2API_DATABASE_URL"
+                    )
+
+        malformed_queries = ("%GG", "%FF", "sslmode=disable%")
+        for query in malformed_queries:
+            with self.subTest(query=query), self.assertRaises(
+                wrapper.ConfigurationError
+            ):
+                wrapper.libpq_environment(
+                    {
+                        "SUB2API_DATABASE_URL": (
+                            "postgresql://user:password@127.0.0.1:5432/sub2api?"
+                            + query
+                        )
+                    },
+                    "SUB2API_DATABASE_URL",
+                )
+
+    def test_postgres_url_wrapper_rejects_literal_control_separators(self):
+        wrapper = load_python_script(PG_ENV_EXEC, "pg_env_exec_control_separator")
+        for separator in ("\t", "\n", "\r", "\x1f", "\x7f"):
+            url = (
+                "postgresql://user:pass"
+                + separator
+                + "word@127.0.0.1:5432/sub2api?sslmode=disable"
+            )
+            with self.subTest(separator=repr(separator)), self.assertRaisesRegex(
+                wrapper.ConfigurationError, "PostgreSQL URL is invalid"
+            ):
+                wrapper.libpq_environment(
+                    {"SUB2API_DATABASE_URL": url}, "SUB2API_DATABASE_URL"
+                )
+
+    def test_canonical_host_collapses_all_loopback_spellings(self):
+        wrapper = load_python_script(PG_ENV_EXEC, "pg_env_exec_loopback_identity")
+        aliases = (
+            "127.0.0.1",
+            "127.0.0.2",
+            "0.0.0.0",
+            "0",
+            "::1",
+            "::",
+            "::ffff:127.0.0.1",
+            "0:0:0:0:0:ffff:7f00:1",
+            "localhost",
+            "LOCALHOST.",
+            "db.localhost",
+            "127.1",
+            "2130706433",
+            "0177.0.0.1",
+            "0x7f000001",
+            "%31%32%37.0.0.1",
+        )
+        for alias in aliases:
+            with self.subTest(alias=alias):
+                self.assertEqual(wrapper._canonical_database_host(alias), "loopback")
+
+        for host in ("%2Fvar%2Frun%2Fpostgresql", "%5C%5C.pipe", "host%"):
+            with self.subTest(host=host), self.assertRaises(wrapper.ConfigurationError):
+                wrapper._canonical_database_host(host)
 
     def test_postgres_url_wrapper_enforces_transport_security_by_location(self):
         wrapper = load_python_script(PG_ENV_EXEC, "pg_env_exec_tls")
@@ -133,6 +662,18 @@ class DataMigrationToolTests(unittest.TestCase):
         )
         self.assertEqual(loopback["PGHOST"], "127.0.0.1")
         self.assertEqual(loopback["PGSSLMODE"], "disable")
+
+        mapped_loopback = wrapper.libpq_environment(
+            {
+                "SUB2API_DATABASE_URL": (
+                    "postgresql://local-user:local-password@"
+                    "[::ffff:127.0.0.1]:5432/sub2api?sslmode=disable"
+                )
+            },
+            "SUB2API_DATABASE_URL",
+        )
+        self.assertEqual(mapped_loopback["PGHOST"], "::ffff:127.0.0.1")
+        self.assertEqual(mapped_loopback["PGSSLMODE"], "disable")
 
         remote = wrapper.libpq_environment(
             {
@@ -151,6 +692,10 @@ class DataMigrationToolTests(unittest.TestCase):
         rejected = (
             "postgresql://user:password@127.0.0.1/sub2api",
             "postgresql://user:password@127.0.0.1/sub2api?sslmode=prefer",
+            (
+                "postgresql://user:password@[::ffff:127.0.0.1]/sub2api"
+                "?sslmode=verify-full&sslrootcert=system"
+            ),
             "postgresql://user:password@db.example.test/sub2api?sslmode=disable",
             "postgresql://user:password@db.example.test/sub2api?sslmode=prefer",
             "postgresql://user:password@db.example.test/sub2api?sslmode=require",
@@ -619,7 +1164,9 @@ class DataMigrationToolTests(unittest.TestCase):
         self.assertIn("SHA256SUMS", script)
         self.assertIn("COMPLETE", script)
         self.assertIn("manifest.json.partial", script)
-        self.assertIn("source_postgres_system_identifier", script)
+        self.assertIn("source_postgres_identity", script)
+        self.assertIn("source_postgres_database_oid", script)
+        self.assertIn("source_postgres_database_name_hex", script)
         self.assertIn("policy_files", script)
         self.assertIn("HEAD^{commit}", script)
         self.assertIn('require_private_directory "$data_root" "0:0:700"', script)
@@ -628,6 +1175,50 @@ class DataMigrationToolTests(unittest.TestCase):
             script.index('require_private_directory "$data_root" "0:0:700"'),
             script.index("coproc SNAPSHOT_HOLDER"),
         )
+        self.assertIn("deploy/verify-migration-totp.py", script)
+        self.assertIn("deploy/source-postgres-exec.py", script)
+        self.assertIn("safe_export_deadline_seconds=600", script)
+        self.assertIn("safe_export_min_free_bytes=10737418240", script)
+        self.assertIn("safe_export_max_output_bytes=4294967296", script)
+        self.assertIn("timeout --foreground -s TERM -k 5", script)
+        self.assertIn("prlimit --fsize=", script)
+        self.assertIn("df --output=avail --block-size=1", script)
+        self.assertIn("du --apparent-size --summarize --block-size=1", script)
+        self.assertGreaterEqual(script.count("require_fresh_capacity"), 4)
+        self.assertGreaterEqual(script.count("require_output_bound"), 3)
+        self.assertLess(
+            script.index("require_fresh_capacity"),
+            script.index("coproc SNAPSHOT_HOLDER"),
+        )
+        self.assertLess(
+            script.rindex("require_fresh_capacity"),
+            script.index('mv "$partial_dir" "$final_dir"'),
+        )
+
+    def test_safe_export_uses_only_the_private_source_database_identity(self):
+        script = SAFE_EXPORT.read_text()
+        self.assertIn("--env-file ABSOLUTE_PATH", script)
+        self.assertIn("safe metadata export --apply requires --env-file", script)
+        self.assertIn('source_pg_exec="$repo_dir/deploy/source-postgres-exec.py"', script)
+        self.assertIn("--source-app-container", script)
+        self.assertIn("--source-app-id", script)
+        self.assertIn("--source-postgres-container", script)
+        self.assertIn("--source-postgres-id", script)
+        self.assertIn("--source-app-state running", script)
+        self.assertNotIn("--source-private-env-file", script)
+        self.assertNotIn("SUB2API_DATABASE_URL", script)
+        self.assertNotIn('--file "$runtime_logging_gate"', script)
+
+        missing_env = "/private/path/not-opened-by-safe-export-check.env"
+        result = subprocess.run(
+            ["bash", SAFE_EXPORT, "check", "--env-file", missing_env],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("private environment file was not read", result.stdout)
 
     def test_postgres_portability_gate_rejects_fdw_and_unreviewed_extensions(self):
         gate = PORTABILITY_GATE.read_text()

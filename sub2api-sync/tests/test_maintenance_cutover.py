@@ -8,6 +8,7 @@ import signal
 import stat
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -47,7 +48,7 @@ class StubNginx:
     def verify_live_direct_v1(self, hostname):
         self.events.append(f"nginx-direct:{hostname}")
 
-    def switch(self, stage, *, timeout):
+    def switch(self, stage, *, timeout, deadline=None, clock=None):
         self.events.append(f"nginx:{stage}")
 
 
@@ -65,8 +66,11 @@ class RollbackRunner:
         self.health = {item.name: "healthy" for item in services.containers()}
         self.health_sequences = {}
         self.sync_active = False
-        self.traffic_targets = set(tool.TARGET_NAMES)
-        self.nonce_targets = {tool.TARGET_NONCE_REDIS}
+        self.traffic_targets = {
+            name: f"{index:x}" * 64
+            for index, name in enumerate(tool.TARGET_NAMES, start=1)
+        }
+        self.nonce_targets = {tool.TARGET_NONCE_REDIS: "f" * 64}
 
     def __call__(
         self,
@@ -79,8 +83,12 @@ class RollbackRunner:
     ):
         argv = [str(value) for value in argv]
         if argv[:2] == ["docker", "inspect"]:
-            name = argv[-1]
+            reference = argv[-1]
             template = argv[3]
+            identity_to_name = {
+                identity: name for name, identity in self.identities.items()
+            }
+            name = identity_to_name.get(reference, reference)
             if name in self.identities:
                 identity = self.identities[name]
                 running = "true" if self.running[name] else "false"
@@ -91,15 +99,30 @@ class RollbackRunner:
                     health = self.health[name]
                 self.events.append(f"inspect:{name}:{running}:{health}")
                 output = (
-                    f"{identity}|{running}|{health}"
+                    f"{identity}|/{name}|{running}|{health}"
                     if "State.Health" in template
                     else identity
                 )
                 return self.tool.CommandResult(0, output.encode())
-            exists = name in self.traffic_targets or name in self.nonce_targets
-            return self.tool.CommandResult(0 if exists else 1, b"target-id" if exists else b"")
+            all_targets = {**self.traffic_targets, **self.nonce_targets}
+            target_identity_to_name = {
+                identity: target_name for target_name, identity in all_targets.items()
+            }
+            target_name = target_identity_to_name.get(reference, reference)
+            identity = all_targets.get(target_name)
+            if identity is None:
+                return self.tool.CommandResult(1)
+            output = (
+                f"{identity}|/{target_name}|true|healthy".encode()
+                if "State.Health" in template
+                else identity.encode()
+            )
+            return self.tool.CommandResult(0, output)
         if argv[:2] == ["docker", "start"]:
-            name = argv[-1]
+            reference = argv[-1]
+            name = {
+                identity: name for name, identity in self.identities.items()
+            }[reference]
             self.events.append(f"start:{name}")
             self.running[name] = True
             return self.tool.CommandResult(0)
@@ -148,7 +171,27 @@ class MaintenanceCutoverTests(unittest.TestCase):
         )
 
     def options(self):
-        return types.SimpleNamespace(env_file=pathlib.Path("/private/env"))
+        return types.SimpleNamespace(
+            env_file=pathlib.Path("/private/env"),
+            verify_url="https://gateway.example.test/v1/responses",
+            model="model-test",
+            approved_hostname="gateway.example.test",
+        )
+
+    def migration_private_values(self):
+        return {
+            "SUB2API_SOURCE_DATABASE_URL": "postgresql://source-secret",
+            "SUB2API_TARGET_DATABASE_URL": "postgresql://target-secret",
+            "SUB2API_DATABASE_URL": "postgresql://target-secret",
+            "SUB2API_APP_DATABASE_PASSWORD": "app-role-secret",
+            "SUB2API_SYNC_DATABASE_PASSWORD": "sync-role-secret",
+            "SUB2API_DATA_ROOT": "/mnt/data/sub2api-gate",
+            "SUB2API_SOURCE_REDIS_URL": "redis://source",
+            "SUB2API_SOURCE_REDIS_PASSWORD": "source-redis-secret",
+            "SUB2API_TARGET_REDIS_URL": "redis://target",
+            "SUB2API_TARGET_REDIS_PASSWORD": "target-redis-secret",
+            "SUB2API_TARGET_REDIS_USERNAME": "sub2api_migration",
+        }
 
     def test_default_check_is_offline_and_side_effect_free(self):
         runner = NeverRunner()
@@ -158,6 +201,100 @@ class MaintenanceCutoverTests(unittest.TestCase):
         self.assertFalse(runner.calls)
         self.assertIn("no private file was read", stdout.getvalue())
         self.assertIn("no service or data changed", stdout.getvalue())
+
+    def test_timed_out_command_kills_its_entire_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            child_pid_path = pathlib.Path(directory) / "child.pid"
+            child_program = (
+                "import signal,time;"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+                "time.sleep(60)"
+            )
+            parent_program = (
+                "import pathlib,subprocess,sys,time;"
+                "child=subprocess.Popen([sys.executable,'-c',sys.argv[2]]);"
+                "pathlib.Path(sys.argv[1]).write_text(str(child.pid),encoding='ascii');"
+                "time.sleep(60)"
+            )
+            runner = self.tool.CommandRunner()
+            with self.assertRaisesRegex(
+                self.tool.WindowExpired,
+                "command deadline exceeded",
+            ):
+                runner(
+                    [
+                        sys.executable,
+                        "-c",
+                        parent_program,
+                        str(child_pid_path),
+                        child_program,
+                    ],
+                    timeout=1,
+                )
+            child_pid = int(child_pid_path.read_text(encoding="ascii"))
+
+            def child_is_running():
+                try:
+                    state = pathlib.Path(f"/proc/{child_pid}/stat").read_text(
+                        encoding="ascii"
+                    ).split()[2]
+                except (FileNotFoundError, ProcessLookupError):
+                    return False
+                return state != "Z"
+
+            for _attempt in range(40):
+                if not child_is_running():
+                    break
+                time.sleep(0.05)
+            self.assertFalse(child_is_running())
+
+    def test_interactive_command_inherits_tty_in_a_foreground_process_group(self):
+        process = mock.Mock()
+        process.communicate.return_value = (None, None)
+        process.returncode = 0
+        process.pid = 12345
+        runner = self.tool.CommandRunner()
+        with mock.patch.object(
+            self.tool.subprocess,
+            "Popen",
+            return_value=process,
+        ) as popen, mock.patch.object(
+            runner,
+            "_interactive_foreground",
+            return_value=self.tool.contextlib.nullcontext(),
+        ), mock.patch.object(
+            runner,
+            "_process_group_exists",
+            return_value=False,
+        ):
+            result = runner(
+                ["private-interactive-helper"],
+                timeout=5,
+                interactive=True,
+            )
+        self.assertEqual(result.returncode, 0)
+        arguments = popen.call_args.kwargs
+        self.assertIsNone(arguments["stdin"])
+        self.assertIsNone(arguments["stdout"])
+        self.assertIsNone(arguments["stderr"])
+        self.assertFalse(arguments["start_new_session"])
+        self.assertIs(arguments["preexec_fn"], os.setpgrp)
+
+    def test_interrupted_command_reaps_its_process_group_before_propagating(self):
+        process = mock.Mock()
+        process.communicate.side_effect = self.tool.TerminationRequested("stop")
+        process.pid = 12345
+        with mock.patch.object(
+            self.tool.subprocess,
+            "Popen",
+            return_value=process,
+        ), mock.patch.object(
+            self.tool.CommandRunner,
+            "_terminate_process_group",
+        ) as terminate:
+            with self.assertRaises(self.tool.TerminationRequested):
+                self.tool.CommandRunner()(["long-migration"], timeout=30)
+        terminate.assert_called_once_with(process)
 
     def test_runtime_images_are_attested_before_writer_stop_and_never_pulled(self):
         source = TOOL_PATH.read_text(encoding="utf-8")
@@ -194,6 +331,246 @@ class MaintenanceCutoverTests(unittest.TestCase):
             self.tool.WindowExpired, "60-second writer-stop deadline exceeded"
         ):
             controller.run(["true"], timeout=20)
+
+    def test_writer_stop_deadline_ends_only_after_canary_traffic_is_healthy(self):
+        clock = mock.Mock(return_value=100.0)
+        canary_deadlines = []
+        canary_timeouts = []
+        health_deadlines = []
+        health_timeouts = []
+        nginx_deadlines = []
+
+        class DeadlineNginx:
+            def switch(_self, stage, *, timeout, deadline=None, clock=None):
+                self.assertEqual(stage, "canary")
+                self.assertGreater(timeout, 0)
+                self.assertEqual(deadline, controller.writer_stop_deadline)
+                self.assertIs(clock, controller.clock)
+                nginx_deadlines.append(controller.writer_stop_deadline)
+
+        def runner(argv, **kwargs):
+            if "run-v1-responses-canary.py" in " ".join(str(value) for value in argv):
+                canary_deadlines.append(controller.writer_stop_deadline)
+                canary_timeouts.append(kwargs["timeout"])
+            return self.tool.CommandResult(0)
+
+        def health(_port, _path, **kwargs):
+            health_deadlines.append(controller.writer_stop_deadline)
+            health_timeouts.append(kwargs["timeout"])
+
+        controller = self.tool.MaintenanceController(
+            options=self.options(),
+            services=self.services(),
+            private_values={},
+            runner=runner,
+            nginx=DeadlineNginx(),
+            health_probe=health,
+            clock=clock,
+        )
+        controller.deadline = 280.0
+        controller.sync_fragment = "/etc/systemd/system/sub2api-sync.service"
+        controller.unit_active = lambda: False
+        controller.unit_metadata = lambda: controller.sync_fragment
+        controller.require_legacy = lambda *_args, **_kwargs: None
+        controller.require_all_targets = lambda **_kwargs: None
+
+        controller.stop_writers()
+        self.assertEqual(controller.writer_stop_deadline, 160.0)
+        controller.switch_and_canary()
+        self.assertEqual(health_deadlines, [160.0, 160.0])
+        self.assertEqual(nginx_deadlines, [160.0])
+        self.assertEqual(canary_deadlines, [160.0])
+        self.assertEqual(canary_timeouts, [60])
+        self.assertEqual(health_timeouts, [5, 5])
+        self.assertIsNone(controller.writer_stop_deadline)
+
+        unbounded = self.tool.MaintenanceController(
+            options=self.options(),
+            services=self.services(),
+            private_values={},
+            runner=NeverRunner(),
+            nginx=StubNginx([]),
+            health_probe=lambda *_args, **_kwargs: None,
+            clock=clock,
+        )
+        unbounded.deadline = 280.0
+        with self.assertRaisesRegex(self.tool.CutoverError, "writer-stop deadline"):
+            unbounded.switch_and_canary()
+
+        near_deadline_timeouts = []
+        near_deadline = self.tool.MaintenanceController(
+            options=self.options(),
+            services=self.services(),
+            private_values={},
+            runner=NeverRunner(),
+            nginx=StubNginx([]),
+            health_probe=lambda _port, _path, **kwargs: near_deadline_timeouts.append(
+                kwargs["timeout"]
+            ),
+            clock=lambda: 158.0,
+        )
+        near_deadline.deadline = 280.0
+        near_deadline.writer_stop_deadline = 160.0
+        near_deadline.probe_health(8081, "/health")
+        self.assertEqual(near_deadline_timeouts, [2])
+
+    def test_legacy_stop_and_start_commands_use_full_immutable_ids(self):
+        services = self.services()
+        calls = []
+        running = {service.identity: True for service in services.containers()}
+
+        def runner(argv, **_kwargs):
+            command = [str(value) for value in argv]
+            calls.append(command)
+            if command[:3] == ["/usr/bin/systemctl", "stop", self.tool.SYNC_UNIT]:
+                return self.tool.CommandResult(0)
+            if command[:3] == ["/usr/bin/systemctl", "is-active", "--quiet"]:
+                return self.tool.CommandResult(3)
+            if command[:3] == ["/usr/bin/systemctl", "show", self.tool.SYNC_UNIT]:
+                return self.tool.CommandResult(
+                    0,
+                    (
+                        "Id=sub2api-sync.service\n"
+                        "LoadState=loaded\n"
+                        "FragmentPath=/etc/systemd/system/sub2api-sync.service\n"
+                    ).encode(),
+                )
+            if command[:2] == ["docker", "stop"]:
+                self.assertEqual(command[-1], services.app.identity)
+                running[services.app.identity] = False
+                return self.tool.CommandResult(0)
+            if command[:2] == ["docker", "start"]:
+                self.assertEqual(command[-1], services.app.identity)
+                running[services.app.identity] = True
+                return self.tool.CommandResult(0)
+            if command[:2] == ["docker", "inspect"]:
+                identity = command[-1]
+                service = next(
+                    item for item in services.containers() if item.identity == identity
+                )
+                state = "true" if running[identity] else "false"
+                return self.tool.CommandResult(
+                    0,
+                    f"{identity}|/{service.name}|{state}|healthy\n".encode(),
+                )
+            raise AssertionError(command)
+
+        controller = self.tool.MaintenanceController(
+            options=self.options(),
+            services=services,
+            private_values={},
+            runner=runner,
+            nginx=StubNginx([]),
+            clock=lambda: 100.0,
+        )
+        controller.deadline = 280.0
+        controller.sync_fragment = "/etc/systemd/system/sub2api-sync.service"
+        controller.stop_writers()
+        controller.ensure_legacy_running(services.app)
+
+        self.assertNotIn(
+            ["docker", "stop", "--time", "10", services.app.name],
+            calls,
+        )
+        self.assertNotIn(["docker", "start", services.app.name], calls)
+
+    def test_target_ids_are_rechecked_before_and_after_nginx_switch(self):
+        target_ids = {
+            name: f"{index:x}" * 64
+            for index, name in enumerate(self.tool.TARGET_NAMES, start=4)
+        }
+        names_by_id = {identity: name for name, identity in target_ids.items()}
+        canary_calls = []
+        rebound = {"active": False}
+
+        def runner(argv, **_kwargs):
+            command = [str(value) for value in argv]
+            if command[:2] == ["docker", "inspect"]:
+                identity = command[-1]
+                name = names_by_id[identity]
+                actual_name = (
+                    "unexpected-replacement"
+                    if rebound["active"] and name == self.tool.TARGET_APP
+                    else name
+                )
+                return self.tool.CommandResult(
+                    0,
+                    f"{identity}|/{actual_name}|true|healthy\n".encode(),
+                )
+            if "run-v1-responses-canary.py" in " ".join(command):
+                canary_calls.append(command)
+                return self.tool.CommandResult(0)
+            raise AssertionError(command)
+
+        class RebindingNginx:
+            def switch(_self, stage, **_kwargs):
+                self.assertEqual(stage, "canary")
+                rebound["active"] = True
+
+        controller = self.tool.MaintenanceController(
+            options=self.options(),
+            services=self.services(),
+            private_values={},
+            runner=runner,
+            nginx=RebindingNginx(),
+            health_probe=lambda *_args, **_kwargs: None,
+            clock=lambda: 100.0,
+        )
+        controller.deadline = 280.0
+        controller.writer_stop_deadline = 160.0
+        controller.target_identities.update(target_ids)
+
+        with self.assertRaisesRegex(
+            self.tool.CutoverError,
+            "container identity or runtime state changed",
+        ):
+            controller.switch_and_canary()
+        self.assertEqual(canary_calls, [])
+        self.assertEqual(controller.writer_stop_deadline, 160.0)
+
+    def test_preflight_rollback_readiness_requires_healthy_data_services(self):
+        events = []
+        controller = self.tool.MaintenanceController(
+            options=self.options(),
+            services=self.services(),
+            private_values={},
+            runner=NeverRunner(),
+            nginx=StubNginx(events),
+            health_probe=lambda port, path, **_kwargs: events.append(
+                f"health:{port}{path}"
+            ),
+        )
+        controller.sync_fragment = "/etc/systemd/system/sub2api-sync.service"
+        controller.sync_fragment_sha256 = "d" * 64
+        controller.unit_metadata = lambda: controller.sync_fragment
+        controller.unit_active = lambda: True
+        controller.require_legacy = lambda service, **kwargs: events.append(
+            (service.name, kwargs)
+        )
+        with mock.patch.object(
+            self.tool,
+            "stable_unit_sha256",
+            return_value=controller.sync_fragment_sha256,
+        ):
+            controller.verify_rollback_ready()
+
+        self.assertIn(
+            (self.services().postgres.name, {"running": True, "healthy": True}),
+            events,
+        )
+        self.assertIn(
+            (self.services().redis.name, {"running": True, "healthy": True}),
+            events,
+        )
+        self.assertLess(events.index("health:8080/health"), events.index("nginx-require:stable"))
+        source = TOOL_PATH.read_text(encoding="utf-8")
+        preflight = source[source.index("    def preflight(self):"):source.index(
+            "    def stop_writers(self):"
+        )]
+        self.assertLess(
+            preflight.index("self.wait_target_healthy(TARGET_NONCE_REDIS)"),
+            preflight.index("self.verify_rollback_ready()"),
+        )
 
     def test_apply_requires_full_legacy_identities_and_explicit_paths(self):
         base = [
@@ -239,21 +616,131 @@ class MaintenanceCutoverTests(unittest.TestCase):
         with self.assertRaisesRegex(self.tool.UsageError, "requires only"):
             self.tool.parse_arguments(recover + ["--model", "ambiguous"])
 
+    def test_private_configuration_paths_must_be_absolute(self):
+        base = [
+            "--apply",
+            "--env-file", "/private/env",
+            "--wrangler-config", "/private/wrangler.jsonc",
+            "--safe-export-dir", "/mnt/data/sub2api-gate/safe-backup/export-20260722T000000Z",
+            "--legacy-sub2api-container", "legacy-app",
+            "--legacy-sub2api-id", "a" * 64,
+            "--legacy-postgres-container", "legacy-postgres",
+            "--legacy-postgres-id", "b" * 64,
+            "--legacy-redis-container", "legacy-redis",
+            "--legacy-redis-id", "c" * 64,
+            "--legacy-app-path", "/legacy/app",
+            "--legacy-postgres-path", "/legacy/postgres",
+            "--legacy-redis-path", "/legacy/redis",
+            "--legacy-nginx-log-path", "/var/log/nginx",
+            "--verify-url", "https://gateway.example.test/v1/responses",
+            "--model", "model-test",
+            "--approved-hostname", "gateway.example.test",
+        ]
+        for option in ("--env-file", "--wrangler-config"):
+            arguments = list(base)
+            arguments[arguments.index(option) + 1] = "relative/private-config"
+            with self.subTest(option=option), self.assertRaisesRegex(
+                self.tool.UsageError,
+                "absolute",
+            ):
+                self.tool.parse_arguments(arguments)
+
+        recovery = [
+            "--recover",
+            "--env-file", "relative/private.env",
+            "--legacy-sub2api-container", "legacy-app",
+            "--legacy-sub2api-id", "a" * 64,
+            "--legacy-postgres-container", "legacy-postgres",
+            "--legacy-postgres-id", "b" * 64,
+            "--legacy-redis-container", "legacy-redis",
+            "--legacy-redis-id", "c" * 64,
+        ]
+        with self.assertRaisesRegex(self.tool.UsageError, "absolute"):
+            self.tool.parse_arguments(recovery)
+
+    def test_apply_rejects_unsafe_canary_arguments_offline(self):
+        base = [
+            "--apply",
+            "--env-file", "/private/env",
+            "--wrangler-config", "/private/wrangler.jsonc",
+            "--safe-export-dir", "/mnt/data/sub2api-gate/safe-backup/export-20260722T000000Z",
+            "--legacy-sub2api-container", "legacy-app",
+            "--legacy-sub2api-id", "a" * 64,
+            "--legacy-postgres-container", "legacy-postgres",
+            "--legacy-postgres-id", "b" * 64,
+            "--legacy-redis-container", "legacy-redis",
+            "--legacy-redis-id", "c" * 64,
+            "--legacy-app-path", "/legacy/app",
+            "--legacy-postgres-path", "/legacy/postgres",
+            "--legacy-redis-path", "/legacy/redis",
+            "--legacy-nginx-log-path", "/var/log/nginx",
+            "--verify-url", "https://gateway.example.test/v1/responses",
+            "--model", "model-test",
+            "--approved-hostname", "gateway.example.test",
+        ]
+        invalid_values = (
+            ("--verify-url", "http://127.0.0.1:8081/v1/responses"),
+            ("--verify-url", "https://other.example.test/v1/responses"),
+            ("--verify-url", "https://gateway.example.test/v1/chat/completions"),
+            ("--model", "<invalid-model>"),
+            ("--approved-hostname", "Gateway.example.test"),
+        )
+        for option, value in invalid_values:
+            arguments = list(base)
+            arguments[arguments.index(option) + 1] = value
+            with self.subTest(option=option, value=value), self.assertRaisesRegex(
+                self.tool.UsageError,
+                "canary",
+            ):
+                self.tool.parse_arguments(arguments)
+
+    def test_controller_preflight_revalidates_canary_before_local_commands(self):
+        options = self.options()
+        options.verify_url = "https://other.example.test/v1/responses"
+        runner = NeverRunner()
+        controller = self.tool.MaintenanceController(
+            options=options,
+            services=self.services(),
+            private_values={},
+            runner=runner,
+            nginx=StubNginx([]),
+        )
+        with self.assertRaisesRegex(self.tool.UsageError, "canary"):
+            controller.preflight()
+        self.assertEqual(runner.calls, [])
+
     def test_persistent_recovery_state_is_private_atomic_and_contains_no_secrets(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory).resolve() / "safe-backup"
             root.mkdir(mode=0o700)
             state_path = root / "maintenance-cutover-state.json"
             document = {
-                "version": 1,
+            "version": 3,
                 "phase": "migrating",
                 "git_head": "a" * 40,
                 "env_file": "/private/runtime.env",
+                "env_file_identity": {
+                    "device": 1,
+                    "inode": 2,
+                    "mode": stat.S_IFREG | 0o600,
+                    "links": 1,
+                    "uid": os.geteuid(),
+                    "gid": os.getegid(),
+                    "size": 4096,
+                    "modified_ns": 3,
+                    "changed_ns": 4,
+                },
                 "sync_fragment": "/etc/systemd/system/sub2api-sync.service",
+                "sync_fragment_sha256": "d" * 64,
                 "legacy": {
                     "app": {"name": "legacy-app", "identity": "a" * 64},
                     "postgres": {"name": "legacy-postgres", "identity": "b" * 64},
                     "redis": {"name": "legacy-redis", "identity": "c" * 64},
+                },
+                "targets": {
+                    "sub2api-traffic-canary": "1" * 64,
+                    "sub2api-traffic-canary-postgres": "2" * 64,
+                    "sub2api-traffic-canary-redis": "3" * 64,
                 },
                 "target_started": True,
                 "nonce_target_started": True,
@@ -284,6 +771,28 @@ class MaintenanceCutoverTests(unittest.TestCase):
                     state_path, expected_uid=os.geteuid()
                 )
                 self.assertFalse(state_path.exists())
+                invalid_documents = []
+                legacy_version = dict(document, version=2)
+                invalid_documents.append(legacy_version)
+                invalid_documents.append(
+                    dict(document, sync_fragment_sha256=123)
+                )
+                boolean_identity = dict(document["env_file_identity"], device=True)
+                invalid_documents.append(
+                    dict(document, env_file_identity=boolean_identity)
+                )
+                aliased_targets = dict(document["targets"])
+                aliased_targets["sub2api-traffic-canary"] = "a" * 64
+                invalid_documents.append(dict(document, targets=aliased_targets))
+                for invalid in invalid_documents:
+                    with self.subTest(invalid=invalid), self.assertRaises(
+                        self.tool.CutoverError
+                    ):
+                        self.tool.write_cutover_state(
+                            state_path,
+                            invalid,
+                            expected_uid=os.geteuid(),
+                        )
 
     def test_safe_export_manifest_binds_artifacts_policy_git_and_source_cluster(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -292,6 +801,8 @@ class MaintenanceCutoverTests(unittest.TestCase):
             backup_root.mkdir(mode=0o700)
             export.mkdir(mode=0o700)
             artifacts = {}
+            self.assertIn("schema_fingerprint.sha256", self.tool.SAFE_EXPORT_ARTIFACTS)
+            self.assertNotIn("schema.sql", self.tool.SAFE_EXPORT_ARTIFACTS)
             for name in self.tool.SAFE_EXPORT_ARTIFACTS:
                 payload = f"metadata:{name}\n".encode()
                 path = export / name
@@ -304,10 +815,14 @@ class MaintenanceCutoverTests(unittest.TestCase):
             }
             completed_at = "2026-07-22T00:00:00Z"
             manifest = {
-                "version": 1,
+                "version": 3,
                 "completed_at": completed_at,
                 "git_head": "a" * 40,
-                "source_postgres_system_identifier": "1234567890123456789",
+                "source_postgres_identity": {
+                    "system_identifier": "1234567890123456789",
+                    "database_oid": "16384",
+                    "database_name_hex": "73756232617069",
+                },
                 "artifacts": artifacts,
                 "policy_files": policy,
             }
@@ -330,7 +845,10 @@ class MaintenanceCutoverTests(unittest.TestCase):
                     "a" * 40,
                     expected_uid=os.geteuid(),
                 )
-                self.assertEqual(identity, "1234567890123456789")
+                self.assertEqual(
+                    identity,
+                    ("1234567890123456789", "16384", "73756232617069"),
+                )
                 (export / "usage_metadata.csv").write_bytes(b"tampered\n")
                 (export / "usage_metadata.csv").chmod(0o600)
                 with self.assertRaisesRegex(self.tool.CutoverError, "artifact hash"):
@@ -372,6 +890,31 @@ class MaintenanceCutoverTests(unittest.TestCase):
         self.assertNotIn("SUB2API_SOURCE_DATABASE_URL", environment)
         self.assertEqual(environment["DOCKER_HOST"], "unix:///var/run/docker.sock")
 
+    def test_operator_authentication_precedes_private_environment_read(self):
+        source = TOOL_PATH.read_text(encoding="utf-8")
+        main_start = source.index("def main(\n")
+        main_source = source[main_start:]
+        self.assertLess(
+            main_source.index("        authenticate()"),
+            main_source.index("private_env.read_private_environment(options.env_file)"),
+        )
+
+    def test_safe_export_policy_binds_totp_and_role_migration_controls(self):
+        policy = set(self.tool.SAFE_EXPORT_POLICY_FILES)
+        self.assertTrue(
+            {
+                "deploy/locked-postgres-stream.py",
+                "deploy/verify-migration-totp.py",
+                "deploy/prepare-app-role.sh",
+                "deploy/prepare-sync-role.sh",
+                "deploy/run-database-migration.sh",
+                "migrations/000_prepare_app_role.sql",
+                "migrations/000_prepare_sync_role.sql",
+                "migrations/003_sync_least_privilege.sql",
+                "migrations/005_app_least_privilege.sql",
+            }.issubset(policy)
+        )
+
     def test_private_values_are_added_only_to_the_step_that_requests_them(self):
         calls = []
 
@@ -404,6 +947,154 @@ class MaintenanceCutoverTests(unittest.TestCase):
         )
         self.assertNotIn("SUB2API_TARGET_DATABASE_URL", calls[1][1])
         self.assertNotIn("CLOUDFLARE_API_TOKEN", calls[1][1])
+
+    def test_migration_prepares_sync_boundary_before_app_role(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            command = [str(value) for value in argv]
+            calls.append((command, dict(kwargs["environment"])))
+            if command[:3] == ["docker", "inspect", "--format"]:
+                return self.tool.CommandResult(0, b"true|healthy\n")
+            return self.tool.CommandResult(0)
+
+        controller = self.tool.MaintenanceController(
+            options=self.options(),
+            services=self.services(),
+            private_values=self.migration_private_values(),
+            runner=runner,
+            nginx=StubNginx([]),
+        )
+        controller.target_identities[self.tool.TARGET_POSTGRES] = "d" * 64
+        controller.target_identities[self.tool.TARGET_REDIS] = "e" * 64
+        controller.require_target = lambda *_args, **_kwargs: None
+        controller.inspect_container_runtime = lambda *_args, **_kwargs: None
+        controller.persist_recovery_state = lambda _phase: None
+
+        def wait_target(name):
+            if name == self.tool.TARGET_POSTGRES:
+                controller.target_identities[name] = "f" * 64
+
+        controller.wait_target_healthy = wait_target
+
+        controller.migrate()
+
+        commands = [command for command, _environment in calls]
+        postgres_migration = next(
+            index
+            for index, command in enumerate(commands)
+            if command[:2] == [
+                str(ROOT / "deploy" / "migrate-sanitized-postgres.sh"),
+                "--apply",
+            ]
+        )
+        self.assertEqual(
+            commands[postgres_migration][2:],
+            [
+                "--env-file", "/private/env",
+                "--source-app-container", "legacy-app",
+                "--source-app-id", "a" * 64,
+                "--source-postgres-container", "legacy-postgres",
+                "--source-postgres-id", "b" * 64,
+            ],
+        )
+        postgres_environment = calls[postgres_migration][1]
+        self.assertNotIn("SUB2API_SOURCE_DATABASE_URL", postgres_environment)
+        self.assertNotIn("SUB2API_TARGET_DATABASE_URL", postgres_environment)
+        prepare_sync = next(
+            index
+            for index, command in enumerate(commands)
+            if command[:2] == [
+                str(ROOT / "deploy" / "prepare-sync-role.sh"),
+                "--apply",
+            ]
+        )
+        apply_sync_schema = next(
+            index
+            for index, command in enumerate(commands)
+            if command[:3] == [
+                str(ROOT / "deploy" / "run-database-migration.sh"),
+                "sync-role",
+                "--apply",
+            ]
+        )
+        prepare_app = next(
+            index
+            for index, command in enumerate(commands)
+            if command[:2] == [
+                str(ROOT / "deploy" / "prepare-app-role.sh"),
+                "--apply",
+            ]
+        )
+        self.assertLess(prepare_sync, apply_sync_schema)
+        self.assertLess(apply_sync_schema, prepare_app)
+
+        sync_environment = calls[prepare_sync][1]
+        self.assertEqual(
+            commands[prepare_sync][2:],
+            ["--env-file", "/private/env"],
+        )
+        self.assertNotIn("SUB2API_SYNC_DATABASE_PASSWORD", sync_environment)
+        self.assertNotIn("SUB2API_DATABASE_URL", sync_environment)
+        self.assertNotIn("SUB2API_APP_DATABASE_PASSWORD", sync_environment)
+
+        schema_environment = calls[apply_sync_schema][1]
+        self.assertEqual(
+            commands[apply_sync_schema][3:],
+            ["--env-file", "/private/env"],
+        )
+        self.assertNotIn("SUB2API_DATABASE_URL", schema_environment)
+        self.assertNotIn("SUB2API_SYNC_DATABASE_PASSWORD", schema_environment)
+        self.assertEqual(
+            commands[prepare_app][2:],
+            ["--env-file", "/private/env"],
+        )
+        self.assertNotIn("SUB2API_DATABASE_URL", calls[prepare_app][1])
+        self.assertNotIn("SUB2API_APP_DATABASE_PASSWORD", calls[prepare_app][1])
+
+    def test_sync_role_failure_after_writer_stop_uses_verified_rollback(self):
+        events = []
+
+        def runner(argv, **_kwargs):
+            command = [str(value) for value in argv]
+            events.append(pathlib.Path(command[0]).name)
+            if command[:2] == [
+                str(ROOT / "deploy" / "prepare-sync-role.sh"),
+                "--apply",
+            ]:
+                raise self.tool.CutoverError("sync role preparation failed")
+            return self.tool.CommandResult(0)
+
+        controller = self.tool.MaintenanceController(
+            options=self.options(),
+            services=self.services(),
+            private_values=self.migration_private_values(),
+            runner=runner,
+            nginx=StubNginx(events),
+            clock=lambda: 100.0,
+        )
+
+        controller.preflight = lambda: events.append("preflight")
+
+        def stop_writers():
+            events.append("writers-stopped")
+            controller.writers_stopped = True
+
+        controller.stop_writers = stop_writers
+        controller.start_target = lambda: events.append("unexpected-target-start")
+        controller.switch_and_canary = lambda: events.append("unexpected-nginx-switch")
+        controller.rollback = lambda: events.append("rollback") or []
+
+        with self.assertRaisesRegex(
+            self.tool.CutoverError,
+            "cutover_phase_failed; rollback_verified",
+        ):
+            controller.execute()
+
+        self.assertIn("prepare-sync-role.sh", events)
+        self.assertIn("rollback", events)
+        self.assertNotIn("unexpected-target-start", events)
+        self.assertNotIn("unexpected-nginx-switch", events)
 
     def test_source_redis_preflight_authenticates_and_binds_run_id_to_exact_container(self):
         recorded = {}
@@ -578,32 +1269,43 @@ class MaintenanceCutoverTests(unittest.TestCase):
         pg_helper = types.SimpleNamespace(
             libpq_environment=lambda environment, name: {
                 "PGHOST": "127.0.0.1",
-                "PGPORT": "15431" if name == "SUB2API_SOURCE_DATABASE_URL" else "15432",
+                "PGPORT": "15432",
+                "PGDATABASE": "sub2api",
             }
         )
 
         def runner(argv, **kwargs):
             calls.append((list(argv), dict(kwargs["environment"])))
+            if argv[:2] == [
+                "python3",
+                str(ROOT / "deploy" / "source-postgres-exec.py"),
+            ]:
+                return self.tool.CommandResult(
+                    0,
+                    b"1234567890123456789|16384|73756232617069\n",
+                )
             if argv[:2] == ["docker", "inspect"]:
-                port = "15431" if argv[-1] == "legacy-postgres" else "15432"
                 return self.tool.CommandResult(
                     0,
                     json.dumps({
                         "Networks": {"data": {"IPAddress": "172.18.0.3"}},
                         "Ports": {
                             "5432/tcp": [
-                                {"HostIp": "127.0.0.1", "HostPort": port}
+                                {"HostIp": "127.0.0.1", "HostPort": "15432"}
                             ]
                         },
                     }).encode(),
                 )
-            return self.tool.CommandResult(0, b"1234567890123456789\n")
+            return self.tool.CommandResult(
+                0,
+                b"1234567890123456789|16384|73756232617069\n",
+            )
 
         controller = self.tool.MaintenanceController(
             options=self.options(),
             services=self.services(),
             private_values={
-                "SUB2API_SOURCE_DATABASE_URL": "source-secret-url",
+                "SUB2API_SOURCE_DATABASE_URL": "must-not-enter-child-environment",
                 "SUB2API_TARGET_DATABASE_URL": "target-secret-url",
             },
             runner=runner,
@@ -613,13 +1315,71 @@ class MaintenanceCutoverTests(unittest.TestCase):
             identities = controller.verify_database_connections()
         self.assertEqual(
             identities["SUB2API_SOURCE_DATABASE_URL"],
-            "1234567890123456789",
+            ("1234567890123456789", "16384", "73756232617069"),
         )
-        psql_calls = [call for call in calls if call[0][0] == "python3"]
-        self.assertEqual(len(psql_calls), 2)
-        self.assertIn("SUB2API_SOURCE_DATABASE_URL", psql_calls[0][1])
-        self.assertNotIn("SUB2API_TARGET_DATABASE_URL", psql_calls[0][1])
-        self.assertIn("SUB2API_TARGET_DATABASE_URL", psql_calls[1][1])
+        source_calls = [
+            call for call in calls
+            if call[0][:2] == [
+                "python3",
+                str(ROOT / "deploy" / "source-postgres-exec.py"),
+            ]
+        ]
+        self.assertEqual(len(source_calls), 1)
+        self.assertEqual(
+            source_calls[0][0][2:],
+            [
+                "--env-file", "/private/env",
+                "--source-app-container", "legacy-app",
+                "--source-app-id", "a" * 64,
+                "--source-postgres-container", "legacy-postgres",
+                "--source-postgres-id", "b" * 64,
+                "--source-app-state", "running",
+                "identity",
+            ],
+        )
+        self.assertNotIn("SUB2API_SOURCE_DATABASE_URL", source_calls[0][1])
+        target_calls = [
+            call for call in calls
+            if call[0][:2] == [
+                "python3",
+                str(ROOT / "deploy" / "pg-env-exec.py"),
+            ]
+        ]
+        self.assertEqual(len(target_calls), 1)
+        self.assertIn("SUB2API_TARGET_DATABASE_URL", target_calls[0][1])
+
+    def test_target_postgres_network_metadata_fails_closed(self):
+        pg_helper = types.SimpleNamespace(
+            libpq_environment=lambda _environment, _name: {
+                "PGHOST": "127.0.0.1",
+                "PGPORT": "15432",
+                "PGDATABASE": "sub2api",
+            }
+        )
+
+        def runner(argv, **_kwargs):
+            if argv[:2] == [
+                "python3",
+                str(ROOT / "deploy" / "source-postgres-exec.py"),
+            ]:
+                return self.tool.CommandResult(
+                    0,
+                    b"1234567890123456789|16384|73756232617069\n",
+                )
+            if argv[:2] == ["docker", "inspect"]:
+                return self.tool.CommandResult(0, b"[]\n")
+            raise AssertionError(argv)
+
+        controller = self.tool.MaintenanceController(
+            options=self.options(),
+            services=self.services(),
+            private_values={"SUB2API_TARGET_DATABASE_URL": "target-secret-url"},
+            runner=runner,
+            nginx=StubNginx([]),
+        )
+        with mock.patch.object(self.tool, "load_module", return_value=pg_helper), \
+             self.assertRaisesRegex(self.tool.CutoverError, "network metadata"):
+            controller.verify_database_connections()
 
     def test_safe_export_source_cluster_must_match_live_source_before_cutover(self):
         controller = self.tool.MaintenanceController(
@@ -629,14 +1389,29 @@ class MaintenanceCutoverTests(unittest.TestCase):
             runner=NeverRunner(),
             nginx=StubNginx([]),
         )
-        controller.export_source_system_identifier = "1234567890123456789"
+        controller.export_source_database_identity = (
+            "1234567890123456789",
+            "16384",
+            "73756232617069",
+        )
         controller.require_export_source_identity({
-            "SUB2API_SOURCE_DATABASE_URL": "1234567890123456789"
+            "SUB2API_SOURCE_DATABASE_URL": (
+                "1234567890123456789",
+                "16384",
+                "73756232617069",
+            )
         })
-        with self.assertRaisesRegex(self.tool.CutoverError, "different source"):
-            controller.require_export_source_identity({
-                "SUB2API_SOURCE_DATABASE_URL": "9876543210987654321"
-            })
+        for mismatched_identity in (
+            ("9876543210987654321", "16384", "73756232617069"),
+            ("1234567890123456789", "16385", "73756232617069"),
+            ("1234567890123456789", "16384", "6f74686572"),
+        ):
+            with self.subTest(identity=mismatched_identity), self.assertRaisesRegex(
+                self.tool.CutoverError, "different source PostgreSQL database"
+            ):
+                controller.require_export_source_identity({
+                    "SUB2API_SOURCE_DATABASE_URL": mismatched_identity
+                })
 
     def test_safe_export_or_live_nginx_failure_cannot_stop_writers(self):
         tool = self.tool
@@ -695,6 +1470,42 @@ class MaintenanceCutoverTests(unittest.TestCase):
                 nginx.switch("stable", timeout=10)
             self.assertEqual(active.read_bytes(), b"server 127.0.0.1:8080;\n")
             self.assertEqual(sum(call == ["/usr/sbin/nginx", "-t"] for call in calls), 2)
+
+    def test_nginx_switch_recomputes_absolute_deadline_before_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            snippets = root / "snippets"
+            state = root / "sub2api-gate"
+            snippets.mkdir()
+            snippets.chmod(0o755)
+            active = snippets / "sub2api-upstream-active.conf"
+            active.write_bytes(b"server 127.0.0.1:8080;\n")
+            active.chmod(0o644)
+            paths = self.tool.NginxPaths(root=root, active=active, state=state)
+            calls = []
+            times = iter((0.0, 0.0, 6.0))
+
+            def runner(argv, **_kwargs):
+                calls.append(list(argv))
+                return self.tool.CommandResult(0)
+
+            nginx = self.tool.NginxUpstream(
+                paths,
+                runner,
+                production=False,
+                initial_stage=None,
+            )
+            with self.assertRaisesRegex(
+                self.tool.WindowExpired,
+                "writer-stop deadline",
+            ):
+                nginx.switch(
+                    "canary",
+                    timeout=10,
+                    deadline=5.0,
+                    clock=lambda: next(times),
+                )
+            self.assertEqual(calls, [["/usr/sbin/nginx", "-t"]])
 
     def test_live_nginx_gate_requires_capture_free_named_direct_upstream(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -761,7 +1572,7 @@ class MaintenanceCutoverTests(unittest.TestCase):
             "healthy",
         ]
 
-        def health(port, path):
+        def health(port, path, **_kwargs):
             events.append(f"health:{port}{path}")
 
         controller = self.tool.MaintenanceController(
@@ -777,9 +1588,12 @@ class MaintenanceCutoverTests(unittest.TestCase):
         controller.sync_fragment = "/etc/systemd/system/sub2api-sync.service"
         controller.target_started = True
         controller.nonce_target_started = True
+        controller.target_identities.update(runner.traffic_targets)
+        controller.writer_stop_deadline = controller.clock() - 1
         errors = controller.rollback()
 
         self.assertEqual(errors, [])
+        self.assertIsNone(controller.writer_stop_deadline)
         stable = events.index("nginx:stable")
         self.assertLess(events.index("health:8080/health"), stable)
         self.assertLess(events.index("health:3021/healthz"), stable)
@@ -795,6 +1609,71 @@ class MaintenanceCutoverTests(unittest.TestCase):
         self.assertLess(stable, events.index("down:nonce"))
         self.assertLess(events.index("down:nonce"), events.index("reset:target"))
 
+    def test_rollback_restores_legacy_before_enforcing_cleanup_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            private = root / "private"
+            private.mkdir(mode=0o700)
+            env_file = private / "sub2api.env"
+            env_file.write_text("VALUE=first\n", encoding="ascii")
+            env_file.chmod(0o600)
+            unit = root / self.tool.SYNC_UNIT
+            unit.write_text("[Service]\nExecStart=/bin/true\n", encoding="ascii")
+            unit.chmod(0o644)
+            expected_uid = os.geteuid()
+            expected_gid = os.getegid()
+
+            def controller():
+                events = []
+                services = self.services()
+                runner = RollbackRunner(self.tool, services, events)
+                instance = self.tool.MaintenanceController(
+                    options=types.SimpleNamespace(env_file=env_file),
+                    services=services,
+                    private_values={},
+                    runner=runner,
+                    nginx=StubNginx(events),
+                    health_probe=lambda port, path, **_kwargs: events.append(
+                        f"health:{port}{path}"
+                    ),
+                    sleeper=lambda _seconds: None,
+                    target_resetter=lambda: events.append("reset:target"),
+                    private_env_identity=self.tool.private_environment_identity(
+                        env_file,
+                        expected_uid=expected_uid,
+                        expected_gid=expected_gid,
+                    ),
+                    recovery_state_expected_uid=expected_uid,
+                    recovery_state_expected_gid=expected_gid,
+                )
+                instance.sync_fragment = str(unit)
+                instance.sync_fragment_sha256 = self.tool.stable_unit_sha256(
+                    unit,
+                    expected_uid=expected_uid,
+                )
+                instance.unit_metadata = lambda: str(unit)
+                instance.target_started = True
+                instance.nonce_target_started = True
+                instance.target_identities.update(runner.traffic_targets)
+                return instance, events
+
+            changed_env, env_events = controller()
+            env_file.write_text("VALUE=changed-value\n", encoding="ascii")
+            self.assertEqual(changed_env.rollback(), ["recovery_identity"])
+            self.assertIn("nginx:stable", env_events)
+            self.assertNotIn("down:traffic", env_events)
+            self.assertNotIn("reset:target", env_events)
+
+            changed_unit, unit_events = controller()
+            unit.write_text("[Service]\nExecStart=/bin/false\n", encoding="ascii")
+            self.assertEqual(
+                changed_unit.rollback(),
+                ["legacy_sync_health", "recovery_identity"],
+            )
+            self.assertIn("nginx:stable", unit_events)
+            self.assertNotIn("down:traffic", unit_events)
+            self.assertNotIn("reset:target", unit_events)
+
     def test_rollback_never_starts_a_rebound_legacy_name(self):
         events = []
         services = self.services()
@@ -806,7 +1685,7 @@ class MaintenanceCutoverTests(unittest.TestCase):
             private_values={},
             runner=runner,
             nginx=StubNginx(events),
-            health_probe=lambda *_args: None,
+            health_probe=lambda *_args, **_kwargs: None,
             sleeper=lambda _seconds: None,
             target_resetter=lambda: events.append("reset:target"),
         )
@@ -830,7 +1709,7 @@ class MaintenanceCutoverTests(unittest.TestCase):
             private_values={},
             runner=runner,
             nginx=StubNginx(events),
-            health_probe=lambda *_args: None,
+            health_probe=lambda *_args, **_kwargs: None,
             sleeper=lambda _seconds: None,
             target_resetter=lambda: events.append("reset:target"),
         )
@@ -986,6 +1865,91 @@ class MaintenanceCutoverTests(unittest.TestCase):
                     exact_path=target,
                 )
             self.assertTrue(external.exists())
+
+    def test_target_reset_rejects_mountinfo_boundaries_and_rechecks_before_delete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            target = root / "target"
+            nested = target / "nested"
+            target.mkdir(mode=0o700)
+            nested.mkdir(mode=0o700)
+            payload = nested / "data"
+            payload.write_bytes(b"preserve")
+            mountinfo = root / "mountinfo"
+            mountinfo.write_text(
+                f"36 25 0:32 / {nested} rw,relatime - ext4 /dev/root rw\n",
+                encoding="ascii",
+            )
+            reader = lambda: self.tool.read_mountpoints(mountinfo)
+            with self.assertRaisesRegex(self.tool.CutoverError, "mount boundary"):
+                self.tool.clear_private_directory(
+                    target,
+                    expected_uid=os.geteuid(),
+                    expected_gid=os.getegid(),
+                    exact_path=target,
+                    mountpoints_reader=reader,
+                )
+            self.assertEqual(payload.read_bytes(), b"preserve")
+
+            calls = 0
+
+            def changed_mount_table():
+                nonlocal calls
+                calls += 1
+                return () if calls == 1 else (nested,)
+
+            with self.assertRaisesRegex(self.tool.CutoverError, "mount boundary"):
+                self.tool.clear_private_directory(
+                    target,
+                    expected_uid=os.geteuid(),
+                    expected_gid=os.getegid(),
+                    exact_path=target,
+                    mountpoints_reader=changed_mount_table,
+                )
+            self.assertEqual(calls, 2)
+            self.assertEqual(payload.read_bytes(), b"preserve")
+
+    @unittest.skipUnless(os.geteuid() == 0, "real bind-mount test requires root")
+    def test_target_reset_rejects_a_real_same_device_bind_mount(self):
+        subprocess = __import__("subprocess")
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            source = root / "source"
+            target = root / "target"
+            nested = target / "nested"
+            source.mkdir(mode=0o700)
+            target.mkdir(mode=0o700)
+            nested.mkdir(mode=0o700)
+            payload = source / "data"
+            payload.write_bytes(b"preserve")
+            result = subprocess.run(
+                ["mount", "--bind", str(source), str(nested)],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if result.returncode:
+                self.skipTest("root test environment cannot create bind mounts")
+            try:
+                self.assertEqual(source.stat().st_dev, nested.stat().st_dev)
+                with self.assertRaisesRegex(
+                    self.tool.CutoverError,
+                    "mount boundary",
+                ):
+                    self.tool.clear_private_directory(
+                        target,
+                        expected_uid=0,
+                        expected_gid=0,
+                        exact_path=target,
+                    )
+                self.assertEqual(payload.read_bytes(), b"preserve")
+            finally:
+                subprocess.run(
+                    ["umount", str(nested)],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
 
     def test_nonce_migration_override_has_only_fixed_loopback_port_and_acl(self):
         source = REDIS_MIGRATION_COMPOSE.read_text()

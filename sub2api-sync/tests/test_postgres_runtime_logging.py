@@ -168,17 +168,28 @@ class PostgresRuntimeLogArtifactTests(unittest.TestCase):
         environment = {
             "PATH": os.environ["PATH"],
             "SUB2API_DATA_ROOT": str(self.root),
-            "SUB2API_DATABASE_URL": (
-                "postgresql://runtime:private@127.0.0.1:5432/sub2api"
-                "?sslmode=disable"
-            ),
         }
+        selected_environment = {
+            "PATH": os.environ["PATH"],
+            "PGHOST": "127.0.0.1",
+            "PGPORT": "15432",
+            "PGUSER": "runtime",
+            "PGPASSWORD": "private",
+            "PGDATABASE": "sub2api",
+            "PGOPTIONS": self.tool.RUNTIME_PGOPTIONS,
+        }
+        pg_tool = mock.Mock()
+        pg_tool.private_libpq_environment.return_value = selected_environment
         with mock.patch.object(
             self.tool, "verify_no_postgres_log_artifacts"
         ) as artifact_gate, mock.patch.object(
             self.tool.subprocess, "run", return_value=completed
-        ) as run:
-            self.tool.verify_runtime_privacy(environment)
+        ) as run, mock.patch.object(
+            self.tool, "load_pg_environment_tool", return_value=pg_tool
+        ):
+            self.tool.verify_runtime_privacy(
+                environment, pathlib.Path("/private/sub2api.env"), "target"
+            )
         self.assertEqual(artifact_gate.call_count, 2)
         self.assertIn("pg_catalog.pg_settings", run.call_args.kwargs["input"])
         self.assertIn("current_logfiles", run.call_args.kwargs["input"])

@@ -53,13 +53,24 @@ SYNC_UNIT = "sub2api-sync.service"
 WINDOW_SECONDS = 180
 WRITER_STOP_SECONDS = 60
 ROLLBACK_SECONDS = 120
+COMMAND_TERM_GRACE_SECONDS = 1
+COMMAND_KILL_GRACE_SECONDS = 1
 CONTAINER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}\Z")
 GIT_HEAD_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 PG_SYSTEM_ID_RE = re.compile(r"[0-9]{10,24}\Z")
+PG_DATABASE_OID_RE = re.compile(r"[0-9]{1,10}\Z")
+PG_DATABASE_NAME_HEX_RE = re.compile(r"(?:[0-9a-f]{2}){1,63}\Z")
+POSTGRES_DATABASE_IDENTITY_SQL = (
+    "SELECT system_identifier::text || '|' || d.oid::text || '|' || "
+    "pg_catalog.encode(pg_catalog.convert_to(pg_catalog.current_database(), "
+    "'UTF8'), 'hex') FROM pg_catalog.pg_control_system() "
+    "CROSS JOIN pg_catalog.pg_database AS d "
+    "WHERE d.datname = pg_catalog.current_database()"
+)
 SAFE_EXPORT_ARTIFACTS = (
-    "schema.sql",
+    "schema_fingerprint.sha256",
     "groups.csv",
     "user_allowed_groups.csv",
     "user_subscriptions.csv",
@@ -67,13 +78,23 @@ SAFE_EXPORT_ARTIFACTS = (
     "usage_metadata.csv",
 )
 SAFE_EXPORT_POLICY_FILES = (
+    "deploy/locked-postgres-stream.py",
     "deploy/migrate-sanitized-postgres.sh",
     "deploy/pg-env-exec.py",
+    "deploy/source-postgres-exec.py",
+    "deploy/prepare-app-role.sh",
+    "deploy/prepare-sync-role.sh",
+    "deploy/run-database-migration.sh",
+    "deploy/verify-migration-totp.py",
     "deploy/verify-postgres-portability.sql",
     "deploy/verify-postgres-runtime-logging.sql",
     "deploy/verify-sanitized-target.sql",
+    "migrations/000_prepare_app_role.sql",
+    "migrations/000_prepare_sync_role.sql",
     "migrations/002_remove_conversation_capture.sql",
     "migrations/002_scrub_conversation_history.sql",
+    "migrations/003_sync_least_privilege.sql",
+    "migrations/005_app_least_privilege.sql",
     "migrations/verify_conversation_guards.sql",
     "migrations/verify_no_conversation_content.sql",
 )
@@ -82,6 +103,7 @@ SAFE_EXPORT_ENTRIES = frozenset(
 )
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_CUTOVER_STATE_BYTES = 64 * 1024
+MAX_PRIVATE_ENV_BYTES = 128 * 1024
 CUTOVER_STATE_PHASES = frozenset(
     {
         "preflight_targets_starting",
@@ -106,6 +128,7 @@ REQUIRED_PRIVATE_VALUES = {
     "SUB2API_TARGET_REDIS_URL",
     "SUB2API_TARGET_REDIS_PASSWORD",
     "SUB2API_TARGET_REDIS_USERNAME",
+    "SUB2API_SYNC_DATABASE_PASSWORD",
     "SUB2API_SYNC_REDIS_PASSWORD",
 }
 
@@ -173,6 +196,83 @@ class CommandResult:
 
 
 class CommandRunner:
+    @staticmethod
+    def _process_group_exists(process_group):
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    @classmethod
+    def _terminate_process_group(cls, process):
+        process_group = process.pid
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process_group, signal.SIGTERM)
+        grace_deadline = time.monotonic() + COMMAND_TERM_GRACE_SECONDS
+        while (
+            time.monotonic() < grace_deadline
+            and cls._process_group_exists(process_group)
+        ):
+            time.sleep(0.05)
+        if cls._process_group_exists(process_group):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process_group, signal.SIGKILL)
+        try:
+            process.communicate(timeout=COMMAND_KILL_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            try:
+                process.communicate(timeout=COMMAND_KILL_GRACE_SECONDS)
+            except subprocess.TimeoutExpired as error:
+                raise CommandError(
+                    "timed-out command process group could not be reaped"
+                ) from error
+
+    @staticmethod
+    def _set_foreground_process_group(terminal_fd, process_group):
+        sigttou = getattr(signal, "SIGTTOU", None)
+        previous = None
+        if sigttou is not None:
+            previous = signal.signal(sigttou, signal.SIG_IGN)
+        try:
+            os.tcsetpgrp(terminal_fd, process_group)
+        finally:
+            if sigttou is not None:
+                signal.signal(sigttou, previous)
+
+    @classmethod
+    @contextlib.contextmanager
+    def _interactive_foreground(cls, process):
+        try:
+            terminal_fd = sys.stdin.fileno()
+            if not os.isatty(terminal_fd):
+                raise OSError("stdin is not a terminal")
+            original_process_group = os.tcgetpgrp(terminal_fd)
+            cls._set_foreground_process_group(terminal_fd, process.pid)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGCONT)
+        except (OSError, ValueError) as error:
+            cls._terminate_process_group(process)
+            raise CommandError(
+                "interactive command could not acquire the private terminal"
+            ) from error
+        try:
+            yield
+        finally:
+            try:
+                cls._set_foreground_process_group(
+                    terminal_fd,
+                    original_process_group,
+                )
+            except OSError as error:
+                raise CommandError(
+                    "interactive command could not restore the private terminal"
+                ) from error
+
     def __call__(
         self,
         argv,
@@ -182,23 +282,42 @@ class CommandRunner:
         allow_failure=False,
         interactive=False,
     ):
+        popen_options = {
+            "stdin": None if interactive else subprocess.DEVNULL,
+            "stdout": None if interactive else subprocess.PIPE,
+            "stderr": None if interactive else subprocess.DEVNULL,
+            "env": environment,
+            "start_new_session": not interactive,
+        }
+        if interactive:
+            popen_options["preexec_fn"] = os.setpgrp
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 [str(value) for value in argv],
-                stdin=None if interactive else subprocess.DEVNULL,
-                stdout=None if interactive else subprocess.PIPE,
-                stderr=None if interactive else subprocess.DEVNULL,
-                env=environment,
-                timeout=max(1, timeout),
-                check=False,
+                **popen_options,
             )
-        except subprocess.TimeoutExpired as error:
-            raise WindowExpired("cutover command deadline exceeded") from error
         except OSError as error:
             raise CommandError("required local command could not be started") from error
-        if result.returncode and not allow_failure:
+        try:
+            foreground = (
+                self._interactive_foreground(process)
+                if interactive
+                else contextlib.nullcontext()
+            )
+            with foreground:
+                stdout, _stderr = process.communicate(timeout=max(1, timeout))
+        except subprocess.TimeoutExpired as error:
+            self._terminate_process_group(process)
+            raise WindowExpired("cutover command deadline exceeded") from error
+        except BaseException:
+            self._terminate_process_group(process)
+            raise
+        if self._process_group_exists(process.pid):
+            self._terminate_process_group(process)
+            raise CommandError("required local command left child processes running")
+        if process.returncode and not allow_failure:
             raise CommandError("required local command returned a failure")
-        return CommandResult(result.returncode, result.stdout or b"")
+        return CommandResult(process.returncode, stdout or b"")
 
 
 def load_module(path, name):
@@ -215,6 +334,111 @@ def decode_stdout(result):
         return result.stdout.decode("utf-8", errors="strict").strip()
     except UnicodeDecodeError as error:
         raise CutoverError("local command returned invalid text") from error
+
+
+def _open_stable_absolute_file(path):
+    path = pathlib.Path(path)
+    components = path.parts[1:] if path.is_absolute() else ()
+    if (
+        not components
+        or any(component in {"", ".", ".."} for component in components)
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+    ):
+        raise CutoverError("private filesystem identity path is invalid")
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+    )
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+    try:
+        directory_descriptor = os.open("/", directory_flags)
+    except OSError as error:
+        raise CutoverError("private filesystem identity is unavailable") from error
+    try:
+        for component in components[:-1]:
+            next_descriptor = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_descriptor,
+            )
+            os.close(directory_descriptor)
+            directory_descriptor = next_descriptor
+        parent_stat = os.fstat(directory_descriptor)
+        descriptor = os.open(
+            components[-1],
+            file_flags,
+            dir_fd=directory_descriptor,
+        )
+        return descriptor, parent_stat
+    except OSError as error:
+        raise CutoverError("private filesystem identity is unavailable") from error
+    finally:
+        os.close(directory_descriptor)
+
+
+def _filesystem_identity(file_stat):
+    return {
+        "device": file_stat.st_dev,
+        "inode": file_stat.st_ino,
+        "mode": file_stat.st_mode,
+        "links": file_stat.st_nlink,
+        "uid": file_stat.st_uid,
+        "gid": file_stat.st_gid,
+        "size": file_stat.st_size,
+        "modified_ns": file_stat.st_mtime_ns,
+        "changed_ns": file_stat.st_ctime_ns,
+    }
+
+
+def private_environment_identity(path, *, expected_uid, expected_gid):
+    descriptor, parent_stat = _open_stable_absolute_file(path)
+    try:
+        file_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid != expected_uid
+            or stat.S_IMODE(parent_stat.st_mode) & 0o022
+            or not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_nlink != 1
+            or (file_stat.st_uid, file_stat.st_gid) != (expected_uid, expected_gid)
+            or stat.S_IMODE(file_stat.st_mode) != 0o600
+            or file_stat.st_size > MAX_PRIVATE_ENV_BYTES
+        ):
+            raise CutoverError("private environment filesystem identity is unsafe")
+        return _filesystem_identity(file_stat)
+    finally:
+        os.close(descriptor)
+
+
+def stable_unit_sha256(path, *, expected_uid):
+    descriptor, parent_stat = _open_stable_absolute_file(path)
+    digest = hashlib.sha256()
+    try:
+        initial = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid != expected_uid
+            or stat.S_IMODE(parent_stat.st_mode) & 0o022
+            or not stat.S_ISREG(initial.st_mode)
+            or initial.st_nlink != 1
+            or initial.st_uid != expected_uid
+            or stat.S_IMODE(initial.st_mode) & 0o022
+            or initial.st_size > 1024 * 1024
+        ):
+            raise CutoverError("legacy sync unit content identity is unsafe")
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        if _filesystem_identity(os.fstat(descriptor)) != _filesystem_identity(initial):
+            raise CutoverError("legacy sync unit changed while being read")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
 
 
 def _open_private_export_file(path, expected_uid):
@@ -319,8 +543,11 @@ def _validate_cutover_state_document(document):
         "phase",
         "git_head",
         "env_file",
+        "env_file_identity",
         "sync_fragment",
+        "sync_fragment_sha256",
         "legacy",
+        "targets",
         "target_started",
         "nonce_target_started",
         "nonce_runtime_active",
@@ -333,25 +560,89 @@ def _validate_cutover_state_document(document):
     if not isinstance(legacy, dict) or set(legacy) != {"app", "postgres", "redis"}:
         raise CutoverError("maintenance recovery state has invalid legacy identities")
     for value in legacy.values():
+        name = value.get("name") if isinstance(value, dict) else None
+        identity = value.get("identity") if isinstance(value, dict) else None
         if (
             not isinstance(value, dict)
             or set(value) != {"name", "identity"}
-            or not CONTAINER_NAME_RE.fullmatch(value.get("name", ""))
-            or not CONTAINER_ID_RE.fullmatch(value.get("identity", ""))
+            or not isinstance(name, str)
+            or not CONTAINER_NAME_RE.fullmatch(name)
+            or not isinstance(identity, str)
+            or not CONTAINER_ID_RE.fullmatch(identity)
         ):
             raise CutoverError("maintenance recovery state has invalid legacy identities")
-    env_file = document.get("env_file")
-    sync_fragment = document.get("sync_fragment")
+    targets = document.get("targets")
     if (
-        document.get("version") != 1
-        or document.get("phase") not in CUTOVER_STATE_PHASES
-        or not GIT_HEAD_RE.fullmatch(document.get("git_head", ""))
+        not isinstance(targets, dict)
+        or set(targets) != set(TARGET_NAMES)
+        or any(
+            value is not None
+            and (
+                not isinstance(value, str)
+                or not CONTAINER_ID_RE.fullmatch(value)
+            )
+            for value in targets.values()
+        )
+    ):
+        raise CutoverError("maintenance recovery state has invalid target identities")
+    target_identity_values = [
+        value for value in targets.values() if value is not None
+    ]
+    legacy_identity_values = {
+        value["identity"] for value in legacy.values()
+    }
+    if (
+        len(target_identity_values) != len(set(target_identity_values))
+        or set(target_identity_values) & legacy_identity_values
+    ):
+        raise CutoverError("maintenance recovery state has aliased target identities")
+    env_file = document.get("env_file")
+    env_file_identity = document.get("env_file_identity")
+    sync_fragment = document.get("sync_fragment")
+    phase = document.get("phase")
+    git_head = document.get("git_head")
+    sync_fragment_sha256 = document.get("sync_fragment_sha256")
+    identity_fields = {
+        "device",
+        "inode",
+        "mode",
+        "links",
+        "uid",
+        "gid",
+        "size",
+        "modified_ns",
+        "changed_ns",
+    }
+    identity_integers_valid = (
+        isinstance(env_file_identity, dict)
+        and set(env_file_identity) == identity_fields
+        and all(
+            isinstance(env_file_identity.get(name), int)
+            and not isinstance(env_file_identity.get(name), bool)
+            and 0 <= env_file_identity[name] <= 2**64 - 1
+            for name in identity_fields
+        )
+    )
+    if (
+        document.get("version") != 3
+        or not isinstance(phase, str)
+        or phase not in CUTOVER_STATE_PHASES
+        or not isinstance(git_head, str)
+        or not GIT_HEAD_RE.fullmatch(git_head)
         or not isinstance(env_file, str)
         or not env_file.startswith("/")
         or "\x00" in env_file
+        or not identity_integers_valid
+        or env_file_identity["mode"] != stat.S_IFREG | 0o600
+        or env_file_identity["links"] != 1
+        or env_file_identity["uid"] > 2**32 - 1
+        or env_file_identity["gid"] > 2**32 - 1
+        or env_file_identity["size"] > MAX_PRIVATE_ENV_BYTES
         or not isinstance(sync_fragment, str)
         or not sync_fragment.startswith("/")
         or pathlib.PurePosixPath(sync_fragment).name != SYNC_UNIT
+        or not isinstance(sync_fragment_sha256, str)
+        or not SHA256_RE.fullmatch(sync_fragment_sha256)
         or any(
             not isinstance(document.get(name), bool)
             for name in (
@@ -499,25 +790,36 @@ def validate_safe_export(export_directory, expected_git_head, *, expected_uid=0)
         "version",
         "completed_at",
         "git_head",
-        "source_postgres_system_identifier",
+        "source_postgres_identity",
         "artifacts",
         "policy_files",
     }:
         raise CutoverError("safe export manifest has an invalid shape")
     completed_at = manifest.get("completed_at")
     git_head = manifest.get("git_head")
-    source_system_identifier = manifest.get("source_postgres_system_identifier")
+    source_identity = manifest.get("source_postgres_identity")
     artifacts = manifest.get("artifacts")
     policy_files = manifest.get("policy_files")
     if (
-        manifest.get("version") != 1
+        manifest.get("version") != 3
         or not isinstance(completed_at, str)
         or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", completed_at)
         or not isinstance(git_head, str)
         or not GIT_HEAD_RE.fullmatch(git_head)
         or git_head != expected_git_head
-        or not isinstance(source_system_identifier, str)
-        or not PG_SYSTEM_ID_RE.fullmatch(source_system_identifier)
+        or not isinstance(source_identity, dict)
+        or set(source_identity) != {
+            "system_identifier",
+            "database_oid",
+            "database_name_hex",
+        }
+        or not isinstance(source_identity.get("system_identifier"), str)
+        or not PG_SYSTEM_ID_RE.fullmatch(source_identity["system_identifier"])
+        or not isinstance(source_identity.get("database_oid"), str)
+        or not PG_DATABASE_OID_RE.fullmatch(source_identity["database_oid"])
+        or int(source_identity["database_oid"]) > 4_294_967_295
+        or not isinstance(source_identity.get("database_name_hex"), str)
+        or not PG_DATABASE_NAME_HEX_RE.fullmatch(source_identity["database_name_hex"])
         or not isinstance(artifacts, dict)
         or set(artifacts) != set(SAFE_EXPORT_ARTIFACTS)
         or not isinstance(policy_files, dict)
@@ -546,7 +848,11 @@ def validate_safe_export(export_directory, expected_git_head, *, expected_uid=0)
         export_directory / "COMPLETE", expected_uid, 256
     ) != expected_complete:
         raise CutoverError("safe export completion marker is invalid")
-    return source_system_identifier
+    return (
+        source_identity["system_identifier"],
+        source_identity["database_oid"],
+        source_identity["database_name_hex"],
+    )
 
 
 def validate_contract():
@@ -556,12 +862,16 @@ def validate_contract():
         DEPLOY_DIR / "security-preflight.sh",
         DEPLOY_DIR / "export-safe-metadata.sh",
         DEPLOY_DIR / "install-nginx-direct-v1.py",
+        DEPLOY_DIR / "locked-postgres-stream.py",
         DEPLOY_DIR / "migrate-sanitized-postgres.sh",
         DEPLOY_DIR / "migrate-app-metadata.py",
         DEPLOY_DIR / "migrate-redis-allowlist.py",
         DEPLOY_DIR / "configure-redis-migration-acl.py",
         DEPLOY_DIR / "prepare-app-role.sh",
+        DEPLOY_DIR / "prepare-sync-role.sh",
+        DEPLOY_DIR / "run-database-migration.sh",
         DEPLOY_DIR / "pg-env-exec.py",
+        DEPLOY_DIR / "source-postgres-exec.py",
         DEPLOY_DIR / "traffic-canary.py",
         DEPLOY_DIR / "run-v1-responses-canary.py",
         DEPLOY_DIR / "retire-legacy-data.py",
@@ -627,6 +937,23 @@ def validate_options(options):
     if len({item.identity for item in services.containers()}) != 3:
         raise UsageError("legacy container identities must be distinct")
     return services
+
+
+def validate_canary_options(options):
+    canary = load_module(
+        DEPLOY_DIR / "run-v1-responses-canary.py",
+        "maintenance_canary_argument_gate",
+    )
+    try:
+        approved = canary.normalize_approved_hostnames(
+            (options.approved_hostname,)
+        )
+        endpoint = canary.validate_endpoint(options.verify_url, approved)
+        canary.validate_model(options.model)
+    except canary.CanaryUsageError as error:
+        raise UsageError("maintenance canary arguments are invalid") from error
+    if endpoint.scheme != "https" or endpoint.hostname != options.approved_hostname:
+        raise UsageError("maintenance canary must use the exact approved HTTPS hostname")
 
 
 def compose_command(env_file, *arguments):
@@ -740,6 +1067,50 @@ def deferred_termination_signals():
             signal.signal(signum, handler)
 
 
+def decode_mountinfo_path(value):
+    def replace(match):
+        return chr(int(match.group(1), 8))
+
+    decoded = re.sub(r"\\([0-7]{3})", replace, value)
+    path = pathlib.Path(decoded)
+    if (
+        "\\" in decoded
+        or "\x00" in decoded
+        or not path.is_absolute()
+        or any(component in {"", ".", ".."} for component in path.parts[1:])
+    ):
+        raise CutoverError("host mount table contains an invalid path")
+    return path
+
+
+def read_mountpoints(path=pathlib.Path("/proc/self/mountinfo")):
+    try:
+        lines = pathlib.Path(path).read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise CutoverError("host mount table could not be read") from error
+    mountpoints = []
+    for line in lines:
+        fields = line.split()
+        separators = [index for index, value in enumerate(fields) if value == "-"]
+        if (
+            len(fields) < 10
+            or len(separators) != 1
+            or separators[0] < 6
+            or len(fields) - separators[0] < 4
+        ):
+            raise CutoverError("host mount table is malformed")
+        mountpoints.append(decode_mountinfo_path(fields[4]))
+    if not mountpoints:
+        raise CutoverError("host mount table is empty")
+    return tuple(mountpoints)
+
+
+def require_no_mount_boundary(path, mountpoints):
+    for mountpoint in mountpoints:
+        if mountpoint == path or mountpoint.is_relative_to(path):
+            raise CutoverError("target reset tree contains a mount boundary")
+
+
 def clear_private_directory(
     path,
     *,
@@ -747,6 +1118,7 @@ def clear_private_directory(
     expected_gid,
     expected_mode=0o700,
     exact_path=None,
+    mountpoints_reader=None,
 ):
     path = pathlib.Path(path)
     if exact_path is not None and path != pathlib.Path(exact_path):
@@ -766,6 +1138,7 @@ def clear_private_directory(
         raise CutoverError("target reset directory identity is unsafe")
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
     root_fd = os.open(path, flags)
+    mountpoints_reader = read_mountpoints if mountpoints_reader is None else mountpoints_reader
 
     def inspect_tree(directory_fd, root_device):
         for name in os.listdir(directory_fd):
@@ -806,7 +1179,9 @@ def clear_private_directory(
         current = os.fstat(root_fd)
         if (current.st_dev, current.st_ino) != (root_stat.st_dev, root_stat.st_ino):
             raise CutoverError("target reset directory changed while opening")
+        require_no_mount_boundary(path, mountpoints_reader())
         inspect_tree(root_fd, root_stat.st_dev)
+        require_no_mount_boundary(path, mountpoints_reader())
         remove_tree(root_fd, root_stat.st_dev)
         os.fsync(root_fd)
         if os.listdir(root_fd):
@@ -964,7 +1339,17 @@ class NginxUpstream:
             raise CutoverError("live Nginx /v1 path is not the reviewed capture-free direct proxy") from error
         self.require_stage("stable")
 
-    def switch(self, stage, *, timeout):
+    def switch(self, stage, *, timeout, deadline=None, clock=time.monotonic):
+        def command_timeout():
+            bound = timeout
+            if deadline is not None:
+                remaining = int(deadline - clock())
+                if remaining <= 0:
+                    raise WindowExpired("60-second writer-stop deadline exceeded")
+                bound = min(bound, remaining)
+            return max(1, bound)
+
+        command_timeout()
         payload = self.stage_bytes(stage)
         directory_descriptor = os.open(
             self.paths.active.parent,
@@ -999,12 +1384,12 @@ class NginxUpstream:
         self._file(self.paths.active, "active Nginx upstream")
         self.runner(
             ["/usr/sbin/nginx", "-t"],
-            timeout=timeout,
+            timeout=command_timeout(),
             environment=self.environment,
         )
         self.runner(
             ["/usr/bin/systemctl", "reload", "nginx"],
-            timeout=timeout,
+            timeout=command_timeout(),
             environment=self.environment,
         )
         self.require_stage(stage)
@@ -1025,6 +1410,8 @@ class MaintenanceController:
         target_resetter=reset_sanitized_target,
         recovery_state_path=None,
         recovery_state_expected_uid=0,
+        recovery_state_expected_gid=0,
+        private_env_identity=None,
         stdout=None,
     ):
         self.options = options
@@ -1038,6 +1425,8 @@ class MaintenanceController:
         self.target_resetter = target_resetter
         self.recovery_state_path = recovery_state_path
         self.recovery_state_expected_uid = recovery_state_expected_uid
+        self.recovery_state_expected_gid = recovery_state_expected_gid
+        self.private_env_identity = private_env_identity
         self.stdout = sys.stdout if stdout is None else stdout
         self.environment = minimal_environment()
         self.migration_writes_stopped = False
@@ -1048,19 +1437,29 @@ class MaintenanceController:
         self.nonce_runtime_active = False
         self.writers_stopped = False
         self.canary_active = False
+        self.target_identities = {name: None for name in TARGET_NAMES}
+        self.recovery_identity_unavailable = False
         self.sync_fragment = None
-        self.export_source_system_identifier = None
+        self.sync_fragment_sha256 = None
+        self.export_source_database_identity = None
         self.git_head = None
 
     def recovery_state_document(self, phase):
-        if self.git_head is None or self.sync_fragment is None:
+        if (
+            self.git_head is None
+            or self.private_env_identity is None
+            or self.sync_fragment is None
+            or self.sync_fragment_sha256 is None
+        ):
             raise CutoverError("maintenance recovery identity is incomplete")
         return {
-            "version": 1,
+            "version": 3,
             "phase": phase,
             "git_head": self.git_head,
             "env_file": str(self.options.env_file),
+            "env_file_identity": self.private_env_identity,
             "sync_fragment": self.sync_fragment,
+            "sync_fragment_sha256": self.sync_fragment_sha256,
             "legacy": {
                 "app": {
                     "name": self.services.app.name,
@@ -1075,6 +1474,7 @@ class MaintenanceController:
                     "identity": self.services.redis.identity,
                 },
             },
+            "targets": dict(self.target_identities),
             "target_started": self.target_started,
             "nonce_target_started": self.nonce_target_started,
             "nonce_runtime_active": self.nonce_runtime_active,
@@ -1085,6 +1485,7 @@ class MaintenanceController:
     def persist_recovery_state(self, phase):
         if self.recovery_state_path is None:
             return
+        self.require_recovery_identity()
         write_cutover_state(
             self.recovery_state_path,
             self.recovery_state_document(phase),
@@ -1105,8 +1506,9 @@ class MaintenanceController:
             "postgres": self.services.postgres,
             "redis": self.services.redis,
         }
-        if document["git_head"] != self.git_head or document["env_file"] != str(
-            self.options.env_file
+        if (
+            document["git_head"] != self.git_head
+            or document["env_file"] != str(self.options.env_file)
         ):
             raise CutoverError("maintenance recovery state does not match this release")
         for name, service in expected_services.items():
@@ -1115,12 +1517,49 @@ class MaintenanceController:
                 "identity": service.identity,
             }:
                 raise CutoverError("maintenance recovery state legacy identity mismatch")
+        if (
+            self.private_env_identity is not None
+            and document["env_file_identity"] != self.private_env_identity
+        ):
+            self.recovery_identity_unavailable = True
+        self.private_env_identity = document["env_file_identity"]
+        self.target_identities = dict(document["targets"])
         self.sync_fragment = document["sync_fragment"]
+        self.sync_fragment_sha256 = document["sync_fragment_sha256"]
         self.target_started = document["target_started"]
         self.nonce_target_started = document["nonce_target_started"]
         self.nonce_runtime_active = document["nonce_runtime_active"]
         self.writers_stopped = document["writers_stopped"]
         self.canary_active = document["canary_active"]
+
+    def require_private_env_identity(self):
+        if self.private_env_identity is None:
+            return
+        if private_environment_identity(
+                self.options.env_file,
+                expected_uid=self.recovery_state_expected_uid,
+                expected_gid=self.recovery_state_expected_gid,
+            ) != self.private_env_identity:
+            raise CutoverError("maintenance private environment identity changed")
+
+    def require_recovery_identity(self):
+        if self.recovery_identity_unavailable:
+            raise CutoverError("maintenance cleanup identity is unavailable")
+        if self.private_env_identity is None and self.sync_fragment_sha256 is None:
+            return
+        self.require_private_env_identity()
+        if (
+            self.sync_fragment is None
+            or self.sync_fragment_sha256 is None
+            or stable_unit_sha256(
+                self.sync_fragment,
+                expected_uid=self.recovery_state_expected_uid,
+            )
+            != self.sync_fragment_sha256
+        ):
+            raise CutoverError("maintenance recovery filesystem identity changed")
+        if self.unit_metadata() != self.sync_fragment:
+            raise CutoverError("legacy sync unit identity changed")
 
     def log(self, message):
         print(message, file=self.stdout, flush=True)
@@ -1133,6 +1572,14 @@ class MaintenanceController:
             raise WindowExpired("180-second maintenance window exceeded")
         return remaining
 
+    def writer_stop_remaining(self):
+        if self.writer_stop_deadline is None:
+            return None
+        remaining = int(self.writer_stop_deadline - self.clock())
+        if remaining <= 0:
+            raise WindowExpired("60-second writer-stop deadline exceeded")
+        return remaining
+
     def run(
         self,
         argv,
@@ -1143,10 +1590,8 @@ class MaintenanceController:
         private_keys=(),
     ):
         bound = self.remaining() if timeout is None else min(timeout, self.remaining())
-        if self.writer_stop_deadline is not None:
-            writer_stop_remaining = int(self.writer_stop_deadline - self.clock())
-            if writer_stop_remaining <= 0:
-                raise WindowExpired("60-second writer-stop deadline exceeded")
+        writer_stop_remaining = self.writer_stop_remaining()
+        if writer_stop_remaining is not None:
             bound = min(bound, writer_stop_remaining)
         environment = self.environment.copy()
         for key in private_keys:
@@ -1163,33 +1608,63 @@ class MaintenanceController:
             interactive=interactive,
         )
 
-    def docker_state(self, service):
+    def probe_health(self, port, path, *, timeout=5):
+        bound = min(timeout, self.remaining())
+        writer_stop_remaining = self.writer_stop_remaining()
+        if writer_stop_remaining is not None:
+            bound = min(bound, writer_stop_remaining)
+        self.health_probe(port, path, timeout=max(1, bound))
+
+    def inspect_container_runtime(
+        self,
+        reference,
+        *,
+        expected_name,
+        expected_identity=None,
+        allow_missing=False,
+    ):
         result = self.run(
             [
                 "docker",
                 "inspect",
                 "--format",
-                "{{.Id}}|{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
-                service.name,
+                "{{.Id}}|{{.Name}}|{{.State.Running}}|"
+                "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+                reference,
             ],
             timeout=10,
+            allow_failure=allow_missing,
         )
-        identity, separator, remainder = decode_stdout(result).partition("|")
-        running, separator2, health = remainder.partition("|")
+        if result.returncode:
+            return None
+        try:
+            identity, actual_name, running, health = decode_stdout(result).split("|")
+        except ValueError as error:
+            raise CutoverError("container identity or runtime state is invalid") from error
         if (
-            not separator
-            or not separator2
-            or identity != service.identity
+            not CONTAINER_ID_RE.fullmatch(identity)
+            or actual_name != f"/{expected_name}"
+            or (expected_identity is not None and identity != expected_identity)
             or running not in {"true", "false"}
             or health not in {"none", "starting", "healthy", "unhealthy"}
         ):
-            raise CutoverError("legacy container identity or runtime state changed")
-        return running == "true", health
+            raise CutoverError("container identity or runtime state changed")
+        return identity, running == "true", health
 
-    def require_legacy(self, service, *, running):
-        actual, _health = self.docker_state(service)
+    def docker_state(self, service):
+        _identity, running, health = self.inspect_container_runtime(
+            service.identity,
+            expected_name=service.name,
+            expected_identity=service.identity,
+        )
+        return running, health
+
+    def require_legacy(self, service, *, running, healthy=False):
+        actual, health = self.docker_state(service)
         if actual != running:
             raise CutoverError("legacy container runtime state is unexpected")
+        if healthy and health != "healthy":
+            raise CutoverError("legacy data container is not rollback-ready")
 
     def target_exists(self, name):
         result = self.run(
@@ -1197,23 +1672,77 @@ class MaintenanceController:
             timeout=10,
             allow_failure=True,
         )
-        return result.returncode == 0
+        if result.returncode:
+            return False
+        identity = decode_stdout(result)
+        if not CONTAINER_ID_RE.fullmatch(identity):
+            raise CutoverError("target container identity is invalid")
+        return True
+
+    def pin_target_identity(self, name, *, replace=False):
+        if name not in self.target_identities:
+            raise CutoverError("unknown migrated-target container")
+        runtime = self.inspect_container_runtime(name, expected_name=name)
+        identity = runtime[0]
+        previous = self.target_identities[name]
+        if previous is not None and previous != identity and not replace:
+            raise CutoverError("migrated-target container identity changed")
+        other_identities = {
+            value
+            for other_name, value in self.target_identities.items()
+            if other_name != name and value is not None
+        }
+        legacy_identities = {service.identity for service in self.services.containers()}
+        if identity in other_identities or identity in legacy_identities:
+            raise CutoverError("migrated-target container identity aliases another service")
+        self.target_identities[name] = identity
+        return identity
+
+    def target_state(self, name):
+        identity = self.target_identities.get(name)
+        if identity is None:
+            raise CutoverError("migrated-target container identity is not pinned")
+        _identity, running, health = self.inspect_container_runtime(
+            identity,
+            expected_name=name,
+            expected_identity=identity,
+        )
+        return running, health
+
+    def require_target(self, name, *, running=True, healthy=False):
+        actual_running, health = self.target_state(name)
+        if actual_running != running:
+            raise CutoverError("migrated-target container runtime state is unexpected")
+        if healthy and health != "healthy":
+            raise CutoverError("migrated-target container is not healthy")
+
+    def require_all_targets(self, *, healthy):
+        for name in TARGET_NAMES:
+            self.require_target(name, running=True, healthy=healthy)
 
     def wait_target_healthy(self, name):
+        if name in self.target_identities and self.target_identities[name] is None:
+            self.pin_target_identity(name)
         deadline = self.clock() + min(90, self.remaining())
         while True:
-            result = self.run(
-                [
-                    "docker",
-                    "inspect",
-                    "--format",
-                    "{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
-                    name,
-                ],
-                timeout=10,
-            )
-            if decode_stdout(result) == "true|healthy":
-                return
+            if name in self.target_identities:
+                running, health = self.target_state(name)
+                if running and health == "healthy":
+                    return
+            else:
+                result = self.run(
+                    [
+                        "docker",
+                        "inspect",
+                        "--format",
+                        "{{.State.Running}}|"
+                        "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+                        name,
+                    ],
+                    timeout=10,
+                )
+                if decode_stdout(result) == "true|healthy":
+                    return
             if self.clock() >= deadline:
                 raise CutoverError("migrated-target container did not become healthy")
             self.sleeper(1)
@@ -1257,79 +1786,105 @@ class MaintenanceController:
         return result.returncode == 0
 
     def verify_database_connections(self):
+        self.require_private_env_identity()
+
+        def parse_identity(result):
+            try:
+                system_identifier, database_oid, database_name_hex = decode_stdout(
+                    result
+                ).split("|")
+            except ValueError as error:
+                raise CutoverError("PostgreSQL endpoint identity query was invalid")
+            if (
+                not PG_SYSTEM_ID_RE.fullmatch(system_identifier)
+                or not PG_DATABASE_OID_RE.fullmatch(database_oid)
+                or int(database_oid) > 4_294_967_295
+                or not PG_DATABASE_NAME_HEX_RE.fullmatch(database_name_hex)
+            ):
+                raise CutoverError("PostgreSQL endpoint identity query was invalid")
+            return system_identifier, database_oid, database_name_hex
+
+        source_result = self.run(
+            [
+                "python3",
+                str(DEPLOY_DIR / "source-postgres-exec.py"),
+                "--env-file",
+                str(self.options.env_file),
+                "--source-app-container",
+                self.services.app.name,
+                "--source-app-id",
+                self.services.app.identity,
+                "--source-postgres-container",
+                self.services.postgres.name,
+                "--source-postgres-id",
+                self.services.postgres.identity,
+                "--source-app-state",
+                "running",
+                "identity",
+            ],
+            timeout=30,
+        )
+        identities = {
+            "SUB2API_SOURCE_DATABASE_URL": parse_identity(source_result),
+        }
+        self.require_private_env_identity()
+
         helper = DEPLOY_DIR / "pg-env-exec.py"
         pg_helper = load_module(helper, "maintenance_postgres_endpoint_gate")
-        endpoints = (
-            (
-                "SUB2API_SOURCE_DATABASE_URL",
-                self.services.postgres.name,
-                None,
-            ),
-            (
-                "SUB2API_TARGET_DATABASE_URL",
-                TARGET_POSTGRES,
-                15432,
-            ),
+        environment_name = "SUB2API_TARGET_DATABASE_URL"
+        parsed = pg_helper.libpq_environment(
+            {environment_name: self.private_values[environment_name]},
+            environment_name,
         )
-        identities = {}
-        for environment_name, container, fixed_loopback_port in endpoints:
-            parsed = pg_helper.libpq_environment(
-                {environment_name: self.private_values[environment_name]},
-                environment_name,
-            )
-            try:
-                address = ipaddress.ip_address(parsed["PGHOST"])
-                port = int(parsed["PGPORT"])
-            except (KeyError, ValueError) as error:
-                raise CutoverError("PostgreSQL migration endpoint is invalid") from error
-            settings_result = self.run(
-                [
-                    "docker",
-                    "inspect",
-                    "--format",
-                    "{{json .NetworkSettings}}",
-                    container,
-                ],
-                timeout=10,
-            )
+        try:
+            address = ipaddress.ip_address(parsed["PGHOST"])
+            port = int(parsed["PGPORT"])
+        except (KeyError, ValueError) as error:
+            raise CutoverError("PostgreSQL migration endpoint is invalid") from error
+        settings_result = self.run(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{json .NetworkSettings}}",
+                self.target_identities[TARGET_POSTGRES],
+            ],
+            timeout=10,
+        )
+        try:
             settings = json.loads(decode_stdout(settings_result))
-            addresses = {
-                ipaddress.ip_address(item["IPAddress"])
-                for item in settings.get("Networks", {}).values()
-                if isinstance(item, dict) and item.get("IPAddress")
-            }
-            if address.is_loopback:
-                bindings = settings.get("Ports", {}).get("5432/tcp")
-                if bindings != [{"HostIp": "127.0.0.1", "HostPort": str(port)}]:
-                    raise CutoverError(
-                        "PostgreSQL loopback URL is not the exact container port binding"
-                    )
-                if fixed_loopback_port is not None and port != fixed_loopback_port:
-                    raise CutoverError("target PostgreSQL must use the fixed migration port")
-            elif fixed_loopback_port is not None or address not in addresses:
-                raise CutoverError(
-                    "PostgreSQL URL is not an exact local container endpoint"
-                )
-            result = self.run(
-                [
-                    "python3",
-                    str(helper),
-                    environment_name,
-                    "psql",
-                    "--no-psqlrc",
-                    "--quiet",
-                    "-v",
-                    "ON_ERROR_STOP=1",
-                    "--command",
-                    "SELECT system_identifier::text FROM pg_control_system()",
-                ],
-                timeout=15,
-                private_keys=(environment_name,),
+        except json.JSONDecodeError as error:
+            raise CutoverError("target PostgreSQL network metadata is invalid") from error
+        ports = settings.get("Ports") if isinstance(settings, dict) else None
+        if not isinstance(ports, dict):
+            raise CutoverError("target PostgreSQL network metadata is invalid")
+        bindings = ports.get("5432/tcp")
+        if (
+            not address.is_loopback
+            or address != ipaddress.ip_address("127.0.0.1")
+            or port != 15432
+            or bindings != [{"HostIp": "127.0.0.1", "HostPort": "15432"}]
+        ):
+            raise CutoverError(
+                "target PostgreSQL URL is not the exact migration port binding"
             )
-            identity = decode_stdout(result)
-            if not PG_SYSTEM_ID_RE.fullmatch(identity):
-                raise CutoverError("PostgreSQL endpoint identity query was invalid")
-            identities[environment_name] = identity
+        target_result = self.run(
+            [
+                "python3",
+                str(helper),
+                environment_name,
+                "psql",
+                "--no-psqlrc",
+                "--quiet",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "--command",
+                POSTGRES_DATABASE_IDENTITY_SQL,
+            ],
+            timeout=15,
+            private_keys=(environment_name,),
+        )
+        identities[environment_name] = parse_identity(target_result)
         return identities
 
     def verify_safe_export(self):
@@ -1340,7 +1895,7 @@ class MaintenanceController:
         git_head = decode_stdout(result)
         if not GIT_HEAD_RE.fullmatch(git_head):
             raise CutoverError("release Git identity is invalid")
-        self.export_source_system_identifier = validate_safe_export(
+        self.export_source_database_identity = validate_safe_export(
             self.options.safe_export_dir,
             git_head,
             expected_uid=0,
@@ -1350,9 +1905,11 @@ class MaintenanceController:
     def require_export_source_identity(self, database_identities):
         if (
             database_identities.get("SUB2API_SOURCE_DATABASE_URL")
-            != self.export_source_system_identifier
+            != self.export_source_database_identity
         ):
-            raise CutoverError("safe export belongs to a different source PostgreSQL cluster")
+            raise CutoverError(
+                "safe export belongs to a different source PostgreSQL database"
+            )
 
     def verify_legacy_redis_source(self):
         migration = load_module(
@@ -1371,7 +1928,7 @@ class MaintenanceController:
                     "inspect",
                     "--format",
                     "{{json .NetworkSettings}}",
-                    self.services.redis.name,
+                    self.services.redis.identity,
                 ],
                 timeout=10,
             )
@@ -1417,7 +1974,27 @@ class MaintenanceController:
         except Exception as error:
             raise CutoverError("legacy Redis source attestation failed") from error
 
+    def verify_rollback_ready(self):
+        self.require_legacy(self.services.app, running=True)
+        self.require_legacy(self.services.postgres, running=True, healthy=True)
+        self.require_legacy(self.services.redis, running=True, healthy=True)
+        if (
+            self.unit_metadata() != self.sync_fragment
+            or stable_unit_sha256(
+                self.sync_fragment,
+                expected_uid=self.recovery_state_expected_uid,
+            )
+            != self.sync_fragment_sha256
+            or not self.unit_active()
+        ):
+            raise CutoverError("legacy sync service is not rollback-ready")
+        self.probe_health(8080, "/health")
+        self.probe_health(3021, "/healthz")
+        self.nginx.require_stage("stable")
+
     def preflight(self):
+        validate_canary_options(self.options)
+        self.require_private_env_identity()
         self.verify_safe_export()
         self.nginx.verify_live_direct_v1(self.options.approved_hostname)
         traffic_canary = load_module(
@@ -1464,10 +2041,14 @@ class MaintenanceController:
         if any(self.target_exists(name) for name in (*TARGET_NAMES, TARGET_NONCE_REDIS)):
             raise CutoverError("traffic-canary target must be absent before maintenance apply")
         self.sync_fragment = self.unit_metadata()
+        self.sync_fragment_sha256 = stable_unit_sha256(
+            self.sync_fragment,
+            expected_uid=self.recovery_state_expected_uid,
+        )
         if not self.unit_active():
             raise CutoverError("legacy sync writer must be active before maintenance")
-        self.health_probe(8080, "/health")
-        self.health_probe(3021, "/healthz")
+        self.probe_health(8080, "/health")
+        self.probe_health(3021, "/healthz")
         self.nginx.require_stage("stable")
 
         self.run(
@@ -1493,6 +2074,7 @@ class MaintenanceController:
         )
         self.wait_target_healthy(TARGET_POSTGRES)
         self.wait_target_healthy(TARGET_REDIS)
+        self.persist_recovery_state("preflight_targets_starting")
         database_identities = self.verify_database_connections()
         self.require_export_source_identity(database_identities)
 
@@ -1537,37 +2119,47 @@ class MaintenanceController:
             timeout=90,
         )
         self.wait_target_healthy(TARGET_NONCE_REDIS)
+        self.verify_rollback_ready()
         self.log("checkpoint: exact legacy identities and target data services verified")
 
     def stop_writers(self):
         self.writer_stop_deadline = self.clock() + WRITER_STOP_SECONDS
-        try:
-            self.run(["/usr/bin/systemctl", "stop", SYNC_UNIT], timeout=20)
-            if self.unit_active():
-                raise CutoverError("legacy sync writer did not stop")
-            if self.unit_metadata() != self.sync_fragment:
-                raise CutoverError("legacy sync unit identity changed while stopping writers")
-            self.run(
-                ["docker", "stop", "--time", "10", self.services.app.name],
-                timeout=20,
-            )
-            self.require_legacy(self.services.app, running=False)
-            self.require_legacy(self.services.postgres, running=True)
-            self.require_legacy(self.services.redis, running=True)
-            self.writers_stopped = True
-            self.log(
-                "checkpoint: legacy Sub2API and sync writers stopped within 60 seconds"
-            )
-        finally:
-            self.writer_stop_deadline = None
+        self.run(["/usr/bin/systemctl", "stop", SYNC_UNIT], timeout=20)
+        if self.unit_active():
+            raise CutoverError("legacy sync writer did not stop")
+        if self.unit_metadata() != self.sync_fragment:
+            raise CutoverError("legacy sync unit identity changed while stopping writers")
+        self.run(
+            ["docker", "stop", "--time", "10", self.services.app.identity],
+            timeout=20,
+        )
+        self.require_legacy(self.services.app, running=False)
+        self.require_legacy(self.services.postgres, running=True, healthy=True)
+        self.require_legacy(self.services.redis, running=True, healthy=True)
+        self.writers_stopped = True
+        self.log("checkpoint: legacy Sub2API and sync writers stopped")
 
     def migrate(self):
+        self.require_recovery_identity()
         self.migration_writes_stopped = True
         steps = (
             (
-                [str(DEPLOY_DIR / "migrate-sanitized-postgres.sh"), "--apply"],
+                [
+                    str(DEPLOY_DIR / "migrate-sanitized-postgres.sh"),
+                    "--apply",
+                    "--env-file",
+                    str(self.options.env_file),
+                    "--source-app-container",
+                    self.services.app.name,
+                    "--source-app-id",
+                    self.services.app.identity,
+                    "--source-postgres-container",
+                    self.services.postgres.name,
+                    "--source-postgres-id",
+                    self.services.postgres.identity,
+                ],
                 "PostgreSQL",
-                ("SUB2API_SOURCE_DATABASE_URL", "SUB2API_TARGET_DATABASE_URL"),
+                (),
             ),
             (
                 ["python3", str(DEPLOY_DIR / "migrate-redis-allowlist.py"), "--apply"],
@@ -1595,15 +2187,43 @@ class MaintenanceController:
                 ),
             ),
             (
-                [str(DEPLOY_DIR / "prepare-app-role.sh"), "--apply"],
+                [
+                    str(DEPLOY_DIR / "prepare-sync-role.sh"),
+                    "--apply",
+                    "--env-file",
+                    str(self.options.env_file),
+                ],
+                "sync database role",
+                (),
+            ),
+            (
+                [
+                    str(DEPLOY_DIR / "run-database-migration.sh"),
+                    "sync-role",
+                    "--apply",
+                    "--env-file",
+                    str(self.options.env_file),
+                ],
+                "sync ownership schema",
+                (),
+            ),
+            (
+                [
+                    str(DEPLOY_DIR / "prepare-app-role.sh"),
+                    "--apply",
+                    "--env-file",
+                    str(self.options.env_file),
+                ],
                 "app database role",
-                ("SUB2API_DATABASE_URL", "SUB2API_APP_DATABASE_PASSWORD"),
+                (),
             ),
         )
         for command, label, private_keys in steps:
             self.run(command, private_keys=private_keys)
             self.log(f"checkpoint: {label} migration completed")
 
+        self.require_target(TARGET_POSTGRES, running=True, healthy=True)
+        old_postgres_identity = self.target_identities[TARGET_POSTGRES]
         self.run(
             postgres_migration_compose_command(
                 self.options.env_file,
@@ -1614,6 +2234,7 @@ class MaintenanceController:
             ),
             timeout=30,
         )
+        self.require_target(TARGET_POSTGRES, running=False)
         self.run(
             postgres_migration_compose_command(
                 self.options.env_file,
@@ -1623,6 +2244,15 @@ class MaintenanceController:
             ),
             timeout=30,
         )
+        if self.inspect_container_runtime(
+            old_postgres_identity,
+            expected_name=TARGET_POSTGRES,
+            expected_identity=old_postgres_identity,
+            allow_missing=True,
+        ) is not None:
+            raise CutoverError("old migrated-target PostgreSQL container still exists")
+        self.target_identities[TARGET_POSTGRES] = None
+        self.persist_recovery_state("migrating")
         self.run(
             compose_command(
                 self.options.env_file,
@@ -1638,6 +2268,9 @@ class MaintenanceController:
         )
         self.wait_target_healthy(TARGET_POSTGRES)
         self.wait_target_healthy(TARGET_REDIS)
+        if self.target_identities[TARGET_POSTGRES] == old_postgres_identity:
+            raise CutoverError("migrated-target PostgreSQL identity was not replaced")
+        self.persist_recovery_state("migrating")
         self.log("checkpoint: target PostgreSQL migration port was removed")
 
         self.run(
@@ -1697,6 +2330,7 @@ class MaintenanceController:
             timeout=120,
         )
         self.wait_target_healthy(TARGET_APP)
+        self.require_all_targets(healthy=True)
         command = [
             "python3",
             str(DEPLOY_DIR / "traffic-canary.py"),
@@ -1715,14 +2349,29 @@ class MaintenanceController:
             self.services.redis.identity,
         ]
         self.run(command, timeout=45)
-        self.health_probe(8081, "/health")
+        self.probe_health(8081, "/health")
         self.log("checkpoint: sanitized traffic target and stopped-legacy identities verified")
 
     def switch_and_canary(self):
-        self.health_probe(8081, "/health")
-        self.nginx.switch("canary", timeout=min(15, self.remaining()))
+        if self.writer_stop_deadline is None:
+            raise CutoverError("active writer-stop deadline is required")
+        self.writer_stop_remaining()
+        self.require_all_targets(healthy=True)
+        self.probe_health(8081, "/health")
+        writer_remaining = self.writer_stop_remaining()
+        switch_timeout = min(15, self.remaining())
+        if writer_remaining is not None:
+            switch_timeout = min(switch_timeout, writer_remaining)
+        self.nginx.switch(
+            "canary",
+            timeout=switch_timeout,
+            deadline=self.writer_stop_deadline,
+            clock=self.clock,
+        )
         self.canary_active = True
-        self.health_probe(8081, "/health")
+        self.require_all_targets(healthy=True)
+        self.probe_health(8081, "/health")
+        self.writer_stop_remaining()
         command = [
             "python3",
             str(DEPLOY_DIR / "run-v1-responses-canary.py"),
@@ -1735,13 +2384,17 @@ class MaintenanceController:
             self.options.approved_hostname,
         ]
         self.run(command, interactive=True)
+        self.require_all_targets(healthy=True)
+        self.writer_stop_remaining()
+        self.writer_stop_deadline = None
+        self.log("checkpoint: target traffic restored within 60 seconds")
         self.log("checkpoint: Nginx canary upstream and metadata-only API canary passed")
 
     def ensure_legacy_running(self, service, *, require_healthy=False):
         running, _health = self.docker_state(service)
         if not running:
             self.runner(
-                ["docker", "start", service.name],
+                ["docker", "start", service.identity],
                 timeout=30,
                 environment=self.environment,
             )
@@ -1763,7 +2416,40 @@ class MaintenanceController:
                 raise CutoverError("exact legacy container did not start during rollback")
             self.sleeper(1)
 
+    def require_target_cleanup_identity(self):
+        for name, identity in self.target_identities.items():
+            if identity is None:
+                if self.target_exists(name):
+                    raise CutoverError(
+                        "unpinned migrated-target container exists during rollback"
+                    )
+                continue
+            runtime = self.inspect_container_runtime(
+                identity,
+                expected_name=name,
+                expected_identity=identity,
+                allow_missing=True,
+            )
+            if runtime is None and self.target_exists(name):
+                raise CutoverError(
+                    "migrated-target container name was rebound during rollback"
+                )
+
+    def require_targets_absent_after_cleanup(self):
+        for name, identity in self.target_identities.items():
+            if identity is not None and self.inspect_container_runtime(
+                identity,
+                expected_name=name,
+                expected_identity=identity,
+                allow_missing=True,
+            ) is not None:
+                raise CutoverError("traffic-canary target still exists after rollback")
+            if self.target_exists(name):
+                raise CutoverError("traffic-canary target name still exists after rollback")
+
     def rollback(self):
+        self.writer_stop_deadline = None
+        self.deadline = self.clock() + ROLLBACK_SECONDS
         errors = []
 
         def attempt(label, action):
@@ -1772,7 +2458,6 @@ class MaintenanceController:
             except Exception:
                 errors.append(label)
 
-        self.deadline = self.clock() + ROLLBACK_SECONDS
         attempt(
             "legacy_postgres_start",
             lambda: self.ensure_legacy_running(
@@ -1788,10 +2473,25 @@ class MaintenanceController:
             ),
         )
         attempt("legacy_app_start", lambda: self.ensure_legacy_running(self.services.app))
-        attempt("legacy_app_health", lambda: self.health_probe(8080, "/health"))
+        attempt("legacy_app_health", lambda: self.probe_health(8080, "/health"))
 
         def restore_sync():
-            if self.unit_metadata() != self.sync_fragment:
+            current_fragment = self.unit_metadata()
+            if self.sync_fragment is None:
+                stable_unit_sha256(
+                    current_fragment,
+                    expected_uid=self.recovery_state_expected_uid,
+                )
+            elif current_fragment != self.sync_fragment:
+                raise CutoverError("legacy sync unit identity changed during rollback")
+            elif (
+                self.sync_fragment_sha256 is not None
+                and stable_unit_sha256(
+                    self.sync_fragment,
+                    expected_uid=self.recovery_state_expected_uid,
+                )
+                != self.sync_fragment_sha256
+            ):
                 raise CutoverError("legacy sync unit identity changed during rollback")
             if not self.unit_active():
                 self.runner(
@@ -1801,7 +2501,7 @@ class MaintenanceController:
                 )
             if not self.unit_active():
                 raise CutoverError("legacy sync unit did not start during rollback")
-            self.health_probe(3021, "/healthz")
+            self.probe_health(3021, "/healthz")
 
         attempt("legacy_sync_health", restore_sync)
 
@@ -1812,23 +2512,31 @@ class MaintenanceController:
                 "legacy_redis_start",
                 "legacy_app_start",
                 "legacy_app_health",
-                "legacy_sync_health",
             )
         )
         stable_restored = False
         if legacy_ready:
             try:
                 self.nginx.switch("stable", timeout=15)
-                self.health_probe(8080, "/health")
+                self.probe_health(8080, "/health")
                 stable_restored = True
             except Exception:
                 errors.append("stable_upstream_restore")
         else:
             errors.append("stable_upstream_not_restored_without_healthy_legacy")
 
+        cleanup_identity_verified = False
+        if stable_restored:
+            try:
+                self.require_recovery_identity()
+                self.require_target_cleanup_identity()
+                cleanup_identity_verified = True
+            except Exception:
+                errors.append("recovery_identity")
+
         traffic_isolated = not self.target_started
         nonce_isolated = not self.nonce_target_started
-        if stable_restored and self.target_started:
+        if stable_restored and cleanup_identity_verified and self.target_started:
             try:
                 self.runner(
                     compose_command(
@@ -1841,16 +2549,14 @@ class MaintenanceController:
                     timeout=60,
                     environment=self.environment,
                 )
-                for name in TARGET_NAMES:
-                    if self.target_exists(name):
-                        raise CutoverError("traffic-canary target still exists after rollback")
+                self.require_targets_absent_after_cleanup()
                 traffic_isolated = True
             except Exception:
                 errors.append("traffic_canary_isolation")
-        elif self.target_started:
+        elif self.target_started and cleanup_identity_verified:
             errors.append("traffic_canary_kept_for_active_upstream_safety")
 
-        if stable_restored and self.nonce_target_started:
+        if stable_restored and cleanup_identity_verified and self.nonce_target_started:
             try:
                 self.runner(
                     nonce_compose_command(
@@ -1875,9 +2581,14 @@ class MaintenanceController:
                 nonce_isolated = True
             except Exception:
                 errors.append("nonce_target_isolation")
-        elif self.nonce_target_started:
+        elif self.nonce_target_started and cleanup_identity_verified:
             errors.append("nonce_target_kept_for_active_upstream_safety")
-        if stable_restored and traffic_isolated and nonce_isolated:
+        if (
+            stable_restored
+            and cleanup_identity_verified
+            and traffic_isolated
+            and nonce_isolated
+        ):
             try:
                 self.target_resetter()
             except Exception:
@@ -1960,6 +2671,14 @@ def parse_arguments(argv):
         options = parser.parse_args(arguments)
     except SystemExit as error:
         raise UsageError("invalid maintenance cutover arguments") from error
+    if mode != "check" and (
+        options.env_file is None or not options.env_file.is_absolute()
+    ):
+        raise UsageError("private environment file path must be absolute")
+    if mode == "--apply" and (
+        options.wrangler_config is None or not options.wrangler_config.is_absolute()
+    ):
+        raise UsageError("private Wrangler config path must be absolute")
     if mode == "check":
         if arguments:
             raise UsageError("check mode does not accept runtime arguments")
@@ -2010,6 +2729,7 @@ def parse_arguments(argv):
     )
     if not all(required):
         raise UsageError("--apply requires private config, canary, and exact legacy identity arguments")
+    validate_canary_options(options)
     return mode, options, validate_options(options)
 
 
@@ -2021,6 +2741,31 @@ def authenticate_private_operator():
     )
     if result.returncode:
         raise CutoverError("maintenance TOTP verification failed")
+
+
+def validate_private_migration_values(private_values):
+    missing = REQUIRED_PRIVATE_VALUES - set(private_values)
+    if missing or private_values.get("SUB2API_DATA_ROOT") != "/mnt/data/sub2api-gate":
+        raise CutoverError("private migration environment is incomplete")
+    if (
+        private_values["SUB2API_SOURCE_DATABASE_URL"]
+        == private_values["SUB2API_TARGET_DATABASE_URL"]
+    ):
+        raise CutoverError("source and target PostgreSQL URLs must differ")
+    if (
+        private_values["SUB2API_DATABASE_URL"]
+        != private_values["SUB2API_TARGET_DATABASE_URL"]
+    ):
+        raise CutoverError("app-role and migration target PostgreSQL URLs must match")
+    if private_values["SUB2API_TARGET_REDIS_USERNAME"] != "sub2api_migration":
+        raise CutoverError("nonce migration target must use sub2api_migration")
+    if len(private_values["SUB2API_TARGET_REDIS_PASSWORD"]) < 24:
+        raise CutoverError("nonce migration target password is too short")
+    if (
+        private_values["SUB2API_SOURCE_REDIS_URL"]
+        == private_values["SUB2API_TARGET_REDIS_URL"]
+    ):
+        raise CutoverError("source and target Redis URLs must differ")
 
 
 def main(
@@ -2059,24 +2804,35 @@ def main(
             timeout=15,
             environment=minimal_environment(),
         )
+        authenticate()
         private_env = load_module(DEPLOY_DIR / "private_env.py", "maintenance_private_env")
+        expected_uid = os.geteuid()
+        expected_gid = 0 if expected_uid == 0 else os.getegid()
+        private_values = {}
+        env_file_identity = None
+        private_environment_unavailable = False
         try:
+            env_file_identity = private_environment_identity(
+                options.env_file,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+            )
             private_values = private_env.read_private_environment(options.env_file)
-        except private_env.PrivateEnvironmentError as error:
-            raise CutoverError(str(error)) from error
-        missing = REQUIRED_PRIVATE_VALUES - set(private_values)
-        if missing or private_values.get("SUB2API_DATA_ROOT") != "/mnt/data/sub2api-gate":
-            raise CutoverError("private migration environment is incomplete")
-        if private_values["SUB2API_SOURCE_DATABASE_URL"] == private_values["SUB2API_TARGET_DATABASE_URL"]:
-            raise CutoverError("source and target PostgreSQL URLs must differ")
-        if private_values["SUB2API_DATABASE_URL"] != private_values["SUB2API_TARGET_DATABASE_URL"]:
-            raise CutoverError("app-role and migration target PostgreSQL URLs must match")
-        if private_values["SUB2API_TARGET_REDIS_USERNAME"] != "sub2api_migration":
-            raise CutoverError("nonce migration target must use sub2api_migration")
-        if len(private_values["SUB2API_TARGET_REDIS_PASSWORD"]) < 24:
-            raise CutoverError("nonce migration target password is too short")
-        if private_values["SUB2API_SOURCE_REDIS_URL"] == private_values["SUB2API_TARGET_REDIS_URL"]:
-            raise CutoverError("source and target Redis URLs must differ")
+            if private_environment_identity(
+                options.env_file,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+            ) != env_file_identity:
+                raise CutoverError("private environment changed while being loaded")
+            validate_private_migration_values(private_values)
+        except (CutoverError, private_env.PrivateEnvironmentError) as error:
+            if mode == "--apply":
+                if isinstance(error, private_env.PrivateEnvironmentError):
+                    raise CutoverError(str(error)) from error
+                raise
+            private_values = {}
+            env_file_identity = None
+            private_environment_unavailable = True
 
         if mode == "--apply":
             if CUTOVER_STATE_PATH.exists() or CUTOVER_STATE_PATH.is_symlink():
@@ -2095,7 +2851,6 @@ def main(
                 timeout=60,
                 environment=minimal_environment(),
             )
-        authenticate()
         paths = NginxPaths.production() if nginx_paths is None else nginx_paths
         with NginxUpstream(
             paths,
@@ -2112,21 +2867,40 @@ def main(
                 nginx=nginx,
                 recovery_state_path=CUTOVER_STATE_PATH,
                 recovery_state_expected_uid=0,
+                recovery_state_expected_gid=0,
+                private_env_identity=env_file_identity,
                 stdout=stdout,
             )
             if mode == "--recover":
-                state = load_cutover_state(CUTOVER_STATE_PATH, expected_uid=0)
-                result = runner(
-                    ["git", "-C", str(REPO_DIR), "rev-parse", "--verify", "HEAD^{commit}"],
-                    timeout=10,
-                    environment=minimal_environment(),
+                recovery_state_unavailable = False
+                try:
+                    state = load_cutover_state(CUTOVER_STATE_PATH, expected_uid=0)
+                    result = runner(
+                        [
+                            "git",
+                            "-C",
+                            str(REPO_DIR),
+                            "rev-parse",
+                            "--verify",
+                            "HEAD^{commit}",
+                        ],
+                        timeout=10,
+                        environment=minimal_environment(),
+                    )
+                    controller.git_head = decode_stdout(result)
+                    controller.restore_recovery_state(state)
+                except CutoverError:
+                    recovery_state_unavailable = True
+                controller.recovery_identity_unavailable = (
+                    controller.recovery_identity_unavailable
+                    or private_environment_unavailable
+                    or recovery_state_unavailable
                 )
-                controller.git_head = decode_stdout(result)
-                controller.restore_recovery_state(state)
                 with deferred_termination_signals():
                     rollback_errors = controller.rollback()
                 if rollback_errors:
-                    controller.persist_recovery_state("rollback_incomplete")
+                    with contextlib.suppress(Exception):
+                        controller.persist_recovery_state("rollback_incomplete")
                     raise CutoverError(
                         "maintenance_recovery_incomplete=" + ",".join(rollback_errors)
                     )

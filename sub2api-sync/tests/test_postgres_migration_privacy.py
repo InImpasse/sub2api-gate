@@ -37,7 +37,6 @@ class SanitizedPostgresStreamPrivacyTests(unittest.TestCase):
             path.mkdir(parents=True, exist_ok=True)
 
         shutil.copy2(MIGRATION, deploy / MIGRATION.name)
-        shutil.copy2(PG_ENV_EXEC, deploy / PG_ENV_EXEC.name)
         shutil.copy2(TARGET_GATE, deploy / TARGET_GATE.name)
         shutil.copy2(RUNTIME_LOGGING_GATE, deploy / RUNTIME_LOGGING_GATE.name)
         shutil.copy2(PORTABILITY_GATE, deploy / PORTABILITY_GATE.name)
@@ -50,6 +49,98 @@ class SanitizedPostgresStreamPrivacyTests(unittest.TestCase):
             set -eu
             [ "${1:-}" = "check" ]
             printf '%s\n' 'clean Git worktree verified'
+            """,
+        )
+        write_executable(
+            deploy / "locked-postgres-stream.py",
+            r"""
+            #!/usr/bin/env python3
+            import os
+            import pathlib
+            import sys
+
+            mode = os.environ["FAKE_STREAM_FAILURE"]
+            counters = pathlib.Path(os.environ["FAKE_COUNTER_DIR"])
+            if mode != "portability":
+                for name in ("pg_dump", "psql_stream"):
+                    counter = counters / name
+                    count = int(counter.read_text() if counter.exists() else "0") + 1
+                    counter.write_text(str(count))
+            private = (
+                "PRIVATE_SENTINEL SQL line COPY private_table invalid COPY data "
+                "constraint failed postgresql:// password="
+                + os.environ["FAKE_SOURCE_PASSWORD"]
+                + os.environ["FAKE_TARGET_PASSWORD"]
+            )
+            print(private)
+            print(private, file=sys.stderr)
+            raise SystemExit(12 if mode == "portability" else 14)
+            """,
+        )
+        write_executable(
+            deploy / "source-postgres-exec.py",
+            r"""
+            #!/usr/bin/env python3
+            import os
+            import sys
+
+            arguments = sys.argv[1:]
+            expected = [
+                "--env-file", os.environ["FAKE_PRIVATE_ENV"],
+                "--source-app-container", "legacy-app",
+                "--source-app-id", "a" * 64,
+                "--source-postgres-container", "legacy-postgres",
+                "--source-postgres-id", "b" * 64,
+                "--source-app-state", "stopped",
+            ]
+            if arguments[:len(expected)] != expected:
+                raise SystemExit(97)
+            command = arguments[len(expected):]
+            if command == ["identity"]:
+                print("1000000000000000001|16384|736f757263652d6462")
+                raise SystemExit(0)
+            if not command or command[0] not in {"psql", "pg_dump"}:
+                raise SystemExit(98)
+            environment = os.environ.copy()
+            environment.update({
+                "PGHOST": "/var/run/postgresql",
+                "PGPORT": "5432",
+                "PGUSER": "source-user",
+                "PGPASSWORD": os.environ["FAKE_SOURCE_PASSWORD"],
+                "PGDATABASE": "source-db",
+            })
+            os.execvpe(command[0], command, environment)
+            """,
+        )
+        write_executable(
+            deploy / PG_ENV_EXEC.name,
+            r"""
+            #!/usr/bin/env python3
+            import os
+            import sys
+
+            arguments = sys.argv[1:]
+            if arguments[:2] != [
+                "--target-private-env-file", os.environ["FAKE_PRIVATE_ENV"]
+            ] or len(arguments) < 3:
+                raise SystemExit(96)
+            command = arguments[2:]
+            environment = os.environ.copy()
+            environment.update({
+                "PGHOST": "127.0.0.1",
+                "PGPORT": "15432",
+                "PGUSER": "target-user",
+                "PGPASSWORD": os.environ["FAKE_TARGET_PASSWORD"],
+                "PGDATABASE": "target-db",
+            })
+            os.execvpe(command[0], command, environment)
+            """,
+        )
+        write_executable(
+            fake_bin / "docker",
+            r"""
+            #!/bin/sh
+            exit 99
             """,
         )
         write_executable(
@@ -90,6 +181,9 @@ class SanitizedPostgresStreamPrivacyTests(unittest.TestCase):
             import time
 
             arguments = sys.argv[1:]
+            if "--version" in arguments:
+                print("psql (PostgreSQL) 18.1")
+                raise SystemExit(0)
             if "--single-transaction" in arguments:
                 counter = pathlib.Path(os.environ["FAKE_COUNTER_DIR"]) / "psql_stream"
                 count = int(counter.read_text() if counter.exists() else "0") + 1
@@ -124,11 +218,11 @@ class SanitizedPostgresStreamPrivacyTests(unittest.TestCase):
                     time.sleep(30)
                 raise SystemExit(1)
 
-            if "--file" in arguments:
-                gate_path = arguments[arguments.index("--file") + 1]
+            if "--command" not in arguments:
+                gate_sql = sys.stdin.read()
                 if (
                     os.environ["FAKE_STREAM_FAILURE"] == "portability"
-                    and gate_path.endswith("verify-postgres-portability.sql")
+                    and "pg_foreign_server" in gate_sql
                     and os.environ["PGDATABASE"] == "source-db"
                 ):
                     detail = (
@@ -148,10 +242,10 @@ class SanitizedPostgresStreamPrivacyTests(unittest.TestCase):
                 print("0|0")
             elif "to_regclass" in command:
                 print("f")
+            elif "pg_control_system()" in command:
+                print("2000000000000000002|16384|7461726765742d6462")
             elif "current_database()" in command:
                 print(f"{database}:127.0.0.1:5432")
-            elif "pg_control_system()" in command:
-                print("1000000000000000001" if database == "source-db" else "2000000000000000002")
             elif "server_version_num" in command:
                 print("180000")
             elif "WITH user_objects" in command:
@@ -172,29 +266,18 @@ class SanitizedPostgresStreamPrivacyTests(unittest.TestCase):
 
             arguments = sys.argv[1:]
             index = 0
-            while index < len(arguments) and arguments[index] in {"-s", "-k"}:
-                index += 2
+            while index < len(arguments):
+                if arguments[index] == "--foreground":
+                    index += 1
+                    continue
+                if arguments[index] in {"-s", "-k"}:
+                    index += 2
+                    continue
+                break
             if index >= len(arguments):
                 raise SystemExit(2)
             index += 1  # Ignore the production deadline in this controlled harness.
             command = arguments[index:]
-            if (
-                os.environ["FAKE_STREAM_FAILURE"] == "timeout"
-                and command
-                and pathlib.Path(command[0]).name == "bash"
-            ):
-                process = subprocess.Popen(command, start_new_session=True)
-                try:
-                    raise_code = process.wait(timeout=0.25)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    try:
-                        process.wait(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
-                        process.wait(timeout=1)
-                    raise SystemExit(124)
-                raise SystemExit(raise_code)
             os.execvp(command[0], command)
             """,
         )
@@ -203,12 +286,15 @@ class SanitizedPostgresStreamPrivacyTests(unittest.TestCase):
     def run_failure(self, failure):
         with tempfile.TemporaryDirectory() as directory:
             root, fake_bin, counters = self.make_harness(directory)
+            private_env = root / "private.env"
+            private_env.write_text("TEST_ONLY=1\n", encoding="ascii")
+            private_env.chmod(0o600)
             source_url = (
-                f"postgresql://source-user:{SOURCE_PASSWORD}@127.0.0.1:5432/"
+                f"postgresql://source-user:{SOURCE_PASSWORD}@172.19.0.2:5432/"
                 "source-db?sslmode=disable"
             )
             target_url = (
-                f"postgresql://target-user:{TARGET_PASSWORD}@127.0.0.1:5432/"
+                f"postgresql://target-user:{TARGET_PASSWORD}@127.0.0.1:15432/"
                 "target-db?sslmode=disable"
             )
             environment = os.environ.copy()
@@ -216,15 +302,24 @@ class SanitizedPostgresStreamPrivacyTests(unittest.TestCase):
                 {
                     "PATH": f"{fake_bin}:{environment['PATH']}",
                     "FAKE_COUNTER_DIR": str(counters),
+                    "FAKE_PRIVATE_ENV": str(private_env),
+                    "FAKE_SOURCE_PASSWORD": SOURCE_PASSWORD,
+                    "FAKE_TARGET_PASSWORD": TARGET_PASSWORD,
                     "FAKE_STREAM_FAILURE": failure,
                     "SUB2API_MIGRATION_WRITES_STOPPED": "YES",
-                    "SUB2API_SOURCE_DATABASE_URL": source_url,
-                    "SUB2API_TARGET_DATABASE_URL": target_url,
                 }
             )
             started = time.monotonic()
             result = subprocess.run(
-                [root / "deploy" / MIGRATION.name, "--apply"],
+                [
+                    root / "deploy" / MIGRATION.name,
+                    "--apply",
+                    "--env-file", private_env,
+                    "--source-app-container", "legacy-app",
+                    "--source-app-id", "a" * 64,
+                    "--source-postgres-container", "legacy-postgres",
+                    "--source-postgres-id", "b" * 64,
+                ],
                 cwd=root,
                 env=environment,
                 capture_output=True,

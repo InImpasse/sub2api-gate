@@ -182,7 +182,8 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertNotIn('pg_dump "$SUB2API_DATABASE_URL"', SAFE_EXPORT)
         self.assertNotIn('PGDATABASE="$SUB2API_DATABASE_URL"', SAFE_EXPORT)
         self.assertIn(
-            'python3 "$pg_env_exec" SUB2API_DATABASE_URL', SAFE_EXPORT
+            'source_pg_exec="$repo_dir/deploy/source-postgres-exec.py"',
+            SAFE_EXPORT,
         )
 
     def test_safe_export_check_mode_needs_no_database_credentials(self):
@@ -219,13 +220,30 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn('mode="${2:-check}"', script)
         self.assertIn('if [ "$mode" != "--apply" ]', script)
         self.assertIn("no database connection was opened", script)
-        self.assertIn("SUB2API_DATABASE_URL is required with --apply", script)
+        self.assertIn("every database migration --apply requires --env-file", script)
         self.assertNotIn("eval ", script)
+        self.assertNotIn("SUB2API_DATABASE_URL", script)
         self.assertNotIn('--dbname="$SUB2API_DATABASE_URL"', script)
         self.assertNotIn('PGDATABASE="$SUB2API_DATABASE_URL"', script)
         self.assertIn(
-            'python3 "$pg_env_exec" SUB2API_DATABASE_URL', script
+            'python3 "$pg_env_exec" --target-private-env-file "$env_file"', script
         )
+        self.assertIn('source_pg_exec="$repo_dir/deploy/source-postgres-exec.py"', script)
+        self.assertIn("--source-app-container", script)
+        self.assertIn("--source-app-id", script)
+        self.assertIn("--source-postgres-container", script)
+        self.assertIn("--source-postgres-id", script)
+        self.assertIn("privacy_deadline_seconds=300", script)
+        self.assertIn("timeout --foreground -s TERM -k 5", script)
+        self.assertIn("lock_timeout=5000", script)
+        self.assertIn("statement_timeout=30000", script)
+        self.assertIn("statement_timeout=180000", script)
+        self.assertIn("idle_in_transaction_session_timeout=30000", script)
+        self.assertIn('run_source_sql "$privacy_guard_options"', script)
+        self.assertIn('run_source_sql "$privacy_scrub_options"', script)
+        source_function = script.split("run_source_sql() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn('< "$repo_dir/$sql_file"', source_function)
+        self.assertNotIn("--file", source_function)
         for target in ("privacy", "sync-role", "default-group", "usage-indexes"):
             self.assertIn(f"{target})", script)
         self.assertLess(
@@ -233,16 +251,34 @@ class DeploymentConfigTests(unittest.TestCase):
             script.index("run_sql migrations/001_default_to_openai_default.sql"),
         )
         self.assertLess(
-            script.index("run_sql migrations/002_remove_conversation_capture.sql"),
-            script.index("run_sql migrations/verify_conversation_guards.sql"),
+            script.index(
+                'run_source_sql "$privacy_guard_options" '
+                "migrations/002_remove_conversation_capture.sql"
+            ),
+            script.index(
+                'run_source_sql "$privacy_read_options" '
+                "migrations/verify_conversation_guards.sql"
+            ),
         )
         self.assertLess(
-            script.index("run_sql migrations/verify_conversation_guards.sql"),
-            script.index("run_sql migrations/002_scrub_conversation_history.sql"),
+            script.index(
+                'run_source_sql "$privacy_read_options" '
+                "migrations/verify_conversation_guards.sql"
+            ),
+            script.index(
+                'run_source_sql "$privacy_scrub_options" '
+                "migrations/002_scrub_conversation_history.sql"
+            ),
         )
         self.assertLess(
-            script.index("run_sql migrations/002_scrub_conversation_history.sql"),
-            script.index("run_sql migrations/verify_no_conversation_content.sql"),
+            script.index(
+                'run_source_sql "$privacy_scrub_options" '
+                "migrations/002_scrub_conversation_history.sql"
+            ),
+            script.index(
+                'run_source_sql "$privacy_read_options" '
+                "migrations/verify_no_conversation_content.sql"
+            ),
         )
 
     def test_privacy_apply_requires_totp_before_database_credentials_or_psql(self):
@@ -252,10 +288,9 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("never pass either value through arguments or environment variables", DEPLOYMENT)
         self.assertIn('python3 "$repo_dir/deploy/verify-migration-totp.py"', script)
         verifier_index = script.index('python3 "$repo_dir/deploy/verify-migration-totp.py"')
-        self.assertLess(verifier_index, script.index("SUB2API_DATABASE_URL is required with --apply"))
         self.assertLess(
             verifier_index,
-            script.index('python3 "$pg_env_exec" SUB2API_DATABASE_URL'),
+            script.index('python3 "$source_pg_exec"'),
         )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -272,7 +307,22 @@ class DeploymentConfigTests(unittest.TestCase):
             env["PATH"] = f"{directory_path}:{env['PATH']}"
             env["SUB2API_DATABASE_URL"] = "must-not-be-read-before-totp"
             result = subprocess.run(
-                ["bash", MIGRATION_RUNNER, "privacy", "--apply"],
+                [
+                    "bash",
+                    MIGRATION_RUNNER,
+                    "privacy",
+                    "--apply",
+                    "--env-file",
+                    "/private/not-opened-before-totp.env",
+                    "--source-app-container",
+                    "legacy-app",
+                    "--source-app-id",
+                    "a" * 64,
+                    "--source-postgres-container",
+                    "legacy-postgres",
+                    "--source-postgres-id",
+                    "b" * 64,
+                ],
                 cwd=ROOT,
                 env=env,
                 input="",
@@ -289,6 +339,18 @@ class DeploymentConfigTests(unittest.TestCase):
             or "Git worktree is dirty" in result.stderr
         )
         self.assertFalse(psql_called)
+
+    def test_privacy_apply_loads_only_the_private_source_after_totp(self):
+        script = MIGRATION_RUNNER.read_text()
+        totp_call = 'python3 "$repo_dir/deploy/verify-migration-totp.py" verify'
+        source_loader = 'python3 "$source_pg_exec"'
+
+        self.assertIn("privacy --apply requires the private file", script)
+        self.assertIn(totp_call, script)
+        self.assertIn(source_loader, script)
+        self.assertLess(script.index(totp_call), script.index(source_loader))
+        privacy_case = script[script.index("case \"$target\" in", script.index("run_sql()")):]
+        self.assertNotIn("SUB2API_DATABASE_URL", privacy_case.split("sync-role)", 1)[0])
 
     def test_privacy_check_needs_no_database_or_totp_input(self):
         env = os.environ.copy()
@@ -307,22 +369,121 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertNotIn("Migration TOTP secret:", result.stdout)
         self.assertNotIn("Migration TOTP code:", result.stdout)
 
+    def test_every_apply_requires_an_absolute_private_environment(self):
+        for target in (
+            "privacy",
+            "sync-role",
+            "default-group",
+            "usage-indexes",
+            "verify-content",
+            "audit-default-group",
+        ):
+            with self.subTest(target=target):
+                result = subprocess.run(
+                    ["bash", MIGRATION_RUNNER, target, "--apply"],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("requires --env-file", result.stderr)
+
+                relative = subprocess.run(
+                    [
+                        "bash",
+                        MIGRATION_RUNNER,
+                        target,
+                        "--apply",
+                        "--env-file",
+                        "relative.env",
+                    ],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(relative.returncode, 2)
+                self.assertIn("must be absolute", relative.stderr)
+
+    def test_target_check_accepts_but_does_not_read_a_private_environment(self):
+        missing_env = "/private/path/that-is-not-opened-in-check-mode.env"
+        result = subprocess.run(
+            [
+                "bash",
+                MIGRATION_RUNNER,
+                "default-group",
+                "check",
+                "--env-file",
+                missing_env,
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no database connection was opened", result.stdout)
+        self.assertIn("SUB2API_TARGET_DATABASE_URL", result.stdout)
+        self.assertIn("private environment file was not read", result.stdout)
+
+    def test_privacy_check_declares_the_private_source_database_interface(self):
+        missing_env = "/private/path/that/is-not-opened-in-check-mode.env"
+        result = subprocess.run(
+            [
+                "bash",
+                MIGRATION_RUNNER,
+                "privacy",
+                "check",
+                "--env-file",
+                missing_env,
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no database connection was opened", result.stdout)
+        self.assertIn("SUB2API_SOURCE_DATABASE_URL", result.stdout)
+        self.assertIn("private environment file was not read", result.stdout)
+
+    def test_rollout_scrubs_source_before_safe_metadata_export(self):
+        source = DEPLOYMENT
+        rollout = source[source.index("## Confirmed rollout order"):]
+        self.assertLess(
+            rollout.index("run-database-migration.sh privacy --apply"),
+            rollout.index("Only after the residue gate passes"),
+        )
+        self.assertIn("/etc/nginx/conf.d/sub2api.conf", source)
+
     def test_sync_role_preparation_is_explicit_and_keeps_password_off_argv(self):
         self.assertTrue(PREPARE_SYNC_ROLE.exists())
         self.assertTrue(PREPARE_SYNC_ROLE_SQL.exists())
         script = PREPARE_SYNC_ROLE.read_text()
         sql = PREPARE_SYNC_ROLE_SQL.read_text()
         self.assertIn('mode="${1:-check}"', script)
+        self.assertIn("--env-file ABSOLUTE_PATH", script)
         self.assertIn('if [ "$mode" != "--apply" ]', script)
         self.assertIn("no database connection was opened", script)
+        self.assertIn("private environment file was not read", script)
         self.assertLess(script.index('if [ "$mode" != "--apply" ]'), script.index("psql --quiet"))
         self.assertNotIn('-v sync_password', script)
         self.assertIn("base64 | tr -d", script)
         self.assertNotIn('--dbname="$SUB2API_DATABASE_URL"', script)
         self.assertNotIn('PGDATABASE="$SUB2API_DATABASE_URL"', script)
+        self.assertNotIn('"$SUB2API_SYNC_DATABASE_PASSWORD"', script)
+        self.assertIn('private_env_parser="$repo_dir/deploy/private_env.py"', script)
+        self.assertIn('coproc PRIVATE_ENV_READER', script)
+        self.assertIn('python3 "$private_env_parser" --emit-nul "$env_file"', script)
+        self.assertIn('wait "$private_env_pid" || private_env_status=$?', script)
         self.assertIn(
-            'python3 "$pg_env_exec" SUB2API_DATABASE_URL', script
+            'python3 "$pg_env_exec" --target-private-env-file "$env_file"', script
         )
+        self.assertIn("sub2api_sync_role_prepare_failed", script)
+        self.assertIn(">/dev/null 2>/dev/null", script)
         self.assertIn("decode(:'sync_password_b64', 'base64')", sql)
         self.assertIn("CREATE ROLE sub2api_sync LOGIN", sql)
         self.assertIn("ALTER ROLE sub2api_sync WITH LOGIN", sql)
@@ -376,11 +537,79 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("pg_default_acl", sql)
         prepare_app = PREPARE_APP_ROLE.read_text()
         self.assertIn("app_password_b64", prepare_app)
+        self.assertIn("--env-file ABSOLUTE_PATH", prepare_app)
+        self.assertIn("private environment file was not read", prepare_app)
+        self.assertIn('coproc PRIVATE_ENV_READER', prepare_app)
+        self.assertIn(
+            'python3 "$private_env_parser" --emit-nul "$env_file"', prepare_app
+        )
+        self.assertNotIn('"$SUB2API_APP_DATABASE_PASSWORD"', prepare_app)
         self.assertNotIn('PGDATABASE="$SUB2API_DATABASE_URL"', prepare_app)
         self.assertIn(
-            'python3 "$pg_env_exec" SUB2API_DATABASE_URL', prepare_app
+            'python3 "$pg_env_exec" --target-private-env-file "$env_file"',
+            prepare_app,
         )
+        self.assertIn("sub2api_app_role_prepare_failed", prepare_app)
+        self.assertIn(">/dev/null 2>/dev/null", prepare_app)
         self.assertIn("trigger-bypass", PG18_APP_ROLE_TEST.read_text())
+
+    def test_role_apply_requires_absolute_private_environment(self):
+        for path in (PREPARE_SYNC_ROLE, PREPARE_APP_ROLE):
+            with self.subTest(path=path.name):
+                missing = subprocess.run(
+                    ["bash", path, "--apply"],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(missing.returncode, 0)
+                self.assertIn("requires --env-file", missing.stderr)
+
+                relative = subprocess.run(
+                    ["bash", path, "--apply", "--env-file", "relative.env"],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(relative.returncode, 2)
+                self.assertIn("must be absolute", relative.stderr)
+
+                offline = subprocess.run(
+                    [
+                        "bash",
+                        path,
+                        "check",
+                        "--env-file",
+                        "/private/not-read-in-check-mode.env",
+                    ],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(offline.returncode, 0, offline.stderr)
+                self.assertIn("private environment file was not read", offline.stdout)
+
+    def test_role_helpers_bound_parser_and_database_subprocesses(self):
+        for path in (PREPARE_SYNC_ROLE, PREPARE_APP_ROLE):
+            script = path.read_text()
+            with self.subTest(path=path.name):
+                self.assertIn(
+                    "for command_name in python3 timeout base64 tr sha256sum",
+                    script,
+                )
+                self.assertIn(
+                    "timeout --foreground -s TERM -k 1 5", script
+                )
+                self.assertIn(
+                    "timeout --foreground -s TERM -k 1 30", script
+                )
+                self.assertIn(
+                    "sub2api_private_environment_load_failed", script
+                )
+                self.assertIn(">/dev/null 2>/dev/null", script)
 
     def test_secret_generator_requires_explicit_apply(self):
         script = SECRET_GENERATOR.read_text()

@@ -27,26 +27,124 @@ class PrivateEnvironmentError(ValueError):
     pass
 
 
-def read_private_environment(path):
+def _decode_private_environment(payload):
+    index = 0
+    while index < len(payload):
+        byte = payload[index]
+        if byte == 0x0D:
+            if index + 1 >= len(payload) or payload[index + 1] != 0x0A:
+                raise PrivateEnvironmentError(
+                    "private environment file contains an invalid line separator"
+                )
+            index += 2
+            continue
+        if byte == 0x0A or 0x20 <= byte <= 0x7E:
+            index += 1
+            continue
+        raise PrivateEnvironmentError(
+            "private environment file must use visible ASCII and canonical line endings"
+        )
+    return payload.replace(b"\r\n", b"\n").decode("ascii")
+
+
+def _stable_file_identity(file_stat):
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_mode,
+        file_stat.st_nlink,
+        file_stat.st_uid,
+        file_stat.st_gid,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+def _expected_operator_identity():
+    expected_uid = os.geteuid()
+    expected_gid = 0 if expected_uid == 0 else os.getegid()
+    return expected_uid, expected_gid
+
+
+def _open_private_environment(path, expected_uid):
     path = pathlib.Path(path)
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    if not path.is_absolute():
+        raise PrivateEnvironmentError(
+            "private environment file path must be absolute"
+        )
+    components = path.parts[1:]
+    if not components or any(component in {"", ".", ".."} for component in components):
+        raise PrivateEnvironmentError("private environment file path is invalid")
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise PrivateEnvironmentError(
+            "private environment file boundary is unavailable"
+        )
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags)
+        directory_descriptor = os.open("/", directory_flags)
     except OSError as error:
-        if error.errno == errno.ELOOP:
-            raise PrivateEnvironmentError(
-                "private environment file must be a regular non-symlink file"
-            ) from error
         raise PrivateEnvironmentError(
             "private environment file is unavailable"
         ) from error
+    try:
+        for component in components[:-1]:
+            try:
+                next_descriptor = os.open(
+                    component, directory_flags, dir_fd=directory_descriptor
+                )
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise PrivateEnvironmentError(
+                        "private environment file must be a regular non-symlink file"
+                    ) from error
+                raise PrivateEnvironmentError(
+                    "private environment file is unavailable"
+                ) from error
+            os.close(directory_descriptor)
+            directory_descriptor = next_descriptor
+        parent_stat = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid != expected_uid
+            or stat.S_IMODE(parent_stat.st_mode) & 0o022
+        ):
+            raise PrivateEnvironmentError(
+                "private environment parent directory is unsafe"
+            )
+        try:
+            return os.open(
+                components[-1], file_flags, dir_fd=directory_descriptor
+            )
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise PrivateEnvironmentError(
+                    "private environment file must be a regular non-symlink file"
+                ) from error
+            raise PrivateEnvironmentError(
+                "private environment file is unavailable"
+            ) from error
+    finally:
+        os.close(directory_descriptor)
+
+
+def read_private_environment(path):
+    expected_uid, expected_gid = _expected_operator_identity()
+    descriptor = _open_private_environment(path, expected_uid)
     try:
         file_stat = os.fstat(descriptor)
         if not stat.S_ISREG(file_stat.st_mode):
             raise PrivateEnvironmentError(
                 "private environment file must be a regular non-symlink file"
+            )
+        if file_stat.st_nlink != 1:
+            raise PrivateEnvironmentError(
+                "private environment file must have a single filesystem link"
+            )
+        if (file_stat.st_uid, file_stat.st_gid) != (expected_uid, expected_gid):
+            raise PrivateEnvironmentError(
+                "private environment file must be owned by the expected operator"
             )
         if stat.S_IMODE(file_stat.st_mode) != 0o600:
             raise PrivateEnvironmentError(
@@ -65,7 +163,12 @@ def read_private_environment(path):
         payload = b"".join(chunks)
         if len(payload) > MAX_FILE_BYTES:
             raise PrivateEnvironmentError("private environment file is too large")
-        source = payload.decode("utf-8")
+        final_stat = os.fstat(descriptor)
+        if _stable_file_identity(final_stat) != _stable_file_identity(file_stat):
+            raise PrivateEnvironmentError(
+                "private environment file changed while being read"
+            )
+        source = _decode_private_environment(payload)
     except PrivateEnvironmentError:
         raise
     except (OSError, UnicodeError) as error:
@@ -76,7 +179,7 @@ def read_private_environment(path):
         os.close(descriptor)
 
     values = {}
-    for raw_line in source.splitlines():
+    for raw_line in source.split("\n"):
         if len(raw_line) > MAX_LINE_CHARACTERS:
             raise PrivateEnvironmentError("private environment line is too long")
         if not raw_line.strip() or raw_line.lstrip().startswith("#"):
@@ -114,7 +217,11 @@ def main(argv=None):
     if not arguments.emit_nul or not arguments.path:
         print("usage: private_env.py --emit-nul PATH", file=sys.stderr)
         return 2
-    if sys.stdout.isatty():
+    try:
+        output_stat = os.fstat(sys.stdout.fileno())
+    except (AttributeError, OSError, ValueError):
+        output_stat = None
+    if output_stat is None or not stat.S_ISFIFO(output_stat.st_mode):
         print("private environment records require a protected pipe", file=sys.stderr)
         return 1
     try:

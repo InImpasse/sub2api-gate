@@ -25,6 +25,7 @@ owns only its own directory:
 
 ```bash
 sudo install -d -o root -g root -m 0700 /mnt/data/sub2api-gate
+sudo install -d -o root -g root -m 0700 /mnt/data/sub2api-gate/private
 sudo install -d -o 1000 -g 1000 -m 0700 /mnt/data/sub2api-gate/app
 sudo install -d -o 70 -g 70 -m 0700 /mnt/data/sub2api-gate/postgres
 sudo install -d -o 999 -g 1000 -m 0700 /mnt/data/sub2api-gate/redis
@@ -38,6 +39,15 @@ PostgreSQL 18 uses its official major-version-aware layout. The host path stays
 the cluster must exist at `postgres/18/docker`. In particular, the release gate
 requires `postgres/18/docker/PG_VERSION`, `global/pg_control`, and `pg_wal`;
 the legacy PostgreSQL 17-style `postgres/PG_VERSION` layout is rejected.
+
+Every root-run production action must execute from the exact
+`/opt/sub2api-gate-release` Git worktree. `/opt`, the release root, and every
+entry below it must be root-owned, must not be group/world writable, and the
+tree must not contain symlinks or nested mounts. Install releases from an exact
+reviewed Git commit into that tree; never run privileged migration or cutover
+code from `/home/ubuntu`, another operator-writable parent, or a copied working
+directory. Private configuration remains outside the release tree under
+`/mnt/data/sub2api-gate/private`.
 
 `security-preflight.sh` checks actual free bytes on that filesystem and requires
 `SUB2API_MIN_FREE_BYTES` to be at least 10 GiB. Raise it above the measured
@@ -91,6 +101,37 @@ docker compose --env-file .env.example \
 git diff --check
 ```
 
+## Private database role preparation
+
+The app and sync role helpers never accept PostgreSQL URLs or role passwords
+from the ambient environment. Their `check` mode is offline and does not read a
+private file. Every apply requires the absolute mode-`0600` private environment
+path:
+
+```bash
+sudo bash deploy/prepare-sync-role.sh --apply \
+  --env-file /mnt/data/sub2api-gate/private/.env
+sudo bash deploy/prepare-app-role.sh --apply \
+  --env-file /mnt/data/sub2api-gate/private/.env
+```
+
+Run those commands only at their documented maintenance-controller stages.
+The controller must pass the same `--env-file` argument and an empty
+credential environment; it must never inject `SUB2API_DATABASE_URL`,
+`SUB2API_TARGET_DATABASE_URL`, `SUB2API_SYNC_DATABASE_PASSWORD`, or
+`SUB2API_APP_DATABASE_PASSWORD` into these child processes.
+
+Each helper consumes the strict private parser's NUL-delimited records through
+a pipe, validates that the target URL and its own role password are present,
+and then invokes `pg-env-exec.py --target-private-env-file`. The executable
+`pg-env-exec.py` interface rejects all ambient URL selectors; its pure parsing
+functions remain available to internal validation code. Private parsing is
+bounded to five seconds and role preparation to thirty seconds, with a
+one-second TERM-to-KILL grace. PostgreSQL stdout and stderr are discarded
+because a generated `ALTER ROLE` statement contains the password internally;
+failure exposes only `sub2api_sync_role_prepare_failed` or
+`sub2api_app_role_prepare_failed`.
+
 The privacy migration is deliberately two-phase. The short
 `002_remove_conversation_capture.sql` transaction installs and commits write
 guards first, `verify_conversation_guards.sql` checks them without reading
@@ -100,17 +141,33 @@ schema-drift gate. In `--apply` mode the runner first reads the administrator TO
 and one-time code from the private controlling terminal, verifies them, and only
 then reads database credentials or starts `psql`; never pass either value through arguments or environment variables.
 
+The one-time verifier enrollment is an explicit trust-on-first-use ceremony:
+Cloudflare never reveals an existing Worker Secret, so the tool cannot prove
+which seed is registered remotely. From the private root TTY, independently
+confirm the seed against the original administrator TOTP enrollment record,
+then run `sudo python3 deploy/verify-migration-totp.py enroll --apply` and enter
+that seed plus its current code. Never generate a self-consistent replacement
+seed merely to satisfy this gate. If the registered seed is unavailable, stop
+and use a separately reviewed Worker TOTP rotation; do not bypass enrollment.
+The verifier, replay lock, and replay state remain under
+`/mnt/data/sub2api-gate/private`. The private parent directory must be
+root-owned mode `0700`; the verifier and replay state are root-owned mode
+`0600` (the replay lock is also created mode `0600`).
+
 The storage migration tools are also check-only by default. PostgreSQL is
 streamed directly from a sanitized, stopped source into a fresh PostgreSQL 18
 database and committed only after privacy, row-count, relationship, and usage
-metadata checks pass. Before either a schema-only safe export or a logical
+metadata checks pass. Before either a safe schema fingerprint or a logical
 migration, the PostgreSQL portability gate rejects every FDW, foreign server,
 user mapping, foreign table, and extension other than the exact `plpgsql`,
 `pgcrypto`, and PostgreSQL 18 trusted `pg_trgm` allowlist. Sub2API 0.1.162 uses
 `pg_trgm` only for local fuzzy-search indexes; it has no remote connection or
 credential boundary. This prevents `pg_dump` from serializing foreign
-connection options or credentials into an export or the target cluster. The
-safe export runs that gate inside the same exported snapshot as `schema.sql`.
+connection options or credentials into the target cluster. The safe export
+runs that gate inside the same exported snapshot, pipes the schema-only stream
+directly into SHA-256, and persists only `schema_fingerprint.sha256`; function
+bodies, defaults, policies, trigger arguments, and other schema text never
+enter the backup directory.
 Apply creates a root-owned mode-`0700` timestamped directory under
 `/mnt/data/sub2api-gate/safe-backup`. Its atomically published `manifest.json`
 binds the current Git commit, source PostgreSQL system identifier, every export
@@ -265,7 +322,7 @@ context. The resulting configuration must contain:
 python3 deploy/install-nginx-direct-v1.py check
 # Only after explicit production approval, from a private root TTY:
 sudo python3 deploy/install-nginx-direct-v1.py --apply \
-  --site-config /etc/nginx/sites-enabled/sub2api.conf \
+  --site-config /etc/nginx/conf.d/sub2api.conf \
   --server-name api.example.com \
   --verify-url https://api.example.com/v1/responses \
   --model reviewed-canary-model
@@ -399,22 +456,32 @@ change a service:
 python3 deploy/maintenance-cutover.py check
 ```
 
-The private mode-`0600` environment must include the source and target
+The private mode-`0600` environment must be supplied by an absolute path and
+must include the source and target
 PostgreSQL URLs plus the source and one-time target Redis migration values shown
 in `.env.example`. The target URLs are fixed to loopback migration ports:
-PostgreSQL `127.0.0.1:15432` and nonce Redis `127.0.0.1:16379`. The source URLs
-must also identify the supplied exact legacy containers. For loopback, the
-controller compares the URL port with that container's exact Docker port
-binding; a Redis bridge address must equal the exact container IP. It performs
-authenticated PostgreSQL system-ID queries and Redis `AUTH`, `PING`, and
-`INFO server` before stopping either writer. If the old services do not expose
-a reviewed local endpoint, apply fails during the zero-downtime preflight; do
-not add a public database or Redis listener.
+PostgreSQL `127.0.0.1:15432` and nonce Redis `127.0.0.1:16379`. The source
+PostgreSQL URL must use the selected container's canonical RFC1918 IPv4 address
+on port `5432` with `sslmode=disable`; it is never opened through a published
+host port. `source-postgres-exec.py` verifies the exact full app and PostgreSQL
+container IDs, their state, their shared Docker network, and the app's
+`DATABASE_HOST`, `DATABASE_PORT`, and `DATABASE_DBNAME`. The host must be that
+exact PostgreSQL endpoint's alias or address. Reviewed PostgreSQL 18 clients
+then run inside that selected container over its Unix socket without putting a
+password or URL in child argv or environment. A Redis loopback URL must match
+the exact published binding; a Redis bridge address must equal the selected
+exact container IP. The controller performs PostgreSQL database-identity
+queries and Redis `AUTH`, `PING`, and `INFO server` before stopping either
+writer. If an old service does not expose this reviewed local boundary, apply
+fails during the zero-downtime preflight; do not add a public database or Redis
+listener.
 
-First create and verify the retirement identity record described below. Then
-create the safe metadata export and pass its exact timestamped directory to the
-controller. Run apply from a private root TTY with the same explicit paths,
-names, and full 64-character Docker IDs:
+After the source privacy scrub and residue gate pass, create the safe metadata
+export with `export-safe-metadata.sh --apply --env-file
+/absolute/private/sub2api.env`. Immediately before maintenance, create and
+verify the retirement identity record described below, then pass the export's
+exact timestamped directory to the controller. Run apply from a private root
+TTY with the same explicit paths, names, and full 64-character Docker IDs:
 
 ```bash
 sudo python3 deploy/maintenance-cutover.py --apply \
@@ -436,9 +503,13 @@ sudo python3 deploy/maintenance-cutover.py --apply \
   --model reviewed-canary-model
 ```
 
-Apply requires a clean worktree, the full security preflight, private TTY, and
-interactive migration TOTP. The later synthetic API canary reads its API key
-from the same private TTY; neither secret is accepted in argv. Before the
+Apply requires absolute private env and Wrangler paths, a clean worktree, the
+full security preflight, private TTY, and interactive migration TOTP. Before
+any local command runs, argument parsing validates that the synthetic canary
+uses the exact approved lowercase hostname, HTTPS `/v1/responses`, and a bounded
+model identifier; controller preflight repeats this check. The later synthetic
+API canary reads its API key from the same private TTY; neither secret is
+accepted in argv. Before the
 maintenance clock starts, the controller verifies the export's exact file set,
 Git and policy hashes, then compares its PostgreSQL system identifier with the
 live source cluster. It structurally verifies the active `/etc/nginx` tree has
@@ -447,9 +518,12 @@ no mirror/capture directive and that `/v1/*` uses the switchable named
 legacy app/PG/Redis identities, fixed sync unit, `8080` and `3021` health,
 source endpoints, target storage, and the two temporary loopback-only migration
 services. The 180-second clock starts immediately before it stops the fixed
-`sub2api-sync.service` and exact legacy Sub2API container; that writer-stop
-phase has its own fail-closed 60-second deadline. Legacy PostgreSQL and Redis
-remain running so the sanitized logical streams can read them.
+`sub2api-sync.service` and exact legacy Sub2API container. A stricter 60-second
+traffic-interruption deadline stays active through the sanitized migration,
+target health checks, and atomic Nginx switch to `8081`; it is cleared only
+after the switched target is healthy. The interactive API canary follows after
+traffic is restored. Legacy PostgreSQL and Redis remain running so the
+sanitized logical streams can read them.
 
 Only unexpired, allowlisted HMAC nonce markers enter the temporary nonce Redis.
 The migration ACL is memory-backed, owned for UID/GID `999:1000`, mounted only
@@ -468,13 +542,18 @@ upstream. Once stable is confirmed it stops both target projects without
 ACL, and empties only the fixed new target app, PostgreSQL, and nonce directories
 so a later attempt starts fresh. Unsafe owners, symlinks, mounts, hard links, or
 changed identities stop that reset and are reported together with the original
-failure. Before any target starts, the controller atomically publishes a
-root-only mode-`0600` recovery record at
+failure. The reset parses `/proc/self/mountinfo` before traversal and again
+immediately before deletion, so same-device bind mounts are rejected as well as
+cross-device mounts. Before any target starts, the controller atomically
+publishes a root-only mode-`0600` version-2 recovery record at
 `/mnt/data/sub2api-gate/safe-backup/maintenance-cutover-state.json`. It contains
-only Git/container identities, phase flags, the sync unit path, and the private
-environment file path; it never contains a password, URL credential, database
-row, Redis value, request, or response. Normal success or a verified rollback
-fsyncs removal of the record. `SIGKILL`, kernel failure, host power loss, and
+only Git/container identities, phase flags, the private environment file's
+non-content filesystem identity, and the sync unit path plus its content
+SHA-256. It never contains a password, URL credential, database row, Redis
+value, request, or response. Every rollback rechecks the unchanged private-file
+identity, current systemd FragmentPath, and unit content before starting or
+stopping any service. Normal success or a verified rollback fsyncs removal of
+the record. `SIGKILL`, kernel failure, host power loss, and
 Docker daemon loss cannot execute an in-process rollback; after the host and
 Docker daemon are available, use the exact recorded legacy identities and the
 same private environment to run:
@@ -491,7 +570,8 @@ sudo python3 deploy/maintenance-cutover.py --recover \
 ```
 
 Recovery requires a root private TTY, a clean unchanged Git release, the same
-private environment, and interactive TOTP. It accepts either active upstream
+unchanged private environment file identity, the unchanged sync unit content,
+and interactive TOTP. It accepts either active upstream
 stage, restores and health-checks the exact legacy services, atomically selects
 stable `8080`, isolates the temporary targets, resets only the reviewed fresh
 target directories, and then removes the recovery record. Repeated termination
@@ -680,18 +760,28 @@ the first failed checkpoint; never skip ahead.
    the complete `/mnt/data/sub2api-gate` directory tree, the configured free
    space threshold, no active host swap, disabled container core dumps, and all
    required Worker Secret names. Run the complete local gate set again.
-2. Create the fixed-column, read-only safe metadata export. Do not create a
-   full database, WAL, Redis AOF, application-directory, or content backup.
-3. Back up the live Nginx configuration. Atomically replace only the `/v1/*`
+2. Back up the live Nginx configuration. Atomically replace only the `/v1/*`
    location with the direct named `sub2api_backend` upstream, whose active
    include initially points to `127.0.0.1:8080`; remove mirror/capture,
    run `nginx -t`, reload, and verify that rollback restores the prior config.
-4. Confirm Sub2API file logging is off and its Docker log driver is `none`.
-   Run `run-database-migration.sh privacy --apply`: the short guard transaction
+3. Confirm Sub2API file logging is off and its Docker log driver is `none`.
+   Enroll the existing administrator TOTP once from the private server TTY with
+   `sudo python3 deploy/verify-migration-totp.py enroll --apply`, after the
+   out-of-band existing-seed confirmation described above,
+   then run `run-database-migration.sh privacy --apply --env-file
+   /absolute/path/to/private.env`: the short guard transaction
    commits before batched history cleanup. If cleanup fails, keep the guards
    installed and resolve the schema conflict before continuing. Run
    `verify-runtime-privacy.py --verify` from the private database environment;
    it must confirm both fail-closed settings and the enabled protection trigger.
+4. Only after the residue gate passes, create the fixed-column, read-only safe
+   metadata export from the sanitized source with `export-safe-metadata.sh
+   --apply --env-file /absolute/path/to/private.env`. The tool reads only the
+   explicit `SUB2API_SOURCE_DATABASE_URL`; it does not use the target app URL.
+   Its manifest binds the source cluster ID, database OID, and database name;
+   maintenance rechecks the same tuple before stopping any writer.
+   Do not create a full database, WAL, Redis AOF, application-directory, or
+   content backup.
 5. Run `docker-compose.canary.yml` only as an isolated empty-data preflight. Its
    PostgreSQL and Redis are tmpfs services on a private Compose network. Verify
    the pinned 0.1.162 binary, startup, health, and no-file/no-Docker-log controls,

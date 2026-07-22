@@ -303,17 +303,21 @@ class ReleaseSafetyTests(unittest.TestCase):
         postgres_migration = (
             ROOT / "deploy" / "migrate-sanitized-postgres.sh"
         ).read_text()
+        locked_stream = (
+            ROOT / "deploy" / "locked-postgres-stream.py"
+        ).read_text()
         redis_migration = (
             ROOT / "deploy" / "migrate-redis-allowlist.py"
         ).read_text()
         app_migration = (ROOT / "deploy" / "migrate-app-metadata.py").read_text()
         self.assertIn('mode="${1:-check}"', postgres_migration)
         self.assertIn("no database connection was opened", postgres_migration)
-        self.assertIn("pg_dump", postgres_migration)
-        self.assertIn("| PGDATABASE=", postgres_migration)
-        self.assertIn("pg_control_system()", postgres_migration)
-        self.assertNotIn("pg_basebackup", postgres_migration)
-        self.assertNotIn("/var/lib/postgresql/data", postgres_migration)
+        self.assertIn("locked-postgres-stream.py", postgres_migration)
+        self.assertIn("pg_dump", locked_stream)
+        self.assertIn("stdout=self.target.stdin", locked_stream)
+        self.assertIn("pg_control_system()", locked_stream)
+        self.assertNotIn("pg_basebackup", postgres_migration + locked_stream)
+        self.assertNotIn("/var/lib/postgresql/data", postgres_migration + locked_stream)
         self.assertIn("ALLOWED_KEY_PREFIXES", redis_migration)
         self.assertIn("unknown Redis key prefix", redis_migration)
         self.assertIn('expected_version = "8.8.0"', redis_migration)
@@ -331,12 +335,16 @@ class ReleaseSafetyTests(unittest.TestCase):
         self.assertIn(".partial-", safe_export)
         self.assertIn("COMPLETE", safe_export)
         self.assertIn("manifest.json", safe_export)
-        self.assertIn("source_postgres_system_identifier", safe_export)
+        self.assertIn("source_postgres_database_oid", safe_export)
+        self.assertIn("source_postgres_database_name_hex", safe_export)
         self.assertIn("git_head", safe_export)
+        self.assertIn("deploy/locked-postgres-stream.py", safe_export)
         self.assertIn('"$(id -u)" -eq 0', safe_export)
         self.assertIn("sha256sum", safe_export)
         self.assertIn("verify-postgres-portability.sql", safe_export)
         self.assertIn("verify_no_conversation_content.sql", safe_export)
+        self.assertIn('source_pg_exec="$repo_dir/deploy/source-postgres-exec.py"', safe_export)
+        self.assertNotIn("--source-private-env-file", safe_export)
         self.assertIn('cat "$privacy_gate"', safe_export)
         self.assertIn('cat "$portability_gate"', safe_export)
         self.assertLess(
@@ -347,15 +355,21 @@ class ReleaseSafetyTests(unittest.TestCase):
             safe_export.index('cat "$portability_gate"'),
             safe_export.index("SELECT pg_export_snapshot()"),
         )
-        self.assertIn("--no-comments", safe_export)
-        self.assertIn("--no-security-labels", safe_export)
+        self.assertIn("schema_fingerprint.sha256", safe_export)
+        self.assertIn("snapshot_holder_stop", safe_export)
+        self.assertIn("idle_in_transaction_session_timeout=600000", safe_export)
+        self.assertNotIn('> "$partial_dir/schema.sql"', safe_export)
+        self.assertNotIn("schema.sql\n", safe_export)
         self.assertNotIn("--format=custom", safe_export)
 
         postgres_migration = (
             ROOT / "deploy" / "migrate-sanitized-postgres.sh"
         ).read_text()
-        self.assertIn("--no-comments", postgres_migration)
-        self.assertIn("--no-security-labels", postgres_migration)
+        locked_stream = (
+            ROOT / "deploy" / "locked-postgres-stream.py"
+        ).read_text()
+        self.assertIn("--no-comments", locked_stream)
+        self.assertIn("--no-security-labels", locked_stream)
 
     def test_production_apply_tools_require_a_clean_worktree(self):
         guarded_tools = (
@@ -382,6 +396,21 @@ class ReleaseSafetyTests(unittest.TestCase):
             with self.subTest(path=relative_path):
                 source = (ROOT / relative_path).read_text()
                 self.assertIn("require-clean-worktree.sh", source)
+
+    def test_root_release_guard_requires_a_fixed_immutable_production_tree(self):
+        guard = (ROOT / "deploy" / "require-clean-worktree.sh").read_text()
+
+        self.assertTrue(guard.startswith("#!/bin/bash\n"))
+        self.assertIn('trusted_production_root="/opt/sub2api-gate-release"', guard)
+        self.assertIn('if [ "$(id -u)" -eq 0 ]; then', guard)
+        self.assertIn('[ "$repo_dir" != "$trusted_production_root" ]', guard)
+        self.assertIn('! -user root', guard)
+        self.assertIn('-perm /022', guard)
+        self.assertIn('/proc/self/mountinfo', guard)
+        self.assertLess(
+            guard.index('if [ "$(id -u)" -eq 0 ]; then'),
+            guard.index('git -C "$repo_dir" rev-parse'),
+        )
 
     def test_nginx_has_custom_aop_stages_and_an_unknown_host_sink(self):
         nginx = (ROOT / "nginx" / "sub2api.conf").read_text()

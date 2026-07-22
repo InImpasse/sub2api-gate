@@ -9,8 +9,13 @@ import sys
 
 REPO_DIR = pathlib.Path(__file__).resolve().parent.parent
 PG_ENV_TOOL = REPO_DIR / "deploy" / "pg-env-exec.py"
+SOURCE_PG_EXEC = REPO_DIR / "deploy" / "source-postgres-exec.py"
 POSTGRES_LOGGING_SQL_PATH = REPO_DIR / "deploy" / "verify-postgres-runtime-logging.sql"
 EXPECTED_DATA_ROOT = pathlib.Path("/mnt/data/sub2api-gate")
+RUNTIME_PGOPTIONS = (
+    "-c default_transaction_read_only=on -c lock_timeout=1000 "
+    "-c statement_timeout=5000 -c idle_in_transaction_session_timeout=5000"
+)
 POSTGRES_LOG_DIRECTORIES = frozenset(
     {"log", "pg_log", "postgresql-log", "postgresql-logs", "postgresql_log"}
 )
@@ -128,47 +133,107 @@ def load_pg_environment_tool():
     return module
 
 
-def verify_runtime_privacy(environment):
-    verify_no_postgres_log_artifacts(environment)
-    pg_env = load_pg_environment_tool()
+def verify_runtime_privacy(
+    environment,
+    env_file,
+    database,
+    *,
+    source_app_container=None,
+    source_app_id=None,
+    source_postgres_container=None,
+    source_postgres_id=None,
+):
+    artifact_environment = {"SUB2API_DATA_ROOT": str(EXPECTED_DATA_ROOT)}
+    verify_no_postgres_log_artifacts(artifact_environment)
     source_environment = dict(environment)
-    source_environment["SUB2API_PGOPTIONS"] = (
-        "-c default_transaction_read_only=on "
-        "-c statement_timeout=5000 "
-        "-c lock_timeout=1000"
-    )
-    child_environment = pg_env.libpq_environment(
-        source_environment, "SUB2API_DATABASE_URL"
-    )
+    source_environment["SUB2API_PGOPTIONS"] = RUNTIME_PGOPTIONS
+    psql_arguments = [
+        "--no-psqlrc",
+        "--tuples-only",
+        "--no-align",
+        "--quiet",
+        "--set",
+        "ON_ERROR_STOP=1",
+    ]
+    if database == "source":
+        source_values = (
+            source_app_container,
+            source_app_id,
+            source_postgres_container,
+            source_postgres_id,
+        )
+        if any(not value for value in source_values):
+            raise RuntimeError("runtime_privacy_gate_failed")
+        for name in tuple(source_environment):
+            if name.startswith("PG") or name in {
+                "SUB2API_DATABASE_URL",
+                "SUB2API_SOURCE_DATABASE_URL",
+                "SUB2API_TARGET_DATABASE_URL",
+            }:
+                source_environment.pop(name, None)
+        source_environment["SUB2API_PGOPTIONS"] = RUNTIME_PGOPTIONS
+        command = [
+            "python3",
+            str(SOURCE_PG_EXEC),
+            "--env-file",
+            str(env_file),
+            "--source-app-container",
+            source_app_container,
+            "--source-app-id",
+            source_app_id,
+            "--source-postgres-container",
+            source_postgres_container,
+            "--source-postgres-id",
+            source_postgres_id,
+            "--source-app-state",
+            "running",
+            "psql",
+            *psql_arguments,
+        ]
+        child_environment = source_environment
+        process_timeout = 45
+    elif database == "target":
+        pg_env = load_pg_environment_tool()
+        child_environment = pg_env.private_libpq_environment(
+            source_environment,
+            env_file,
+            "SUB2API_TARGET_DATABASE_URL",
+        )
+        command = ["psql", *psql_arguments]
+        process_timeout = 8
+    else:
+        raise RuntimeError("runtime_privacy_gate_failed")
     child_environment["PGAPPNAME"] = "sub2api-gate-runtime-privacy"
     result = subprocess.run(
-        [
-            "psql",
-            "--no-psqlrc",
-            "--tuples-only",
-            "--no-align",
-            "--quiet",
-            "--set",
-            "ON_ERROR_STOP=1",
-        ],
+        command,
         input=PRIVACY_SQL + "\n" + load_postgres_logging_sql(),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         env=child_environment,
-        timeout=8,
+        timeout=process_timeout,
         check=False,
     )
     if result.returncode != 0 or result.stdout.strip() != "ok":
         raise RuntimeError("runtime_privacy_gate_failed")
-    verify_no_postgres_log_artifacts(environment)
+    verify_no_postgres_log_artifacts(artifact_environment)
+
+
+def usage():
+    print(
+        "usage: verify-runtime-privacy.py check | "
+        "--verify --env-file ABSOLUTE_PATH --database source|target "
+        "[--source-app-container NAME --source-app-id FULL_ID "
+        "--source-postgres-container NAME --source-postgres-id FULL_ID]",
+        file=sys.stderr,
+    )
 
 
 def main(argv=None):
     arguments = list(sys.argv[1:] if argv is None else argv)
     mode = arguments[0] if arguments else "check"
-    if len(arguments) > 1 or mode not in {"check", "--verify"}:
-        print("usage: verify-runtime-privacy.py [check|--verify]", file=sys.stderr)
+    if mode == "check" and arguments not in ([], ["check"]):
+        usage()
         return 2
     if mode == "check":
         try:
@@ -179,8 +244,51 @@ def main(argv=None):
             return 1
         print("runtime privacy preflight check passed; no database connection was opened")
         return 0
+    if mode != "--verify":
+        usage()
+        return 2
+    values = {}
+    remaining = arguments[1:]
+    allowed = {
+        "--env-file": "env_file",
+        "--database": "database",
+        "--source-app-container": "source_app_container",
+        "--source-app-id": "source_app_id",
+        "--source-postgres-container": "source_postgres_container",
+        "--source-postgres-id": "source_postgres_id",
+    }
+    while remaining:
+        option = remaining.pop(0)
+        if option not in allowed or not remaining or allowed[option] in values:
+            usage()
+            return 2
+        values[allowed[option]] = remaining.pop(0)
+    database = values.get("database")
+    source_names = (
+        "source_app_container",
+        "source_app_id",
+        "source_postgres_container",
+        "source_postgres_id",
+    )
+    if not values.get("env_file") or not database:
+        usage()
+        return 2
+    env_file = pathlib.Path(values["env_file"])
+    if not env_file.is_absolute():
+        print("private environment file path must be absolute", file=sys.stderr)
+        return 2
+    if database not in {"source", "target"} or (
+        database == "source" and any(not values.get(name) for name in source_names)
+    ) or (database == "target" and any(values.get(name) for name in source_names)):
+        usage()
+        return 2
     try:
-        verify_runtime_privacy(os.environ)
+        verify_runtime_privacy(
+            os.environ,
+            env_file,
+            database,
+            **{name: values.get(name) for name in source_names},
+        )
     except Exception:
         print("runtime privacy verification failed", file=sys.stderr)
         return 1

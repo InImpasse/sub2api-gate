@@ -202,6 +202,20 @@ class NginxDirectCutoverTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("check only", result.stdout)
 
+    def test_command_validation_never_echoes_an_accidental_api_key(self):
+        sentinel = "sk-accidental-command-line-secret"
+        result = subprocess.run(
+            [CUTOVER, f"--api-key={sentinel}"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn(sentinel, result.stdout)
+        self.assertNotIn(sentinel, result.stderr)
+        self.assertIn("command validation failed", result.stderr)
+
     def test_live_gate_scans_active_config_without_a_conf_suffix(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory) / "nginx"

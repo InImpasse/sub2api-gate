@@ -65,6 +65,15 @@ class CutoverError(RuntimeError):
     pass
 
 
+class CutoverUsageError(CutoverError):
+    pass
+
+
+class RedactedArgumentParser(argparse.ArgumentParser):
+    def error(self, _message):
+        raise CutoverUsageError("Nginx direct /v1 cutover command validation failed")
+
+
 class Block:
     def __init__(self, header, start, open_index, close_index, parent):
         self.header = header
@@ -1027,7 +1036,7 @@ def install_cutover(arguments):
 
 
 def parse_arguments(argv):
-    parser = argparse.ArgumentParser(allow_abbrev=False)
+    parser = RedactedArgumentParser(allow_abbrev=False)
     parser.add_argument("mode", nargs="?", choices=("check",))
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--site-config")
@@ -1064,6 +1073,9 @@ def main(argv=None):
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except CutoverUsageError as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(2) from None
     except CutoverError as error:
         print(str(error), file=sys.stderr)
         raise SystemExit(1) from None
