@@ -211,15 +211,19 @@ class NginxDirectCutoverTests(unittest.TestCase):
             sites.mkdir()
             for path in (root, snippets, sites):
                 path.chmod(0o755)
-            site = sites / "gateway"
-            site.write_text(
-                self.module.rewrite_direct_v1(OLD_CONFIG, "gateway.example.test"),
-                encoding="utf-8",
-            )
-            site.chmod(0o640)
             capture = snippets / "legacy-capture"
             capture.write_text("mirror /_response-capture;\n", encoding="utf-8")
             capture.chmod(0o640)
+            active_upstream = snippets / "sub2api-upstream-active.conf"
+            active_upstream.write_text("server 127.0.0.1:8080;\n", encoding="utf-8")
+            active_upstream.chmod(0o640)
+            site = sites / "gateway"
+            site.write_text(
+                self.module.rewrite_direct_v1(OLD_CONFIG, "gateway.example.test")
+                + f"include {capture};\n",
+                encoding="utf-8",
+            )
+            site.chmod(0o640)
 
             with self.assertRaisesRegex(self.module.CutoverError, "mirror or capture"):
                 self.module.verify_live_direct_v1(
@@ -228,6 +232,26 @@ class NginxDirectCutoverTests(unittest.TestCase):
                     "gateway.example.test",
                     production=False,
                 )
+
+    def test_apply_ignores_inactive_capture_backup_outside_include_graph(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env, site, target, _, _, _ = self.fixture(directory)
+            inactive = pathlib.Path(directory) / "nginx/conf.d/sub2api.conf.bak-capture"
+            inactive.write_text("mirror /_response-capture;\n", encoding="utf-8")
+            inactive.chmod(0o640)
+
+            result = subprocess.run(
+                [CUTOVER, *self.apply_args(site)],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(inactive.read_text(), "mirror /_response-capture;\n")
+            self.assertNotIn("mirror", target.read_text())
 
     def test_apply_rewrites_symlink_target_installs_map_and_runs_canary(self):
         with tempfile.TemporaryDirectory() as directory:

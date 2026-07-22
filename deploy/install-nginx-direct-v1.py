@@ -2,6 +2,7 @@
 import argparse
 import datetime
 import fcntl
+import glob
 import http.client
 import os
 import pathlib
@@ -601,33 +602,30 @@ def command_ok(command, *, visible=False):
 
 def verify_no_capture_config(nginx_root):
     total = 0
-    backup_root = nginx_root / "sub2api-gate" / "backups"
     try:
         root_resolved = nginx_root.resolve(strict=True)
-        files = []
         main_config = nginx_root / "nginx.conf"
         if main_config.exists() or main_config.is_symlink():
-            files.append(main_config)
-        for active_directory in ("conf.d", "sites-enabled", "snippets"):
-            directory = nginx_root / active_directory
-            if not directory.exists():
-                continue
-            if directory.is_symlink() or not directory.is_dir():
-                raise CutoverError("Nginx active configuration directory is unsafe")
-            files.extend(
-                path for path in directory.rglob("*")
-                if path.is_file() or path.is_symlink()
-            )
+            pending = [main_config]
+        else:
+            # Test fixtures without nginx.conf still model the two conventional
+            # active include roots. Production always starts from nginx.conf.
+            pending = []
+            conf_dir = nginx_root / "conf.d"
+            sites_dir = nginx_root / "sites-enabled"
+            if conf_dir.is_dir() and not conf_dir.is_symlink():
+                pending.extend(conf_dir.glob("*.conf"))
+            if sites_dir.is_dir() and not sites_dir.is_symlink():
+                pending.extend(sites_dir.iterdir())
     except CutoverError:
         raise
     except OSError as error:
         raise CutoverError("Nginx configuration tree could not be inspected") from error
     inspected = set()
-    for path in files:
+    while pending:
+        path = pathlib.Path(pending.pop())
         try:
             resolved = path.resolve(strict=True)
-            if backup_root in resolved.parents:
-                continue
             file_stat = resolved.stat(follow_symlinks=False)
             if root_resolved not in resolved.parents or not stat.S_ISREG(file_stat.st_mode):
                 raise CutoverError("Nginx configuration tree contains an unsafe entry")
@@ -642,7 +640,8 @@ def verify_no_capture_config(nginx_root):
         if len(raw) > MAX_CONFIG_BYTES or total > 16 * MAX_CONFIG_BYTES:
             raise CutoverError("Nginx configuration tree is too large")
         try:
-            cleaned = strip_comments(raw.decode("utf-8")).lower()
+            source = raw.decode("utf-8")
+            cleaned = strip_comments(source).lower()
         except UnicodeDecodeError as error:
             raise CutoverError("Nginx configuration files must be UTF-8") from error
         unsafe_directive = re.search(
@@ -651,6 +650,32 @@ def verify_no_capture_config(nginx_root):
         )
         if unsafe_directive or any(marker in cleaned for marker in CAPTURE_MARKERS):
             raise CutoverError("Nginx configuration tree still contains mirror or capture directives")
+
+        _, directives = parse_config(source)
+        for directive in directives:
+            tokens = tokenise(directive.text)
+            if not tokens or tokens[0] != "include":
+                continue
+            if len(tokens) != 2:
+                raise CutoverError("Nginx include directive has an unsupported shape")
+            include_value = tokens[1]
+            include_path = pathlib.Path(include_value)
+            if ".." in include_path.parts:
+                raise CutoverError("Nginx include path is unsafe")
+            if include_path.is_absolute():
+                if nginx_root != DEFAULT_NGINX_ROOT:
+                    try:
+                        pattern = nginx_root / include_path.relative_to(DEFAULT_NGINX_ROOT)
+                    except ValueError:
+                        pattern = include_path
+                else:
+                    pattern = include_path
+            else:
+                pattern = nginx_root / include_path
+            matches = [pathlib.Path(value) for value in glob.glob(str(pattern))]
+            if not matches and not glob.has_magic(str(pattern)):
+                raise CutoverError("Nginx included configuration is unavailable")
+            pending.extend(matches)
 
 
 def verify_live_direct_v1(nginx_root, site_path, hostname, *, production):

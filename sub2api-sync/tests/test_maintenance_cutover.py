@@ -709,6 +709,17 @@ class MaintenanceCutoverTests(unittest.TestCase):
             active = snippets / "sub2api-upstream-active.conf"
             active.write_bytes(b"server 127.0.0.1:8080;\n")
             active.chmod(0o644)
+            for name, source in (
+                ("cloudflare-real-ip.conf", ROOT / "nginx/snippets/cloudflare-real-ip.conf"),
+                ("cloudflare-only.conf", ROOT / "nginx/snippets/cloudflare-only.conf"),
+                ("sub2api-sync-location.conf", ROOT / "nginx/sub2api-sync-location.conf"),
+            ):
+                target = snippets / name
+                target.write_bytes(source.read_bytes())
+                target.chmod(0o644)
+            aop = snippets / "sub2api-aop-active.conf"
+            aop.write_text("# test fixture\n", encoding="ascii")
+            aop.chmod(0o644)
             site = sites / "sub2api.conf"
             site.write_text((ROOT / "nginx/sub2api.conf").read_text(), encoding="utf-8")
             site.chmod(0o644)
