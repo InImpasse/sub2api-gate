@@ -1,17 +1,43 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "sub2api-allow-ip",
-  "main": "src/index.js",
-  "compatibility_date": "2026-05-08",
+  "main": "src/worker-entry.js",
+  "compatibility_date": "2026-07-19",
+  "compatibility_flags": ["nodejs_compat"],
   "workers_dev": false,
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 1
+    "head_sampling_rate": 0.1,
+    "logs": {
+      "invocation_logs": false
+    }
   },
   "kv_namespaces": [
     {
       "binding": "INVITE_STORE",
       "id": "YOUR_KV_NAMESPACE_ID"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "AUTH_RATE_LIMITER",
+        "class_name": "AuthRateLimiter"
+      },
+      {
+        "name": "AUTH_STATE",
+        "class_name": "AuthState"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["AuthRateLimiter"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["AuthState"]
     }
   ],
   "routes": [
@@ -26,12 +52,19 @@
     ]
   },
   "vars": {
+    // Public Worker/Sub2API hostnames only. Provider hosts must never appear here.
     "ALLOWED_HOSTNAMES": "api.example.com",
+    // External API provider hostnames only. Fill this in wrangler.private.jsonc.
+    // It must remain disjoint from ALLOWED_HOSTNAMES.
+    "PROVIDER_ALLOWED_HOSTNAMES": "",
     "ACCOUNT_ID": "YOUR_CLOUDFLARE_ACCOUNT_ID",
     "IP_LIST_ID": "YOUR_CLOUDFLARE_IP_LIST_ID",
     "TURNSTILE_SITE_KEY": "YOUR_TURNSTILE_SITE_KEY",
     "ADMIN_USERNAME": "admin",
     "SUB2API_DEFAULT_BASE_URL": "https://api.example.com/v1",
-    "SUB2API_SYNC_URL": "https://api.example.com/_sub2api-sync/provision"
+    "SUB2API_SYNC_URL": "https://api.example.com/_sub2api-sync/provision",
+    // Optional. Both values must remain empty unless third-party GeoIP is explicitly approved.
+    "GEOIP_LOOKUP_URL": "",
+    "GEOIP_ALLOWED_HOSTNAMES": ""
   }
 }

@@ -1,18 +1,109 @@
+import { renderInviteSummary } from "./invite-summary.js";
+import { cloudflareApiFetch, isCloudflareIdentifier, listCloudflareItems, readCloudflareJson, waitForCloudflareOperation } from "./cloudflare-client.js";
+import { renderUsageInspectorBody, sanitizeUsageInspectorData } from "./usage-inspector.js";
+import { fetchWithTimeout, isRequestBodyTooLarge, parseBoundedFormData, readJsonWithLimit } from "./request-security.js";
+import { consumeAuthAttempt, resetAuthAttempts } from "./auth-rate-limiter.js";
+import {
+  createAuthStateStore,
+  isAuthStateBindingConfigured,
+  MAX_INVITE_CREDENTIAL_MIGRATION_BATCH,
+  MAX_RECORD_LEASE_MS,
+} from "./auth-state.js";
+import {
+  CLOUDFLARE_MUTATION_RETRY_MS,
+  cloudflareMutationIdFromError,
+  createManagedCloudflareListItems,
+  findCloudflareMutationCandidates,
+  resolveCloudflareMutation,
+} from "./cloudflare-mutation.js";
+import { parseApprovedHostnames, parseApprovedHttpsUrl } from "./url-security.js";
+import {
+  accessKeyHmac,
+  base64UrlDecode,
+  issueInviteAccessCredential,
+  matchesInviteAccess,
+  passwordHashFingerprint,
+  protectInviteCredentials,
+  revealInviteCredentials,
+  sanitizeInviteForTrash,
+  timingSafeTextEqual as timingSafeEqual,
+  verifyPbkdf2Password,
+} from "./credential-security.js";
+
 const ADMIN_PATH = "/allow-ip/admin";
 const COOKIE_NAME = "sub2api_allow_admin";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
 const INVITES_KEY = "invites";
 const TRASH_KEY = "trash";
+const INVITES_REVISION = Symbol("invitesRevision");
+const TRASH_REVISION = Symbol("trashRevision");
+const CLOUDFLARE_MUTATION_IDS = Symbol("cloudflareMutationIds");
 const DEFAULT_IP_TTL_DAYS = 365;
-const LOGIN_ATTEMPT_LIMIT = 5;
-const LOGIN_ATTEMPT_TTL_SECONDS = 15 * 60;
+const SUB2API_SYNC_TIMEOUT_MS = 5000;
+const SUB2API_SYNC_DEFAULT_RESPONSE_MAX_BYTES = 16 * 1024;
+const SUB2API_SYNC_ACCOUNT_RESPONSE_MAX_BYTES = 128 * 1024;
+const SUB2API_SYNC_MAX_TOKENS = 100;
+const SUB2API_SYNC_MAX_AUTH_TOKEN_BYTES = 4 * 1024;
+const SUB2API_SYNC_MAX_AUTH_USER_FIELD_BYTES = 512;
+const SUB2API_SYNC_MAX_AUTH_USER_BYTES = 8 * 1024;
+const SYNC_AUTH_KEYS = new Set(["access_token", "refresh_token", "expires_in", "user"]);
+const SYNC_AUTH_USER_KEYS = new Set([
+  "id",
+  "username",
+  "name",
+  "email",
+  "role",
+  "status",
+  "balance",
+  "avatar",
+  "created_at",
+  "updated_at",
+]);
+const GEOIP_TIMEOUT_MS = 5000;
+const AUTH_STATE_RECONCILE_ATTEMPTS = 3;
+const ADMIN_PAGE_SIZE = 25;
+const ADMIN_IP_GROUP_PAGE_SIZE = 20;
+const MAX_ADMIN_INVITE_PAGE = 400;
+const MAX_ADMIN_TRASH_PAGE = 800;
+const MAX_ADMIN_IP_GROUP_PAGE = 400;
+const ADMIN_RECORD_PAYLOAD_MAX_BYTES = 256 * 1024;
+const ADMIN_LIST_HTML_MAX_BYTES = 256 * 1024;
+const ADMIN_DETAIL_HTML_MAX_BYTES = 512 * 1024;
+const ISSUED_ACCESS_KEYS_HTML_MAX_BYTES = 256 * 1024;
+const MANAGED_CLOUDFLARE_COMMENT = /^sub2api ref [a-f0-9]{32}$/;
+const CLOUDFLARE_LIST_ITEM_ID = /^[A-Za-z0-9_-]{1,128}$/;
+export const CLOUDFLARE_DELETE_BATCH_SIZE = 1000;
+export const IP_RECORDS_BUSY_CODE = "ip_records_busy";
+const EXISTING_CREDENTIAL_MARKER_PREFIX = "@existing-credential:v1:";
+const STEP_UP_ACTIONS = new Set([
+  "migrate_invite_credentials",
+  "finalize_legacy_auth_state_cleanup",
+  "rotate_access_key",
+  "restore_uuid",
+  "reset_sub2api_password",
+  "update_invite",
+  "purge_uuid",
+  "purge_ip_group",
+]);
 const SUB2API_FAVICON = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA0MSA0MSI+PHBhdGggZD0iTTM3LjUzMjQgMTYuODcwN0MzNy45ODA4IDE1LjUyNDEgMzguMTM2MyAxNC4wOTc0IDM3Ljk4ODYgMTIuNjg1OUMzNy44NDA5IDExLjI3NDQgMzcuMzkzNCA5LjkxMDc2IDM2LjY3NiA4LjY4NjIyQzM1LjYxMjYgNi44MzQwNCAzMy45ODgyIDUuMzY3NiAzMi4wMzczIDQuNDk4NUMzMC4wODY0IDMuNjI5NDEgMjcuOTA5OCAzLjQwMjU5IDI1LjgyMTUgMy44NTA3OEMyNC44Nzk2IDIuNzg5MyAyMy43MjE5IDEuOTQxMjUgMjIuNDI1NyAxLjM2MzQxQzIxLjEyOTUgMC43ODU1NzUgMTkuNzI0OSAwLjQ5MTI2OSAxOC4zMDU4IDAuNTAwMTk3QzE2LjE3MDggMC40OTUwNDQgMTQuMDg5MyAxLjE2ODAzIDEyLjM2MTQgMi40MjIxNEMxMC42MzM1IDMuNjc2MjQgOS4zNDg1MyA1LjQ0NjY2IDguNjkxNyA3LjQ3ODE1QzcuMzAwODUgNy43NjI4NiA1Ljk4Njg2IDguMzQxNCA0LjgzNzcgOS4xNzUwNUMzLjY4ODU0IDEwLjAwODcgMi43MzA3MyAxMS4wNzgyIDIuMDI4MzkgMTIuMzEyQzAuOTU2NDY0IDE0LjE1OTEgMC40OTg5MDUgMTYuMjk4OCAwLjcyMTY5OCAxOC40MjI4QzAuOTQ0NDkyIDIwLjU0NjcgMS44MzYxMiAyMi41NDQ5IDMuMjY4IDI0LjEyOTNDMi44MTk2NiAyNS40NzU5IDIuNjY0MTMgMjYuOTAyNiAyLjgxMTgyIDI4LjMxNDFDMi45NTk1MSAyOS43MjU2IDMuNDA3MDEgMzEuMDg5MiA0LjEyNDM3IDMyLjMxMzhDNS4xODc5MSAzNC4xNjU5IDYuODEyMyAzNS42MzIyIDguNzYzMjEgMzYuNTAxM0MxMC43MTQxIDM3LjM3MDQgMTIuODkwNyAzNy41OTczIDE0Ljk3ODkgMzcuMTQ5MkMxNS45MjA4IDM4LjIxMDcgMTcuMDc4NiAzOS4wNTg3IDE4LjM3NDcgMzkuNjM2NkMxOS42NzA5IDQwLjIxNDQgMjEuMDc1NSA0MC41MDg3IDIyLjQ5NDYgNDAuNDk5OEMyNC42MzA3IDQwLjUwNTQgMjYuNzEzMyAzOS44MzIxIDI4LjQ0MTggMzguNTc3MkMzMC4xNzA0IDM3LjMyMjMgMzEuNDU1NiAzNS41NTA2IDMyLjExMTkgMzMuNTE3OUMzMy41MDI3IDMzLjIzMzIgMzQuODE2NyAzMi42NTQ3IDM1Ljk2NTkgMzEuODIxQzM3LjExNSAzMC45ODc0IDM4LjA3MjggMjkuOTE3OCAzOC43NzUyIDI4LjY4NEMzOS44NDU4IDI2LjgzNzEgNDAuMzAyMyAyNC42OTc5IDQwLjA3ODkgMjIuNTc0OEMzOS44NTU2IDIwLjQ1MTcgMzguOTYzOSAxOC40NTQ0IDM3LjUzMjQgMTYuODcwN1pNMjIuNDk3OCAzNy44ODQ5QzIwLjc0NDMgMzcuODg3NCAxOS4wNDU5IDM3LjI3MzMgMTcuNjk5NCAzNi4xNTAxQzE3Ljc2MDEgMzYuMTE3IDE3Ljg2NjYgMzYuMDU4NiAxNy45MzYgMzYuMDE2MUwyNS45MDA0IDMxLjQxNTZDMjYuMTAwMyAzMS4zMDE5IDI2LjI2NjMgMzEuMTM3IDI2LjM4MTMgMzAuOTM3OEMyNi40OTY0IDMwLjczODYgMjYuNTU2MyAzMC41MTI0IDI2LjU1NDkgMzAuMjgyNVYxOS4wNTQyTDI5LjkyMTMgMjAuOTk4QzI5LjkzODkgMjEuMDA2OCAyOS45NTQxIDIxLjAxOTggMjkuOTY1NiAyMS4wMzU5QzI5Ljk3NyAyMS4wNTIgMjkuOTg0MiAyMS4wNzA3IDI5Ljk4NjcgMjEuMDkwMlYzMC4zODg5QzI5Ljk4NDIgMzIuMzc1IDI5LjE5NDYgMzQuMjc5MSAyNy43OTA5IDM1LjY4NDFDMjYuMzg3MiAzNy4wODkyIDI0LjQ4MzggMzcuODgwNiAyMi40OTc4IDM3Ljg4NDlaTTYuMzkyMjcgMzEuMDA2NEM1LjUxMzk3IDI5LjQ4ODggNS4xOTc0MiAyNy43MTA3IDUuNDk4MDQgMjUuOTgzMkM1LjU1NzE4IDI2LjAxODcgNS42NjA0OCAyNi4wODE4IDUuNzM0NjEgMjYuMTI0NEwxMy42OTkgMzAuNzI0OEMxMy44OTc1IDMwLjg0MDggMTQuMTIzMyAzMC45MDIgMTQuMzUzMiAzMC45MDJDMTQuNTgzIDMwLjkwMiAxNC44MDg4IDMwLjg0MDggMTUuMDA3MyAzMC43MjQ4TDI0LjczMSAyNS4xMTAzVjI4Ljk5NzlDMjQuNzMyMSAyOS4wMTc3IDI0LjcyODMgMjkuMDM3NiAyNC43MTk5IDI5LjA1NTZDMjQuNzExNSAyOS4wNzM2IDI0LjY5ODggMjkuMDg5MyAyNC42ODI5IDI5LjEwMTJMMTYuNjMxNyAzMy43NDk3QzE0LjkwOTYgMzQuNzQxNiAxMi44NjQzIDM1LjAwOTcgMTAuOTQ0NyAzNC40OTU0QzkuMDI1MDYgMzMuOTgxMSA3LjM4Nzg1IDMyLjcyNjMgNi4zOTIyNyAzMS4wMDY0Wk00LjI5NzA3IDEzLjYxOTRDNS4xNzE1NiAxMi4wOTk4IDYuNTUyNzkgMTAuOTM2NCA4LjE5ODg1IDEwLjMzMjdDOC4xOTg4NSAxMC40MDEzIDguMTk0OTEgMTAuNTIyOCA4LjE5NDkxIDEwLjYwNzFWMTkuODA4QzguMTkzNTEgMjAuMDM3OCA4LjI1MzM0IDIwLjI2MzggOC4zNjgyMyAyMC40NjI5QzguNDgzMTIgMjAuNjYxOSA4LjY0ODkzIDIwLjgyNjcgOC44NDg2MyAyMC45NDA0TDE4LjU3MjMgMjYuNTU0MkwxNS4yMDYgMjguNDk3OUMxNS4xODk0IDI4LjUwODkgMTUuMTcwMyAyOC41MTU1IDE1LjE1MDUgMjguNTE3M0MxNS4xMzA3IDI4LjUxOTEgMTUuMTEwNyAyOC41MTYgMTUuMDkyNCAyOC41MDgyTDcuMDQwNDYgMjMuODU1N0M1LjMyMTM1IDIyLjg2MDEgNC4wNjcxNiAyMS4yMjM1IDMuNTUyODkgMTkuMzA0NkMzLjAzODYyIDE3LjM4NTggMy4zMDYyNCAxNS4zNDEzIDQuMjk3MDcgMTMuNjE5NFpNMzEuOTU1IDIwLjA1NTZMMjIuMjMxMiAxNC40NDExTDI1LjU5NzYgMTIuNDk4MUMyNS42MTQyIDEyLjQ4NzIgMjUuNjMzMyAxMi40ODA1IDI1LjY1MzEgMTIuNDc4N0MyNS42NzI5IDEyLjQ3NjkgMjUuNjkyOCAxMi40ODAxIDI1LjcxMTEgMTIuNDg3OUwzMy43NjMxIDE3LjEzNjRDMzQuOTk2NyAxNy44NDkgMzYuMDAxNyAxOC44OTgyIDM2LjY2MDYgMjAuMTYxM0MzNy4zMTk0IDIxLjQyNDQgMzcuNjA0NyAyMi44NDkgMzcuNDgzMiAyNC4yNjg0QzM3LjM2MTcgMjUuNjg3OCAzNi44MzgyIDI3LjA0MzIgMzUuOTc0MyAyOC4xNzU5QzM1LjExMDMgMjkuMzA4NiAzMy45NDE1IDMwLjE3MTcgMzIuNjA0NyAzMC42NjQxQzMyLjYwNDcgMzAuNTk0NyAzMi42MDQ3IDMwLjQ3MzMgMzIuNjA0NyAzMC4zODg5VjIxLjE4OEMzMi42MDY2IDIwLjk1ODYgMzIuNTQ3NCAyMC43MzI4IDMyLjQzMzIgMjAuNTMzOEMzMi4zMTkgMjAuMzM0OCAzMi4xNTQgMjAuMTY5OCAzMS45NTUgMjAuMDU1NlpNMzUuMzA1NSAxNS4wMTI4QzM1LjI0NjQgMTQuOTc2NSAzNS4xNDMxIDE0LjkxNDIgMzUuMDY5IDE0Ljg3MTdMMjcuMTA0NSAxMC4yNzEyQzI2LjkwNiAxMC4xNTU0IDI2LjY4MDMgMTAuMDk0MyAyNi40NTA0IDEwLjA5NDNDMjYuMjIwNiAxMC4wOTQzIDI1Ljk5NDggMTAuMTU1NCAyNS43OTYzIDEwLjI3MTJMMTYuMDcyNiAxNS44ODU4VjExLjk5ODJDMTYuMDcxNSAxMS45NzgzIDE2LjA3NTMgMTEuOTU4NSAxNi4wODM3IDExLjk0MDVDMTYuMDkyMSAxMS45MjI1IDE2LjEwNDggMTEuOTA2OCAxNi4xMjA3IDExLjg5NDlMMjQuMTcxOSA3LjI1MDI1QzI1LjQwNTMgNi41MzkwMyAyNi44MTU4IDYuMTkzNzYgMjguMjM4MyA2LjI1NDgyQzI5LjY2MDggNi4zMTU4OSAzMS4wMzY0IDYuNzgwNzcgMzIuMjA0NCA3LjU5NTA4QzMzLjM3MjMgOC40MDkzOSAzNC4yODQyIDkuNTM5NDUgMzQuODMzNCAxMC44NTMxQzM1LjM4MjYgMTIuMTY2NyAzNS41NDY0IDEzLjYwOTUgMzUuMzA1NSAxNS4wMTI4Wk0xNC4yNDI0IDIxLjk0MTlMMTAuODc1MiAxOS45OTgxQzEwLjg1NzYgMTkuOTg5MyAxMC44NDIzIDE5Ljk3NjMgMTAuODMwOSAxOS45NjAyQzEwLjgxOTUgMTkuOTQ0MSAxMC44MTIyIDE5LjkyNTQgMTAuODA5OCAxOS45MDU4VjEwLjYwNzFDMTAuODEwNyA5LjE4Mjk1IDExLjIxNzMgNy43ODg0OCAxMS45ODE5IDYuNTg2OTZDMTIuNzQ2NiA1LjM4NTQ0IDEzLjgzNzcgNC40MjY1OSAxNS4xMjc1IDMuODIyNjRDMTYuNDE3MyAzLjIxODY5IDE3Ljg1MjQgMi45OTQ2NCAxOS4yNjQ5IDMuMTc2N0MyMC42Nzc1IDMuMzU4NzYgMjIuMDA4OSAzLjkzOTQxIDIzLjEwMzQgNC44NTA2N0MyMy4wNDI3IDQuODgzNzkgMjIuOTM3IDQuOTQyMTUgMjIuODY2OCA0Ljk4NDczTDE0LjkwMjQgOS41ODUxN0MxNC43MDI1IDkuNjk4NzggMTQuNTM2NiA5Ljg2MzU2IDE0LjQyMTUgMTAuMDYyNkMxNC4zMDY1IDEwLjI2MTYgMTQuMjQ2NiAxMC40ODc3IDE0LjI0NzkgMTAuNzE3NUwxNC4yNDI0IDIxLjk0MTlaTTE2LjA3MSAxNy45OTkxTDIwLjQwMTggMTUuNDk3OEwyNC43MzI1IDE3Ljk5NzVWMjIuOTk4NUwyMC40MDE4IDI1LjQ5ODNMMTYuMDcxIDIyLjk5ODVWMTcuOTk5MVoiIGZpbGw9IiMxMTEiLz48L3N2Zz4=";
 
 export async function handleAdmin(request, env) {
   try {
     return await handleAdminRequest(request, env);
   } catch (error) {
-    console.error(JSON.stringify({ level: "error", message: "admin_action_failed", error: error.message }));
+    if (isRequestBodyTooLarge(error)) {
+      return html(renderMessage("Request too large", "Form submissions are limited to 32 KiB."), 413);
+    }
+    if (isAuthStateConflict(error)) {
+      return html(
+        renderMessage(
+          "Update conflict",
+          "The admin state changed while this request was being processed. Refresh the page and try again.",
+        ),
+        409,
+      );
+    }
+    console.error(JSON.stringify({ level: "error", message: "admin_action_failed" }));
     const message = isUserFacingAdminError(error)
       ? error.message
       : "The requested admin action could not be completed. Refresh the admin page and try again.";
@@ -33,17 +124,33 @@ async function handleAdminRequest(request, env) {
       return html(renderLogin());
     }
 
-    await refreshInvitesFromSub2Api(env);
-    const invites = await getInvitesWithRecords(env);
-    const trash = await getTrash(env);
-    return html(renderAdmin(invites, trash, session.csrf, request, env));
+    const adminUrl = new URL(request.url);
+    if (adminUrl.pathname === `${ADMIN_PATH}/requests`) {
+      const usage = await listUsageMetadata(env, request);
+      return html(renderUsageInspector(usage, session.csrf, request), 200);
+    }
+
+    if (adminUrl.pathname === `${ADMIN_PATH}/requests/detail`) {
+      const usage = await getUsageMetadataDetail(env, request);
+      return html(renderUsageInspector(usage, session.csrf, request), 200);
+    }
+
+    const dashboard = await getAdminDashboard(env, adminUrl);
+    return html(renderAdmin(
+      dashboard.invites,
+      dashboard.trash,
+      session.csrf,
+      request,
+      env,
+      dashboard,
+    ), 200, dashboard.selectedInvite ? ADMIN_DETAIL_HTML_MAX_BYTES : ADMIN_LIST_HTML_MAX_BYTES);
   }
 
   if (request.method !== "POST") {
     return text("Method not allowed", 405, { allow: "GET, POST" });
   }
 
-  const form = await request.formData();
+  const form = await parseBoundedFormData(request);
   const action = String(form.get("action") || "");
 
   if (action === "login") {
@@ -63,14 +170,57 @@ async function handleAdminRequest(request, env) {
     return redirect(ADMIN_PATH, `${COOKIE_NAME}=; Path=${ADMIN_PATH}; Max-Age=0; HttpOnly; Secure; SameSite=Strict`);
   }
 
+  if (requiresStepUpAction(action)) {
+    const attemptKey = await stepUpAttemptKey(env, session.sessionHash);
+    if (!(await consumeAuthAttempt(env, "totp", attemptKey))) {
+      return html(renderMessage("Too many 2FA attempts", "Try again later."), 429);
+    }
+    await requireStepUpTotp(form, env);
+    await resetAuthAttempts(env, "totp", attemptKey);
+  }
+
   if (action === "create") {
     const uuid = String(form.get("uuid") || "").trim();
     const username = cleanText(form.get("username"), 100);
     const email = cleanText(form.get("email"), 160);
     const remark = cleanText(form.get("remark"), 240);
-    const apiConfigs = parseApiConfigs(String(form.get("api_configs") || ""));
-    await createInvite(env, uuid, { username, email, remark, apiConfigs });
+    const apiConfigs = parseApiConfigs(String(form.get("api_configs") || ""), env);
+    const created = await createInvite(env, uuid, { username, email, remark, apiConfigs });
+    if (created.accessKey) {
+      return html(renderIssuedAccessKeys([{
+        uuid,
+        username,
+        accessKey: created.accessKey,
+      }]), 201);
+    }
     return redirect(ADMIN_PATH);
+  }
+
+  if (action === "migrate_invite_credentials") {
+    return await migrateInviteCredentials(env);
+  }
+
+  if (action === "finalize_legacy_auth_state_cleanup") {
+    await finalizeLegacyAuthStateCleanup(env);
+    return redirect(ADMIN_PATH);
+  }
+
+  if (action === "rotate_access_key") {
+    const uuid = String(form.get("uuid") || "").trim();
+    const issued = await rotateInviteAccessKey(env, uuid);
+    return html(renderIssuedAccessKeys([issued]), 200);
+  }
+
+  if (action === "refresh_sub2api_status") {
+    const uuid = String(form.get("uuid") || "").trim();
+    await refreshInviteFromSub2Api(env, uuid);
+    return redirect(`${ADMIN_PATH}?edit=${encodeURIComponent(uuid)}`);
+  }
+
+  if (action === "reset_sub2api_password") {
+    const uuid = String(form.get("uuid") || "").trim();
+    await resetInviteSub2ApiPassword(env, uuid);
+    return redirect(`${ADMIN_PATH}?edit=${encodeURIComponent(uuid)}`);
   }
 
   if (action === "update_invite") {
@@ -79,7 +229,11 @@ async function handleAdminRequest(request, env) {
     const username = cleanText(form.get("username"), 100);
     const email = cleanText(form.get("email"), 160);
     const remark = cleanText(form.get("remark"), 240);
-    const apiConfigs = parseApiConfigs(String(form.get("api_configs") || ""));
+    const apiConfigs = parseApiConfigs(
+      String(form.get("api_configs") || ""),
+      env,
+      { allowExistingCredentialReferences: true },
+    );
     await updateInvite(env, originalUuid, { uuid, username, email, remark, apiConfigs });
     return redirect(ADMIN_PATH);
   }
@@ -92,8 +246,10 @@ async function handleAdminRequest(request, env) {
 
   if (action === "restore_uuid") {
     const trashId = String(form.get("trash_id") || "").trim();
-    await restoreInviteFromTrash(env, trashId);
-    return redirect(ADMIN_PATH);
+    const restored = await restoreInviteFromTrash(env, trashId);
+    return restored
+      ? html(renderIssuedAccessKeys([restored]), 200)
+      : redirect(ADMIN_PATH);
   }
 
   if (action === "purge_uuid") {
@@ -133,6 +289,18 @@ async function handleAdminRequest(request, env) {
     return redirect(ADMIN_PATH);
   }
 
+  if (action === "add_ip_group") {
+    const uuid = String(form.get("uuid") || "").trim();
+    const ipValue = cleanText(form.get("ip_value"), 160);
+    const expiresAt = parseExpirationInput(
+      String(form.get("expires_at") || ""),
+      String(form.get("expires_in_days") || ""),
+      String(form.get("expiration_mode") || ""),
+    ) || addDaysIso(new Date().toISOString(), DEFAULT_IP_TTL_DAYS);
+    await addManualIpGroup(env, uuid, ipValue, expiresAt);
+    return redirect(ADMIN_PATH);
+  }
+
   return redirect(ADMIN_PATH);
 }
 
@@ -141,22 +309,85 @@ export async function findInvite(env, input) {
     return null;
   }
 
-  if (env.INVITE_STORE) {
-    const invites = await getInvites(env);
-    const match = invites.find((invite) => invite.uuid === input);
-    if (match) {
-      return match;
+  if (isAuthStateBindingConfigured(env)) {
+    const store = createAuthStateStore(env);
+    const candidateHmac = await accessKeyHmac(env.INVITE_ACCESS_HMAC_KEY, input);
+    let invite = await store.findInviteByAccessKeyHmac(candidateHmac);
+    if (!invite && isUuid(input)) {
+      invite = await store.getInvite(input);
     }
+    if (invite && await matchesInviteAccess(
+      invite,
+      input,
+      env.INVITE_ACCESS_HMAC_KEY,
+      new Date(),
+      candidateHmac,
+    )) {
+      return await revealStoredInvite(env, invite);
+    }
+    return null;
   }
 
-  if (env.INVITE_KEYS && (await isValidConfiguredKey(input, env.INVITE_KEYS))) {
-    return { uuid: input, username: "legacy" };
+  if (env.INVITE_STORE) {
+    const invites = await getStoredInvites(env);
+    const candidateHmac = invites.some((invite) => invite.accessKeyHmac)
+      ? await accessKeyHmac(env.INVITE_ACCESS_HMAC_KEY, input)
+      : "";
+    for (const invite of invites) {
+      if (await matchesInviteAccess(
+        invite,
+        input,
+        env.INVITE_ACCESS_HMAC_KEY,
+        new Date(),
+        candidateHmac,
+      )) {
+        return await revealStoredInvite(env, invite);
+      }
+    }
   }
 
   return null;
 }
 
-export async function recordVisitorIp(env, request, invite, result) {
+export async function getInviteByUuid(env, uuid) {
+  if (!env.INVITE_STORE || !isUuid(uuid)) {
+    return null;
+  }
+  if (isAuthStateBindingConfigured(env)) {
+    const invite = await createAuthStateStore(env).getInvite(uuid, { reveal: true });
+    return invite ? sanitizeInviteUrls(env, invite) : null;
+  }
+  const invites = await getStoredInvites(env);
+  const invite = invites.find((item) => item.uuid === uuid);
+  return invite ? await revealStoredInvite(env, invite) : null;
+}
+
+export function sanitizeInviteForPublic(env, invite) {
+  return sanitizeInviteUrls(env, invite);
+}
+
+export async function authorizeVisitorIps(env, request, invite, ips) {
+  try {
+    return await withIpRecordsLease(env, invite?.uuid, async (lease) => {
+      const result = await addVisitorIpsToCloudflareList(env, ips, lease);
+      if (!result.ok) return result;
+      await recordVisitorIp(env, request, invite, result, lease);
+      return result;
+    });
+  } catch (error) {
+    if (String(error?.message || "") !== IP_RECORDS_BUSY_CODE) throw error;
+    return {
+      ok: false,
+      status: 409,
+      errors: [{ code: IP_RECORDS_BUSY_CODE }],
+      messages: [],
+      items: [],
+      mutationIds: [],
+    };
+  }
+}
+
+async function recordVisitorIp(env, request, invite, result, lease) {
   if (!env.INVITE_STORE) {
     return;
   }
@@ -190,11 +421,84 @@ export async function recordVisitorIp(env, request, invite, result) {
 
   const nextGroups = upsertIpGroup(groups, group).slice(0, 50);
 
-  await env.INVITE_STORE.put(recordsKey(invite.uuid), JSON.stringify(nextGroups));
+  try {
+    await putIpRecords(env, invite.uuid, nextGroups, lease);
+  } catch (error) {
+    await compensateCloudflareMutationIds(env, result.mutationIds || [], lease);
+    throw error;
+  }
+  await finalizeCloudflareMutationIds(env, result.mutationIds || []);
+}
+
+async function withIpRecordsLease(env, uuid, callback, existingLease = null) {
+  if (!isUuid(uuid)) throw new Error("Invalid UUID");
+  if (!isAuthStateBindingConfigured(env)) return await callback(null);
+  if (existingLease) {
+    if (existingLease.scope === "all" || (existingLease.scope === "invite" && existingLease.uuid === uuid)) {
+      return await callback(existingLease);
+    }
+    throw new Error("ip_records_lease_scope_invalid");
+  }
+
+  const ownerToken = randomHex(32);
+  const store = createAuthStateStore(env);
+  const claim = await store.claimRecordLease(
+    uuid,
+    ownerToken,
+    Date.now(),
+    MAX_RECORD_LEASE_MS,
+  );
+  if (!claim?.claimed) throw new Error(IP_RECORDS_BUSY_CODE);
+
+  const lease = Object.freeze({ scope: "invite", uuid, ownerToken });
+  try {
+    return await callback(lease);
+  } finally {
+    try {
+      await store.releaseRecordLease(uuid, ownerToken);
+    } catch {
+      console.error(JSON.stringify({ level: "error", message: "ip_records_lease_release_deferred" }));
+    }
+  }
+}
+
+async function withAllIpRecordsLease(env, callback, existingLease = null) {
+  if (!isAuthStateBindingConfigured(env)) return await callback(null);
+  if (existingLease?.scope === "all") return await callback(existingLease);
+
+  const ownerToken = existingLease?.ownerToken || randomHex(32);
+  const store = createAuthStateStore(env);
+  const claim = await store.claimRecordMaintenanceLease(
+    ownerToken,
+    Date.now(),
+    MAX_RECORD_LEASE_MS,
+  );
+  if (!claim?.claimed) throw new Error(IP_RECORDS_BUSY_CODE);
+
+  const lease = Object.freeze({ scope: "all", ownerToken });
+  try {
+    return await callback(lease);
+  } finally {
+    try {
+      await store.releaseRecordMaintenanceLease(ownerToken);
+    } catch {
+      console.error(JSON.stringify({ level: "error", message: "ip_records_maintenance_lease_release_deferred" }));
+    }
+  }
+}
+
+function requireIpRecordsLease(env, uuid, lease) {
+  if (!isAuthStateBindingConfigured(env)) return;
+  if (lease?.scope === "all" || (lease?.scope === "invite" && lease.uuid === uuid)) return;
+  throw new Error("ip_records_lease_required");
 }
 
 export function getInviteApiConfigs(invite, env, request) {
-  const configs = Array.isArray(invite.apiConfigs) ? normalizeApiConfigs(invite.apiConfigs) : [];
+  const configs = Array.isArray(invite.apiConfigs)
+    ? normalizeApiConfigs(invite.apiConfigs)
+      .map((config) => ({ ...config, baseUrl: approvedApiConfigUrl(env, config) }))
+      .filter((config) => config.baseUrl)
+    : [];
   if (configs.length > 0) {
     return configs;
   }
@@ -224,32 +528,35 @@ export async function refreshInviteFromSub2Api(env, uuid) {
     return invite;
   }
 
+  const nextPasswordFingerprint = String(syncResult.passwordHashFingerprint || "") || (
+    syncResult.passwordHash
+      ? await passwordHashFingerprint(env.INVITE_ACCESS_HMAC_KEY, syncResult.passwordHash)
+      : ""
+  );
+  const previousPasswordFingerprint = previousSync.passwordHashFingerprint || (
+    previousSync.passwordHash
+      ? await passwordHashFingerprint(env.INVITE_ACCESS_HMAC_KEY, previousSync.passwordHash)
+      : ""
+  );
+  const passwordChangedExternally = Boolean(
+    nextPasswordFingerprint
+    && previousPasswordFingerprint
+    && nextPasswordFingerprint !== previousPasswordFingerprint
+  );
   invite.sub2apiSync = {
     ...previousSync,
-    ...sub2apiSyncMetadata({
+    ...await sub2apiSyncMetadata(env, {
       ...syncResult,
-      loginPassword: syncResult.passwordHash && previousSync.passwordHash && syncResult.passwordHash !== previousSync.passwordHash
-        ? ""
-        : previousSync.loginPassword,
+      loginPassword: passwordChangedExternally ? "" : previousSync.loginPassword,
     }),
-    passwordHash: String(syncResult.passwordHash || ""),
-    passwordChangedExternally: Boolean(syncResult.passwordHash && previousSync.passwordHash && syncResult.passwordHash !== previousSync.passwordHash),
+    passwordHashFingerprint: nextPasswordFingerprint || previousPasswordFingerprint,
+    passwordChangedExternally,
   };
+  delete invite.sub2apiSync.passwordHash;
   invite.apiConfigs = mergeSub2ApiConfig(env, invite.apiConfigs, syncResult);
   invite.updatedAt = new Date().toISOString();
   await saveInvites(env, invites);
   return invite;
-}
-
-async function refreshInvitesFromSub2Api(env) {
-  const invites = await getInvites(env);
-  for (const invite of invites) {
-    try {
-      await refreshInviteFromSub2Api(env, invite.uuid);
-    } catch (error) {
-      console.error(JSON.stringify({ level: "warn", message: "sub2api_admin_refresh_failed", uuid: invite.uuid, error: error.message }));
-    }
-  }
 }
 
 export async function resetInviteSub2ApiPassword(env, uuid) {
@@ -276,15 +583,24 @@ export async function resetInviteSub2ApiPassword(env, uuid) {
     tokens: desiredSub2ApiTokens(env, invite.apiConfigs),
   });
   invite.apiConfigs = mergeSub2ApiConfig(env, invite.apiConfigs, syncResult);
-  invite.sub2apiSync = sub2apiSyncMetadata(syncResult);
+  invite.sub2apiSync = await sub2apiSyncMetadata(env, syncResult);
   invite.updatedAt = new Date().toISOString();
-  await saveInvites(env, invites);
+  try {
+    await saveInvites(env, invites);
+  } catch (error) {
+    await compensateProvisionConflict(env, invite.uuid, invite);
+    throw error;
+  }
   return invite;
 }
 
 export async function loginInviteToSub2Api(env, invite) {
   const sync = invite.sub2apiSync || {};
   const username = String(sync.username || "");
+  const canonicalUsername = desiredSub2ApiUsername(
+    inviteUsername(invite) || username,
+    invite.uuid,
+  );
   const email = String(sync.email || (username ? `${username}@sub2api.local` : ""));
   const password = String(sync.loginPassword || "");
   if (!email || !password) {
@@ -292,6 +608,8 @@ export async function loginInviteToSub2Api(env, invite) {
   }
   return await callSub2ApiSync(env, "login", {
     uuid: invite.uuid,
+    username: canonicalUsername,
+    sub2apiUserId: safePositiveIdentifier(sync.userId),
     email,
     loginPassword: password,
   });
@@ -301,32 +619,34 @@ async function handleAdminLogin(form, env, request) {
   const username = String(form.get("username") || "").trim();
   const password = String(form.get("password") || "");
   const token = String(form.get("token") || "").replace(/\s+/g, "");
-  const attemptKey = loginAttemptKey(request, username);
-  const attempts = Number(await env.INVITE_STORE.get(attemptKey) || "0");
-  if (attempts >= LOGIN_ATTEMPT_LIMIT) {
+  const attemptKey = await loginAttemptKey(env, request);
+  if (!(await consumeAuthAttempt(env, "admin", attemptKey))) {
     return html(renderLogin("Too many failed sign-in attempts. Try again later."), 429);
   }
 
   const usernameOk = await timingSafeEqual(username, env.ADMIN_USERNAME);
-  const passwordOk = await verifyPassword(password, env.ADMIN_PASSWORD_HASH);
+  const passwordOk = await verifyPbkdf2Password(password, env.ADMIN_PASSWORD_PBKDF2);
   const tokenOk = await verifyTotp(env.ADMIN_TOTP_SECRET, token);
 
   if (!usernameOk || !passwordOk || !tokenOk) {
-    await env.INVITE_STORE.put(attemptKey, String(attempts + 1), { expirationTtl: LOGIN_ATTEMPT_TTL_SECONDS });
     return html(renderLogin("The username, password, or 2FA code is incorrect."), 403);
   }
-  await env.INVITE_STORE.delete(attemptKey);
+  await resetAuthAttempts(env, "admin", attemptKey);
 
   const sessionToken = randomHex(32);
   const sessionHash = await sha256Hex(sessionToken);
   const csrf = randomHex(24);
   const expiresAt = Date.now() + SESSION_TTL_SECONDS * 1000;
 
-  await env.INVITE_STORE.put(
-    sessionKey(sessionHash),
-    JSON.stringify({ csrf, expiresAt }),
-    { expirationTtl: SESSION_TTL_SECONDS },
-  );
+  if (isAuthStateBindingConfigured(env)) {
+    await createAuthStateStore(env).createAdminSession(sessionHash, { csrf, expiresAt });
+  } else {
+    await env.INVITE_STORE.put(
+      sessionKey(sessionHash),
+      JSON.stringify({ csrf, expiresAt }),
+      { expirationTtl: SESSION_TTL_SECONDS },
+    );
+  }
 
   const cookie = [
     `${COOKIE_NAME}=${sessionToken}`,
@@ -348,95 +668,386 @@ async function getAdminSession(request, env) {
   }
 
   const sessionHash = await sha256Hex(token);
+  if (isAuthStateBindingConfigured(env)) {
+    const session = await createAuthStateStore(env).getAdminSession(sessionHash);
+    return session ? { ...session, sessionHash } : null;
+  }
+
   const raw = await env.INVITE_STORE.get(sessionKey(sessionHash));
   if (!raw) {
     return null;
   }
 
   const session = parseJson(raw, null);
-  if (!session || !session.csrf || session.expiresAt < Date.now()) {
+  const expiresAt = Number(session?.expiresAt);
+  if (!session || !session.csrf || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
     await env.INVITE_STORE.delete(sessionKey(sessionHash));
     return null;
   }
 
-  return session;
+  return { ...session, expiresAt, sessionHash };
 }
 
 async function deleteSession(env, request) {
   const cookies = parseCookies(request.headers.get("Cookie") || "");
   const token = cookies[COOKIE_NAME];
   if (token) {
-    await env.INVITE_STORE.delete(sessionKey(await sha256Hex(token)));
+    const sessionHash = await sha256Hex(token);
+    if (isAuthStateBindingConfigured(env)) {
+      await createAuthStateStore(env).deleteAdminSession(sessionHash);
+    } else {
+      await env.INVITE_STORE.delete(sessionKey(sessionHash));
+    }
   }
 }
 
-async function getInvitesWithRecords(env) {
-  const invites = await getInvites(env);
-  const rows = [];
+async function getAdminDashboard(env, adminUrl) {
+  const requestedPage = parseAdminPageNumber(adminUrl.searchParams.get("page"), MAX_ADMIN_INVITE_PAGE);
+  const requestedTrashPage = parseAdminPageNumber(adminUrl.searchParams.get("trashPage"), MAX_ADMIN_TRASH_PAGE);
+  const candidateEditUuid = String(adminUrl.searchParams.get("edit") || "");
+  const editUuid = isUuid(candidateEditUuid) ? candidateEditUuid : "";
+  const candidateDetailUuid = String(adminUrl.searchParams.get("detail") || "");
+  const detailUuid = isUuid(candidateDetailUuid) ? candidateDetailUuid : "";
+  const selectedUuid = editUuid || detailUuid;
+  const requestedIpPage = parseAdminPageNumber(
+    adminUrl.searchParams.get("ipPage"),
+    MAX_ADMIN_IP_GROUP_PAGE,
+  );
 
-  for (const invite of invites) {
-    rows.push({
-      ...invite,
-      records: await getIpRecords(env, invite.uuid),
+  if (isAuthStateBindingConfigured(env)) {
+    const store = createAuthStateStore(env);
+    const authStateStatus = await store.ready();
+    let page = requestedPage;
+    let trashPage = requestedTrashPage;
+    let result = await store.readAdminPage({
+      inviteOffset: (page - 1) * ADMIN_PAGE_SIZE,
+      inviteLimit: ADMIN_PAGE_SIZE,
+      trashOffset: (trashPage - 1) * ADMIN_PAGE_SIZE,
+      trashLimit: ADMIN_PAGE_SIZE,
     });
+    const inviteCount = normalizeAdminTotal(result.inviteCount);
+    const trashCount = normalizeAdminTotal(result.trashCount);
+    page = Math.min(page, adminPageCount(inviteCount));
+    trashPage = Math.min(trashPage, adminPageCount(trashCount));
+    if (page !== requestedPage || trashPage !== requestedTrashPage) {
+      result = await store.readAdminPage({
+        inviteOffset: (page - 1) * ADMIN_PAGE_SIZE,
+        inviteLimit: ADMIN_PAGE_SIZE,
+        trashOffset: (trashPage - 1) * ADMIN_PAGE_SIZE,
+        trashLimit: ADMIN_PAGE_SIZE,
+      });
+    }
+
+    const pageInvites = normalizeStoredInvites(Array.isArray(result.invites) ? result.invites : [])
+      .slice(0, ADMIN_PAGE_SIZE);
+    const invites = pageInvites.map((invite) => summarizeStoredInvite(env, invite));
+    const selectedStoredInvite = selectedUuid
+      ? await store.getInvite(selectedUuid)
+      : null;
+    const selectedInvite = selectedStoredInvite
+      ? await hydrateAdminInvite(env, selectedStoredInvite, editUuid, requestedIpPage)
+      : null;
+    return {
+      invites,
+      trash: (Array.isArray(result.trash) ? result.trash : [])
+        .slice(0, ADMIN_PAGE_SIZE)
+        .map(summarizeAdminTrashItem)
+        .filter(Boolean),
+      inviteCount,
+      trashCount,
+      unmigratedInviteCount: normalizeAdminTotal(result.unmigratedInviteCount),
+      authStateStatus,
+      selectedInvite,
+      page,
+      trashPage,
+    };
   }
 
-  return rows;
+  const [storedInvites, storedTrash] = await Promise.all([getStoredInvites(env), getTrash(env)]);
+  const inviteCount = storedInvites.length;
+  const trashCount = storedTrash.length;
+  const page = Math.min(requestedPage, adminPageCount(inviteCount));
+  const trashPage = Math.min(requestedTrashPage, adminPageCount(trashCount));
+  const pageInvites = storedInvites.slice((page - 1) * ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE);
+  const invites = pageInvites.map((invite) => summarizeStoredInvite(env, invite));
+  const selectedStoredInvite = selectedUuid
+    ? storedInvites.find((invite) => invite.uuid === selectedUuid)
+    : null;
+  const selectedInvite = selectedStoredInvite
+    ? await hydrateAdminInvite(env, selectedStoredInvite, editUuid, requestedIpPage)
+    : null;
+  return {
+    invites,
+    trash: storedTrash
+      .slice((trashPage - 1) * ADMIN_PAGE_SIZE, trashPage * ADMIN_PAGE_SIZE)
+      .map(summarizeAdminTrashItem)
+      .filter(Boolean),
+    inviteCount,
+    trashCount,
+    unmigratedInviteCount: storedInvites.filter((invite) => !invite.accessKeyHmac).length,
+    selectedInvite,
+    page,
+    trashPage,
+  };
+}
+
+async function hydrateAdminInvite(env, storedInvite, _editUuid = "", requestedIpPage = 1) {
+  const invite = summarizeStoredInvite(env, storedInvite);
+  const { records, recordsOversized } = await getAdminIpRecords(env, invite.uuid);
+  const recordCount = records.length;
+  const ipPageCount = Math.max(1, Math.ceil(recordCount / ADMIN_IP_GROUP_PAGE_SIZE));
+  const ipPage = Math.min(requestedIpPage, ipPageCount);
+  const offset = (ipPage - 1) * ADMIN_IP_GROUP_PAGE_SIZE;
+  return {
+    ...invite,
+    records: records.slice(offset, offset + ADMIN_IP_GROUP_PAGE_SIZE),
+    recordsOversized,
+    recordCount,
+    ipPage,
+  };
+}
+
+function parseAdminPageNumber(value, maximum) {
+  const input = String(value || "");
+  if (!/^[1-9][0-9]*$/.test(input)) return 1;
+  const page = Number(input);
+  return Number.isSafeInteger(page) && page <= maximum ? page : 1;
+}
+
+function normalizeAdminTotal(value) {
+  const total = Number(value);
+  return Number.isSafeInteger(total) && total >= 0 ? total : 0;
+}
+
+function adminPageCount(total) {
+  return Math.max(1, Math.ceil(normalizeAdminTotal(total) / ADMIN_PAGE_SIZE));
 }
 
 async function getInvites(env) {
+  const invites = await getStoredInvites(env);
+  const revealed = await Promise.all(invites.map((invite) => revealStoredInvite(env, invite)));
+  return copyCollectionRevision(invites, revealed, INVITES_REVISION);
+}
+
+async function getStoredInvites(env) {
+  if (isAuthStateBindingConfigured(env)) {
+    const result = await createAuthStateStore(env).readInvites();
+    const invites = normalizeStoredInvites(result.items);
+    return attachCollectionRevision(invites, INVITES_REVISION, result.revision);
+  }
+
   const raw = await env.INVITE_STORE.get(INVITES_KEY);
   const invites = parseJson(raw, []);
   if (!Array.isArray(invites)) {
     return [];
   }
 
+  return normalizeStoredInvites(invites);
+}
+
+function normalizeStoredInvites(invites) {
   return invites
     .filter((invite) => invite && invite.uuid)
     .sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")));
 }
 
+async function revealStoredInvite(env, invite) {
+  return sanitizeInviteUrls(
+    env,
+    await revealInviteCredentials(invite, env.CREDENTIAL_ENCRYPTION_KEY),
+  );
+}
+
+function summarizeStoredInvite(env, invite) {
+  const sync = invite?.sub2apiSync || {};
+  const apiConfigs = (Array.isArray(invite?.apiConfigs) ? invite.apiConfigs : [])
+    .map((config) => ({
+      id: boundedRecordText(config?.id, 128),
+      name: boundedRecordText(config?.name, 80),
+      baseUrl: boundedRecordText(approvedApiConfigUrl(env, config), 2048),
+      credentialConfigured: Boolean(config?.apiKeyEncrypted || config?.apiKey),
+    }))
+    .filter((config) => config.baseUrl)
+    .slice(0, 8);
+  const storedApiConfigCount = Number(invite?.apiConfigCount);
+  return {
+    uuid: boundedRecordText(invite?.uuid, 36),
+    username: boundedRecordText(invite?.username, 100),
+    name: boundedRecordText(invite?.name, 100),
+    email: boundedRecordText(invite?.email, 160),
+    remark: boundedRecordText(invite?.remark, 240),
+    createdAt: boundedRecordText(invite?.createdAt, 64),
+    updatedAt: boundedRecordText(invite?.updatedAt, 64),
+    legacyUuidLoginUntil: boundedRecordText(invite?.legacyUuidLoginUntil, 64),
+    accessKeyHmac: invite?.accessKeyHmac ? "configured" : "",
+    credentialVersion: Number(invite?.credentialVersion || 0),
+    accessCredentialVersion: Number(invite?.accessCredentialVersion || 0),
+    apiConfigs,
+    apiConfigCount: Number.isSafeInteger(storedApiConfigCount) && storedApiConfigCount >= 0
+      ? Math.min(storedApiConfigCount, 10_000)
+      : apiConfigs.length,
+    sub2apiSync: {
+      userId: Number(sync.userId || 0),
+      tokenId: Number(sync.tokenId || 0),
+      username: boundedRecordText(sync.username, 100),
+      email: boundedRecordText(sync.email, 160),
+      loginUrl: boundedRecordText(approvedPublicHttpsUrl(env, sync.loginUrl || ""), 2048),
+      syncedAt: boundedRecordText(sync.syncedAt, 64),
+      passwordChangedExternally: Boolean(sync.passwordChangedExternally),
+    },
+  };
+}
+
+function summarizeAdminTrashItem(item) {
+  if (item?.type === "uuid") {
+    const invite = item.invite || {};
+    const storedRecordCount = Number(item.recordCount);
+    return {
+      id: boundedRecordText(item.id, 128),
+      type: "uuid",
+      deletedAt: boundedRecordText(item.deletedAt, 64),
+      invite: {
+        uuid: boundedRecordText(invite.uuid, 36),
+        username: boundedRecordText(invite.username, 100),
+        name: boundedRecordText(invite.name, 100),
+        email: boundedRecordText(invite.email, 160),
+      },
+      recordCount: Number.isSafeInteger(storedRecordCount) && storedRecordCount >= 0
+        ? Math.min(storedRecordCount, 20_000)
+        : Math.min(Array.isArray(item.records) ? item.records.length : 0, 20_000),
+    };
+  }
+  if (item?.type === "ip_group") {
+    const group = item.group || {};
+    const storedIpCount = Number(group.ipCount);
+    return {
+      id: boundedRecordText(item.id, 128),
+      type: "ip_group",
+      uuid: boundedRecordText(item.uuid, 36),
+      deletedAt: boundedRecordText(item.deletedAt, 64),
+      group: {
+        country: boundedRecordText(group.country, 80),
+        region: boundedRecordText(group.region, 120),
+        city: boundedRecordText(group.city, 120),
+        ipCount: Number.isSafeInteger(storedIpCount) && storedIpCount >= 0
+          ? Math.min(storedIpCount, 20_000)
+          : Math.min(Array.isArray(group.ips) ? group.ips.length : 0, 20_000),
+      },
+    };
+  }
+  return null;
+}
+
 async function saveInvites(env, invites) {
-  await env.INVITE_STORE.put(INVITES_KEY, JSON.stringify(invites));
+  if (isAuthStateBindingConfigured(env)) {
+    const revision = requireCollectionRevision(invites, INVITES_REVISION);
+    const result = await createAuthStateStore(env).compareAndSwapInvites(revision, invites);
+    requireAuthStateWrite(result);
+    return result;
+  }
+
+  const protectedInvites = await Promise.all(
+    invites.map((invite) => protectInviteCredentials(
+      invite,
+      env.CREDENTIAL_ENCRYPTION_KEY,
+      env.INVITE_ACCESS_HMAC_KEY,
+    )),
+  );
+  await env.INVITE_STORE.put(INVITES_KEY, JSON.stringify(protectedInvites));
 }
 
 async function getTrash(env) {
+  if (isAuthStateBindingConfigured(env)) {
+    const result = await createAuthStateStore(env).readTrash();
+    const trash = normalizeTrashCollection(result.items);
+    return attachCollectionRevision(trash, TRASH_REVISION, result.revision);
+  }
+
   const raw = await env.INVITE_STORE.get(TRASH_KEY);
   const trash = parseJson(raw, []);
   if (!Array.isArray(trash)) {
     return [];
   }
 
+  return normalizeTrashCollection(trash);
+}
+
+function normalizeTrashCollection(trash) {
   return trash
     .filter((item) => item && item.id && item.type)
     .map(normalizeTrashItem)
+    .filter(Boolean)
     .sort((left, right) => String(right.deletedAt || "").localeCompare(String(left.deletedAt || "")));
 }
 
 async function saveTrash(env, trash) {
+  if (isAuthStateBindingConfigured(env)) {
+    const revision = requireCollectionRevision(trash, TRASH_REVISION);
+    const result = await createAuthStateStore(env).compareAndSwapTrash(revision, trash);
+    requireAuthStateWrite(result);
+    return result;
+  }
   await env.INVITE_STORE.put(TRASH_KEY, JSON.stringify(trash));
+}
+
+function attachCollectionRevision(items, symbol, revision) {
+  if (!Array.isArray(items)) {
+    throw new Error("auth_state_collection_invalid");
+  }
+  const normalizedRevision = Number(revision);
+  if (!Number.isSafeInteger(normalizedRevision) || normalizedRevision < 0) {
+    throw new Error("auth_state_revision_invalid");
+  }
+  Object.defineProperty(items, symbol, {
+    value: normalizedRevision,
+    enumerable: false,
+  });
+  return items;
+}
+
+function copyCollectionRevision(source, target, symbol) {
+  if (!Object.hasOwn(source, symbol)) return target;
+  return attachCollectionRevision(target, symbol, source[symbol]);
+}
+
+function requireCollectionRevision(items, symbol) {
+  const revision = items?.[symbol];
+  if (!Number.isSafeInteger(revision) || revision < 0) {
+    throw new Error("auth_state_revision_required");
+  }
+  return revision;
+}
+
+function requireAuthStateWrite(result) {
+  if (result?.ok === true) return result;
+  throw new Error(result?.conflict ? "auth_state_conflict" : "auth_state_write_failed");
 }
 
 function normalizeTrashItem(item) {
   if (item.type === "uuid") {
     return {
-      ...item,
-      invite: item.invite || {},
+      id: String(item.id || ""),
+      type: "uuid",
+      deletedAt: String(item.deletedAt || ""),
+      invite: {
+        ...sanitizeInviteForTrash(item.invite || {}),
+        deletedAt: String(item.invite?.deletedAt || item.deletedAt || ""),
+      },
       records: Array.isArray(item.records) ? item.records.map(normalizeIpGroup) : [],
-      deletedAt: item.deletedAt || "",
     };
   }
 
   if (item.type === "ip_group") {
     return {
-      ...item,
+      id: String(item.id || ""),
+      type: "ip_group",
       uuid: String(item.uuid || ""),
       group: item.group ? normalizeIpGroup(item.group) : null,
-      deletedAt: item.deletedAt || "",
+      deletedAt: String(item.deletedAt || ""),
     };
   }
 
-  return item;
+  return null;
 }
 
 async function createInvite(env, uuid, data) {
@@ -444,10 +1055,13 @@ async function createInvite(env, uuid, data) {
     throw new Error("Invalid UUID");
   }
 
-  const invites = await getInvites(env);
+  const invites = await getStoredInvites(env);
   const existing = invites.find((invite) => invite.uuid === uuid);
+  if (existing) {
+    throw new Error("UUID already exists");
+  }
   const username = validateInviteUsername(data.username, uuid);
-  assertUniqueInviteUsername(invites, username, existing?.uuid || null);
+  assertUniqueInviteUsername(invites, username, null);
   const now = new Date().toISOString();
   const syncResult = await provisionSub2ApiUser(env, {
     uuid,
@@ -455,69 +1069,209 @@ async function createInvite(env, uuid, data) {
     name: username,
     email: data.email || "",
     remark: data.remark || "",
-    sub2apiUserId: existing?.sub2apiSync?.userId || 0,
-    loginPassword: existing?.sub2apiSync?.loginPassword || "",
+    sub2apiUserId: 0,
+    loginPassword: "",
     tokens: desiredSub2ApiTokens(env, data.apiConfigs),
   });
   const apiConfigs = mergeSub2ApiConfig(env, data.apiConfigs, syncResult);
-  const sub2apiSync = sub2apiSyncMetadata(syncResult);
+  const sub2apiSync = await sub2apiSyncMetadata(env, syncResult);
 
-  if (existing) {
-    existing.username = username;
-    existing.name = username;
-    existing.email = data.email || "";
-    existing.remark = data.remark || "";
-    existing.apiConfigs = apiConfigs;
-    existing.sub2apiSync = sub2apiSync;
-    existing.updatedAt = now;
-  } else {
-    invites.push({
-      uuid,
-      username,
-      name: username,
-      email: data.email || "",
-      remark: data.remark || "",
-      apiConfigs,
-      sub2apiSync,
-      createdAt: now,
-      updatedAt: now,
-    });
+  const issued = await issueInviteAccessCredential({
+    uuid,
+    username,
+    name: username,
+    email: data.email || "",
+    remark: data.remark || "",
+    apiConfigs,
+    sub2apiSync,
+    createdAt: now,
+    updatedAt: now,
+  }, env.INVITE_ACCESS_HMAC_KEY, new Date(now), false);
+  invites.push(issued.invite);
+  try {
+    await saveInvites(env, invites);
+  } catch (error) {
+    await compensateProvisionConflict(env, uuid, issued.invite);
+    throw error;
+  }
+  return issued;
+}
+
+async function migrateInviteCredentials(env, now = new Date()) {
+  const migratedAt = now.getTime();
+  if (!Number.isFinite(migratedAt)) {
+    throw new Error("Invalid credential migration timestamp");
   }
 
+  if (isAuthStateBindingConfigured(env)) {
+    const store = createAuthStateStore(env);
+    const batch = await store.readCredentialMigrationBatch(
+      MAX_INVITE_CREDENTIAL_MIGRATION_BATCH,
+    );
+    const issued = [];
+    const updates = [];
+    for (const invite of batch.items) {
+      const result = await issueInviteAccessCredential(
+        invite,
+        env.INVITE_ACCESS_HMAC_KEY,
+        now,
+        true,
+      );
+      issued.push({
+        uuid: result.invite.uuid,
+        username: inviteUsername(result.invite),
+        accessKey: result.accessKey,
+      });
+      updates.push({
+        uuid: result.invite.uuid,
+        accessKeyHmac: result.invite.accessKeyHmac,
+        expectedAccessCredentialVersion: Number(invite.accessCredentialVersion || 0),
+      });
+    }
+    const response = prepareIssuedAccessKeysResponse(
+      issued,
+      Math.max(0, Number(batch.remainingCount || 0) - issued.length),
+    );
+    if (updates.length > 0) {
+      requireAuthStateWrite(await store.commitCredentialMigrationBatch(
+        batch.revision,
+        updates,
+      ));
+    }
+    return response;
+  }
+
+  const invites = await getStoredInvites(env);
+  const trash = await getTrash(env);
+  const targets = invites
+    .map((invite, index) => ({ invite, index }))
+    .filter(({ invite }) => !invite.accessKeyHmac)
+    .slice(0, MAX_INVITE_CREDENTIAL_MIGRATION_BATCH);
+  const issued = [];
+  for (const { invite, index } of targets) {
+    const result = await issueInviteAccessCredential(
+      invite,
+      env.INVITE_ACCESS_HMAC_KEY,
+      now,
+      true,
+    );
+    invites[index] = result.invite;
+    issued.push({
+      uuid: result.invite.uuid,
+      username: inviteUsername(result.invite),
+      accessKey: result.accessKey,
+    });
+  }
+  const remainingCount = invites.filter((invite) => !invite.accessKeyHmac).length;
+  const response = prepareIssuedAccessKeysResponse(issued, remainingCount);
+
+  // Sanitize legacy trash before persisting any one-time access keys. If the
+  // invite write fails, no generated key has been committed.
+  await saveTrash(env, trash);
+  if (issued.length > 0) {
+    await saveInvites(env, invites);
+  }
+  return response;
+}
+
+async function finalizeLegacyAuthStateCleanup(env, now = Date.now()) {
+  if (!isAuthStateBindingConfigured(env)) {
+    throw new Error("auth_state_binding_required_for_legacy_cleanup");
+  }
+  const store = createAuthStateStore(env);
+  const status = await store.ready();
+  if (status.legacyCleanupComplete === true) return status;
+
+  const collection = await store.readInvites();
+  assertLegacyAuthStateCleanupEligible(collection.items, now);
+  const result = await store.purgeLegacySourceKeys();
+  if (result?.cleaned !== true) {
+    throw new Error(result?.busy ? "auth_state_legacy_cleanup_busy" : "auth_state_legacy_cleanup_failed");
+  }
+  return result;
+}
+
+function assertLegacyAuthStateCleanupEligible(invites, now = Date.now()) {
+  if (!Array.isArray(invites) || !Number.isSafeInteger(Number(now)) || Number(now) < 0) {
+    throw new Error("auth_state_legacy_cleanup_state_invalid");
+  }
+  for (const invite of invites) {
+    if (
+      Number(invite?.credentialVersion || 0) < 2
+      || Number(invite?.accessCredentialVersion || 0) < 1
+      || !/^[a-f0-9]{64}$/.test(String(invite?.accessKeyHmac || ""))
+    ) {
+      throw new Error("auth_state_legacy_cleanup_credentials_incomplete");
+    }
+    const deadlineText = String(invite?.legacyUuidLoginUntil || "");
+    if (!deadlineText) continue;
+    const deadline = Date.parse(deadlineText);
+    if (!Number.isFinite(deadline) || deadline > Number(now)) {
+      throw new Error("auth_state_legacy_cleanup_deadline_active");
+    }
+  }
+}
+
+async function rotateInviteAccessKey(env, uuid) {
+  const invites = await getStoredInvites(env);
+  const index = invites.findIndex((invite) => invite.uuid === uuid);
+  if (index < 0) throw new Error("UUID not found");
+  const result = await issueInviteAccessCredential(
+    invites[index],
+    env.INVITE_ACCESS_HMAC_KEY,
+    new Date(),
+    false,
+  );
+  invites[index] = result.invite;
   await saveInvites(env, invites);
+  return {
+    uuid,
+    username: inviteUsername(result.invite),
+    accessKey: result.accessKey,
+  };
+}
+
+async function requireStepUpTotp(form, env) {
+  const token = String(form.get("step_up_token") || "").replace(/\s+/g, "");
+  if (!(await verifyTotp(env.ADMIN_TOTP_SECRET, token))) {
+    throw new Error("A valid 2FA code is required");
+  }
 }
 
 async function updateInvite(env, originalUuid, data) {
   if (!isUuid(originalUuid) || !isUuid(data.uuid)) {
     throw new Error("Invalid UUID");
   }
+  if (originalUuid !== data.uuid) {
+    throw new Error("UUID is immutable");
+  }
 
-  const invites = await getInvites(env);
-  const invite = invites.find((item) => item.uuid === originalUuid);
-  if (!invite) {
+  const invites = await getStoredInvites(env);
+  const inviteIndex = invites.findIndex((item) => item.uuid === originalUuid);
+  if (inviteIndex < 0) {
     return;
   }
 
   const username = validateInviteUsername(data.username, data.uuid);
-  const uuidChanged = originalUuid !== data.uuid;
-  if (uuidChanged && invites.some((item) => item.uuid === data.uuid)) {
-    throw new Error("UUID already exists");
-  }
   assertUniqueInviteUsername(invites, username, originalUuid);
+  const storedInvite = invites[inviteIndex];
+  const invite = await revealStoredInvite(env, storedInvite);
+  const apiConfigs = resolveExistingCredentialReferences(
+    env,
+    data.apiConfigs,
+    storedInvite,
+    invite,
+  );
 
-  let syncResult = null;
-  if (uuidChanged) {
-    await deprovisionSub2ApiUser(env, invite);
-  }
-  syncResult = await provisionSub2ApiUser(env, {
+  const syncResult = await provisionSub2ApiUser(env, {
     uuid: data.uuid,
     username: desiredSub2ApiUsername(username, data.uuid),
     name: username,
     email: data.email || "",
     remark: data.remark || "",
-    sub2apiUserId: uuidChanged ? 0 : invite.sub2apiSync?.userId || 0,
-    loginPassword: uuidChanged ? "" : invite.sub2apiSync?.loginPassword || "",
-    tokens: desiredSub2ApiTokens(env, data.apiConfigs),
+    sub2apiUserId: invite.sub2apiSync?.userId || 0,
+    loginPassword: invite.sub2apiSync?.loginPassword || "",
+    tokens: desiredSub2ApiTokens(env, apiConfigs),
   });
 
   const now = new Date().toISOString();
@@ -526,30 +1280,34 @@ async function updateInvite(env, originalUuid, data) {
   invite.name = username;
   invite.email = data.email || "";
   invite.remark = data.remark || "";
-  invite.apiConfigs = mergeSub2ApiConfig(env, data.apiConfigs, syncResult);
-  invite.sub2apiSync = sub2apiSyncMetadata(syncResult);
+  invite.apiConfigs = mergeSub2ApiConfig(env, apiConfigs, syncResult);
+  invite.sub2apiSync = await sub2apiSyncMetadata(env, syncResult);
   invite.updatedAt = now;
+  invites[inviteIndex] = invite;
 
-  await saveInvites(env, invites);
-
-  if (uuidChanged) {
-    const records = await env.INVITE_STORE.get(recordsKey(originalUuid));
-    if (records) {
-      await env.INVITE_STORE.put(recordsKey(data.uuid), records);
-    }
-    await env.INVITE_STORE.delete(recordsKey(originalUuid));
+  try {
+    await saveInvites(env, invites);
+  } catch (error) {
+    await compensateProvisionConflict(env, invite.uuid, invite);
+    throw error;
   }
 }
 
 async function deleteInvite(env, uuid) {
-  const invites = await getInvites(env);
+  return await withAllIpRecordsLease(env, async (lease) => {
+    return await deleteInviteWithLease(env, uuid, lease);
+  });
+}
+
+async function deleteInviteWithLease(env, uuid, lease) {
+  const invites = await getStoredInvites(env);
   const invite = invites.find((item) => item.uuid === uuid);
   if (!invite) {
     return;
   }
 
   const groups = await getIpRecords(env, uuid);
-  const protectedKeys = await getReferencedIpKeys(env, { excludeUuid: uuid });
+  const protectedKeys = await getReferencedIpKeys(env, { excludeUuid: uuid }, lease);
   const now = new Date().toISOString();
 
   for (const group of groups) {
@@ -559,30 +1317,56 @@ async function deleteInvite(env, uuid) {
   await deprovisionSub2ApiUser(env, invite);
 
   const trash = await getTrash(env);
-  trash.unshift({
+  const trashItem = {
     id: randomHex(12),
     type: "uuid",
     deletedAt: now,
     invite: {
-      ...invite,
+      ...sanitizeInviteForTrash(invite),
       deletedAt: now,
     },
     records: groups,
-  });
+  };
 
-  await saveTrash(env, trash);
-  await saveInvites(env, invites.filter((invite) => invite.uuid !== uuid));
-  await env.INVITE_STORE.delete(recordsKey(uuid));
+  if (isAuthStateBindingConfigured(env)) {
+    const result = await createAuthStateStore(env).removeInvite(
+      requireCollectionRevision(invites, INVITES_REVISION),
+      requireCollectionRevision(trash, TRASH_REVISION),
+      uuid,
+      trashItem,
+    );
+    if (result?.conflict) {
+      const authoritative = await reconcileAuthoritativeInviteAfterConflict(env, uuid);
+      if (authoritative) {
+        await restoreAuthoritativeIpAccess(env, uuid, lease);
+        throw new Error("auth_state_conflict");
+      }
+    } else {
+      requireAuthStateWrite(result);
+    }
+  } else {
+    trash.unshift(trashItem);
+    await saveTrash(env, trash);
+    await saveInvites(env, invites.filter((candidate) => candidate.uuid !== uuid));
+  }
+  await deleteIpRecords(env, uuid, lease);
 }
 
-async function restoreInviteFromTrash(env, trashId) {
+async function restoreInviteFromTrash(env, trashId, lease = null) {
   const trash = await getTrash(env);
   const item = trash.find((entry) => entry.id === trashId && entry.type === "uuid");
   if (!item || !item.invite || !isUuid(item.invite.uuid)) {
     return;
   }
+  if (!lease) {
+    return await withIpRecordsLease(
+      env,
+      item.invite.uuid,
+      async (claimedLease) => await restoreInviteFromTrash(env, trashId, claimedLease),
+    );
+  }
 
-  const invites = await getInvites(env);
+  const invites = await getStoredInvites(env);
   if (invites.some((invite) => invite.uuid === item.invite.uuid)) {
     throw new Error("UUID already exists");
   }
@@ -604,46 +1388,230 @@ async function restoreInviteFromTrash(env, trashId) {
   invite.username = username;
   invite.name = username;
   invite.apiConfigs = mergeSub2ApiConfig(env, invite.apiConfigs, syncResult);
-  invite.sub2apiSync = sub2apiSyncMetadata(syncResult);
+  invite.sub2apiSync = await sub2apiSyncMetadata(env, syncResult);
   invite.updatedAt = new Date().toISOString();
   delete invite.deletedAt;
 
+  let previousRecordsRaw = null;
+  let previousRecordsLoaded = false;
   const restoredGroups = [];
-  for (const group of item.records || []) {
-    restoredGroups.push(await restoreCloudflareListItems(env, group, invite.uuid));
+  let issued;
+  try {
+    previousRecordsRaw = await getRawIpRecords(env, invite.uuid);
+    previousRecordsLoaded = true;
+    for (const group of item.records || []) {
+      restoredGroups.push(await restoreCloudflareListItems(env, group, invite.uuid, lease));
+    }
+
+    issued = await issueInviteAccessCredential(
+      invite,
+      env.INVITE_ACCESS_HMAC_KEY,
+      new Date(),
+      false,
+    );
+    await putIpRecords(env, invite.uuid, restoredGroups, lease);
+
+    if (isAuthStateBindingConfigured(env)) {
+      const result = await createAuthStateStore(env).restoreInvite(
+        requireCollectionRevision(invites, INVITES_REVISION),
+        requireCollectionRevision(trash, TRASH_REVISION),
+        trashId,
+        issued.invite,
+      );
+      requireAuthStateWrite(result);
+    } else {
+      invites.push(issued.invite);
+      await saveInvites(env, invites);
+      await saveTrash(env, trash.filter((entry) => entry.id !== trashId));
+    }
+  } catch (error) {
+    if (issued && !isAuthStateConflict(error) && isAuthStateBindingConfigured(env)) {
+      try {
+        const authoritative = await getInviteByUuid(env, invite.uuid);
+        if (authoritative?.accessKeyHmac === issued.invite.accessKeyHmac) {
+          await putIpRecords(env, invite.uuid, restoredGroups, lease);
+          await finalizeCloudflareMutationIds(
+            env,
+            cloudflareMutationIdsFromGroups(restoredGroups),
+          );
+          return {
+            uuid: issued.invite.uuid,
+            username: inviteUsername(issued.invite),
+            accessKey: issued.accessKey,
+          };
+        }
+      } catch {
+        // Continue into the fail-closed compensation path below.
+      }
+    }
+
+    let compensationFailed = false;
+    if (previousRecordsLoaded) {
+      try {
+        await restoreRawIpRecords(env, invite.uuid, previousRecordsRaw, lease);
+      } catch {
+        compensationFailed = true;
+      }
+    }
+
+    let authoritative = null;
+    if (isAuthStateBindingConfigured(env)) {
+      try {
+        authoritative = await reconcileAuthoritativeInviteAfterConflict(env, invite.uuid);
+      } catch {
+        compensationFailed = true;
+      }
+    }
+    try {
+      if (authoritative) {
+        await rollbackRestoredIpAccess(env, restoredGroups, lease);
+        await restoreAuthoritativeIpAccess(env, invite.uuid, lease);
+      } else {
+        await rollbackRestoredExternalState(env, issued?.invite || invite, restoredGroups, lease);
+      }
+    } catch {
+      compensationFailed = true;
+    }
+    if (compensationFailed) {
+      console.error(JSON.stringify({ level: "error", message: "auth_state_compensation_failed" }));
+      throw new Error("auth_state_compensation_failed");
+    }
+    throw error;
   }
 
-  invites.push(invite);
-  await saveInvites(env, invites);
-  if (restoredGroups.length) {
-    await env.INVITE_STORE.put(recordsKey(invite.uuid), JSON.stringify(restoredGroups));
+  await finalizeCloudflareMutationIds(env, cloudflareMutationIdsFromGroups(restoredGroups));
+  return {
+    uuid: issued.invite.uuid,
+    username: inviteUsername(issued.invite),
+    accessKey: issued.accessKey,
+  };
+}
+
+async function compensateProvisionConflict(env, uuid, provisionalInvite) {
+  try {
+    const authoritative = await reconcileAuthoritativeInviteAfterConflict(env, uuid);
+    if (!authoritative) {
+      await deprovisionSub2ApiUser(env, provisionalInvite);
+    }
+    return authoritative;
+  } catch {
+    console.error(JSON.stringify({ level: "error", message: "auth_state_compensation_failed" }));
+    throw new Error("auth_state_compensation_failed");
   }
-  await saveTrash(env, trash.filter((entry) => entry.id !== trashId));
+}
+
+async function reconcileAuthoritativeInviteAfterConflict(env, uuid) {
+  for (let attempt = 0; attempt < AUTH_STATE_RECONCILE_ATTEMPTS; attempt += 1) {
+    const invites = await getInvites(env);
+    const invite = invites.find((item) => item.uuid === uuid);
+    if (!invite) return null;
+
+    const sync = invite.sub2apiSync || {};
+    const loginPassword = String(sync.loginPassword || "");
+    const syncResult = await provisionSub2ApiUser(env, {
+      uuid: invite.uuid,
+      username: desiredSub2ApiUsername(inviteUsername(invite), invite.uuid),
+      name: inviteUsername(invite) || invite.uuid,
+      email: invite.email || "",
+      remark: invite.remark || "",
+      sub2apiUserId: sync.userId || 0,
+      loginPassword,
+      resetLoginPassword: loginPassword.length >= 8 && loginPassword.length <= 64,
+      tokens: desiredSub2ApiTokens(env, invite.apiConfigs),
+    });
+
+    invite.apiConfigs = mergeSub2ApiConfig(env, invite.apiConfigs, syncResult);
+    invite.sub2apiSync = await sub2apiSyncMetadata(env, syncResult);
+    invite.updatedAt = new Date().toISOString();
+    try {
+      await saveInvites(env, invites);
+      return invite;
+    } catch (error) {
+      if (!isAuthStateConflict(error)) throw error;
+    }
+  }
+  throw new Error("auth_state_compensation_failed");
+}
+
+async function restoreAuthoritativeIpAccess(env, uuid, lease = null) {
+  if (!lease) {
+    return await withIpRecordsLease(
+      env,
+      uuid,
+      async (claimedLease) => await restoreAuthoritativeIpAccess(env, uuid, claimedLease),
+    );
+  }
+  const groups = await getIpRecords(env, uuid);
+  const restoredGroups = [];
+  for (const group of groups) {
+    restoredGroups.push(await restoreCloudflareListItems(env, group, uuid, lease));
+  }
+  const mutationIds = cloudflareMutationIdsFromGroups(restoredGroups);
+  try {
+    await putIpRecords(env, uuid, restoredGroups, lease);
+  } catch (error) {
+    await compensateCloudflareMutationIds(env, mutationIds, lease);
+    throw error;
+  }
+  await finalizeCloudflareMutationIds(env, mutationIds);
+}
+
+async function rollbackRestoredExternalState(env, provisionalInvite, restoredGroups, lease = null) {
+  let failed = false;
+  try {
+    await rollbackRestoredIpAccess(env, restoredGroups, lease);
+  } catch {
+    failed = true;
+  }
+
+  try {
+    await deprovisionSub2ApiUser(env, provisionalInvite);
+  } catch {
+    failed = true;
+  }
+
+  if (failed) throw new Error("auth_state_compensation_failed");
+}
+
+async function rollbackRestoredIpAccess(env, restoredGroups, lease = null) {
+  await compensateCloudflareMutationIds(env, cloudflareMutationIdsFromGroups(restoredGroups), lease);
 }
 
 async function purgeInviteTrash(env, trashId) {
+  return await withAllIpRecordsLease(env, async (lease) => {
+    return await purgeInviteTrashWithLease(env, trashId, lease);
+  });
+}
+
+async function purgeInviteTrashWithLease(env, trashId, lease) {
   const trash = await getTrash(env);
   const item = trash.find((entry) => entry.id === trashId && entry.type === "uuid");
   if (!item) {
     return;
   }
 
-  const protectedKeys = await getReferencedIpKeys(env);
+  const protectedKeys = await getReferencedIpKeys(env, {}, lease);
   for (const group of item.records || []) {
     await deleteCloudflareListItems(env, group.ips || [], protectedKeys);
   }
   await purgeSub2ApiUser(env, item.invite || {});
-  await saveTrash(env, trash.filter((entry) => entry.id !== trashId));
+  await purgeTrashItem(env, trash, trashId);
 }
 
-export async function cleanupExpiredIpGroups(env, now = new Date()) {
+export async function cleanupExpiredIpGroups(env, now = new Date(), lease = null) {
   if (!hasCloudflareListConfig(env) || !env.INVITE_STORE) {
     console.error(JSON.stringify({ level: "error", message: "ip_cleanup_missing_configuration" }));
     return { checked: 0, deleted: 0 };
   }
+  if (!lease) {
+    return await withAllIpRecordsLease(
+      env,
+      async (claimedLease) => await cleanupExpiredIpGroups(env, now, claimedLease),
+    );
+  }
 
-  const invites = await getInvites(env);
-  const activeUuids = new Set(invites.map((invite) => invite.uuid));
+  const reconciliation = await reconcilePendingCloudflareMutations(env, now.getTime(), lease);
+  const invites = await getStoredInvites(env);
   const protectedKeys = new Set();
   const expiredIps = [];
   const updates = [];
@@ -678,28 +1646,53 @@ export async function cleanupExpiredIpGroups(env, now = new Date()) {
   }
 
   await deleteCloudflareListItems(env, expiredIps, protectedKeys);
-  orphaned = await deleteOrphanedCloudflareListItems(env, protectedKeys, activeUuids);
-
   for (const update of updates) {
     if (update.groups.length === 0) {
-      await env.INVITE_STORE.delete(recordsKey(update.uuid));
+      await deleteIpRecords(env, update.uuid, lease);
     } else {
-      await env.INVITE_STORE.put(recordsKey(update.uuid), JSON.stringify(update.groups));
+      await putIpRecords(env, update.uuid, update.groups, lease);
     }
   }
 
-  console.log(JSON.stringify({ level: "info", message: "ip_cleanup_complete", checked, deleted, orphaned }));
-  return { checked, deleted, orphaned };
+  const pendingMutationComments = isAuthStateBindingConfigured(env)
+    ? new Set(await createAuthStateStore(env).listCloudflareMutationComments())
+    : new Set();
+  const currentProtectedKeys = await getReferencedIpKeys(env, {}, lease);
+  orphaned = await deleteOrphanedCloudflareListItems(
+    env,
+    currentProtectedKeys,
+    pendingMutationComments,
+  );
+
+  console.log(JSON.stringify({
+    level: "info",
+    message: "ip_cleanup_complete",
+    checked,
+    deleted,
+    orphaned,
+    reconciled: reconciliation.checked,
+  }));
+  return { checked, deleted, orphaned, reconciled: reconciliation.checked };
 }
 
 async function deleteIpGroup(env, uuid, groupId) {
+  return await withAllIpRecordsLease(env, async (lease) => {
+    return await deleteIpGroupWithLease(env, uuid, groupId, lease);
+  });
+}
+
+async function deleteIpGroupWithLease(env, uuid, groupId, lease) {
   const groups = await getIpRecords(env, uuid);
   const group = groups.find((item) => item.id === groupId);
   if (!group) {
     return;
   }
 
-  const protectedKeys = await getReferencedIpKeys(env, { excludedGroups: new Map([[uuid, new Set([groupId])]]) });
+  const protectedKeys = await getReferencedIpKeys(
+    env,
+    { excludedGroups: new Map([[uuid, new Set([groupId])]]) },
+    lease,
+  );
   await deleteCloudflareListItems(env, group.ips || [], protectedKeys);
   const trash = await getTrash(env);
   trash.unshift({
@@ -710,207 +1703,550 @@ async function deleteIpGroup(env, uuid, groupId) {
     group,
   });
   await saveTrash(env, trash);
-  await env.INVITE_STORE.put(recordsKey(uuid), JSON.stringify(groups.filter((item) => item.id !== groupId)));
+  await putIpRecords(env, uuid, groups.filter((item) => item.id !== groupId), lease);
 }
 
-async function restoreIpGroupFromTrash(env, trashId) {
+async function restoreIpGroupFromTrash(env, trashId, lease = null) {
   const trash = await getTrash(env);
   const item = trash.find((entry) => entry.id === trashId && entry.type === "ip_group");
   if (!item || !isUuid(item.uuid) || !item.group) {
     return;
   }
+  if (!lease) {
+    return await withIpRecordsLease(
+      env,
+      item.uuid,
+      async (claimedLease) => await restoreIpGroupFromTrash(env, trashId, claimedLease),
+    );
+  }
 
-  const invites = await getInvites(env);
+  const invites = await getStoredInvites(env);
   if (!invites.some((invite) => invite.uuid === item.uuid)) {
     throw new Error("UUID must be restored before this IP group");
   }
 
   const groups = await getIpRecords(env, item.uuid);
-  const restoredGroup = await restoreCloudflareListItems(env, item.group, item.uuid);
+  const restoredGroup = await restoreCloudflareListItems(env, item.group, item.uuid, lease);
   const nextGroups = upsertIpGroup(groups, restoredGroup).slice(0, 50);
+  const mutationIds = cloudflareMutationIdsFromGroups([restoredGroup]);
 
-  await env.INVITE_STORE.put(recordsKey(item.uuid), JSON.stringify(nextGroups));
-  await saveTrash(env, trash.filter((entry) => entry.id !== trashId));
+  try {
+    await putIpRecords(env, item.uuid, nextGroups, lease);
+  } catch (error) {
+    await compensateCloudflareMutationIds(env, mutationIds, lease);
+    throw error;
+  }
+  await finalizeCloudflareMutationIds(env, mutationIds);
+  await purgeTrashItem(env, trash, trashId);
 }
 
 async function purgeIpGroupTrash(env, trashId) {
+  return await withAllIpRecordsLease(env, async (lease) => {
+    return await purgeIpGroupTrashWithLease(env, trashId, lease);
+  });
+}
+
+async function purgeIpGroupTrashWithLease(env, trashId, lease) {
   const trash = await getTrash(env);
   const item = trash.find((entry) => entry.id === trashId && entry.type === "ip_group");
   if (!item) {
     return;
   }
 
-  const protectedKeys = await getReferencedIpKeys(env);
+  const protectedKeys = await getReferencedIpKeys(env, {}, lease);
   await deleteCloudflareListItems(env, item.group?.ips || [], protectedKeys);
+  await purgeTrashItem(env, trash, trashId);
+}
+
+async function purgeTrashItem(env, trash, trashId) {
+  if (isAuthStateBindingConfigured(env)) {
+    const result = await createAuthStateStore(env).purgeTrash(
+      requireCollectionRevision(trash, TRASH_REVISION),
+      trashId,
+    );
+    requireAuthStateWrite(result);
+    return;
+  }
   await saveTrash(env, trash.filter((entry) => entry.id !== trashId));
 }
 
-async function updateIpGroupExpiration(env, uuid, groupId, expiresAt) {
+async function updateIpGroupExpiration(env, uuid, groupId, expiresAt, lease = null) {
   if (!expiresAt) {
     throw new Error("Invalid expiration timestamp");
+  }
+  if (!lease) {
+    return await withIpRecordsLease(
+      env,
+      uuid,
+      async (claimedLease) => await updateIpGroupExpiration(env, uuid, groupId, expiresAt, claimedLease),
+    );
   }
 
   const groups = await getIpRecords(env, uuid);
   const nextGroups = groups.map((group) => group.id === groupId ? { ...group, expiresAt } : group);
-  await env.INVITE_STORE.put(recordsKey(uuid), JSON.stringify(nextGroups));
+  await putIpRecords(env, uuid, nextGroups, lease);
 }
 
-async function getIpRecords(env, uuid) {
-  const records = parseJson(await env.INVITE_STORE.get(recordsKey(uuid)), []);
-  return Array.isArray(records) ? records.map(normalizeIpGroup) : [];
-}
-
-function normalizeIpGroup(record) {
-  if (Array.isArray(record.ips)) {
+async function addVisitorIpsToCloudflareList(env, ips, lease = null) {
+  try {
+    const result = await ensureManagedCloudflareEntries(env, (ips || []).map((item) => ({
+      ...item,
+      listValue: item.cidr || item.ip,
+    })), lease);
     return {
-      ...record,
-      id: record.id || randomHex(12),
-      addedAt: record.addedAt || "",
-      updatedAt: record.updatedAt || record.addedAt || "",
-      expiresAt: record.expiresAt || addDaysIso(record.addedAt || new Date().toISOString(), DEFAULT_IP_TTL_DAYS),
-      ips: record.ips.map((item) => ({
-        ...item,
-        listValue: item.listValue || item.cidr || item.ip || "",
-      })),
+      ok: true,
+      status: 200,
+      errors: [],
+      messages: [],
+      items: result.items,
+      mutationIds: result.mutationIds,
+    };
+  } catch {
+    return {
+      ok: false,
+      status: 502,
+      errors: [{ code: "cloudflare_list_mutation_failed" }],
+      messages: [],
+      items: [],
+      mutationIds: [],
     };
   }
-
-  const cidr = record.cidr || (record.ip && record.ip.includes(":") ? `${record.ip}/128` : ipv4Cidr24(record.ip || ""));
-  return {
-    id: record.id || randomHex(12),
-    addedAt: record.addedAt || "",
-    updatedAt: record.updatedAt || record.addedAt || "",
-    expiresAt: record.expiresAt || addDaysIso(record.addedAt || new Date().toISOString(), DEFAULT_IP_TTL_DAYS),
-    country: stringOrEmpty(record.country),
-    region: stringOrEmpty(record.region),
-    city: stringOrEmpty(record.city),
-    timezone: stringOrEmpty(record.timezone),
-    colo: stringOrEmpty(record.colo),
-    asn: record.asn || "",
-    asOrganization: stringOrEmpty(record.asOrganization),
-    ips: record.ip ? [{
-      ip: record.ip,
-      version: record.ip.includes(":") ? "IPv6" : "IPv4",
-      cidr,
-      listValue: cidr,
-      listItemId: record.listItemId || "",
-    }] : [],
-  };
 }
 
-async function deleteCloudflareListItems(env, ips, protectedKeys = new Set()) {
-  const ids = new Set();
-
-  for (const item of ips) {
-    if (isIpReferenced(protectedKeys, item)) {
-      continue;
-    }
-
-    if (item.listItemId) {
-      ids.add(item.listItemId);
-      continue;
-    }
-
-    const listItem = await findCloudflareListItem(env, item.listValue || item.cidr || item.ip);
-    if (listItem && listItem.id) {
-      ids.add(listItem.id);
-    }
-  }
-
-  if (ids.size === 0) {
-    return;
-  }
-
-  const idList = [...ids];
-  await deleteCloudflareListItemIds(env, idList);
-}
-
-async function restoreCloudflareListItems(env, group, uuid) {
+async function ensureManagedCloudflareEntries(env, entries, lease = null) {
   const existingItems = await findCloudflareListItems(env);
-  const existingByIp = new Map(existingItems.map((item) => [item.ip, item]));
-  const ips = (group.ips || []).map((item) => {
-    const listValue = item.listValue || item.cidr || item.ip;
-    const existing = existingByIp.get(listValue) || existingByIp.get(item.ip);
+  const existingByIp = new Map(existingItems.map((item) => [String(item.ip || ""), item]));
+  const normalized = (entries || []).map((entry) => {
+    const listValue = String(entry.listValue || entry.cidr || entry.ip || "");
+    const existing = existingByIp.get(listValue) || existingByIp.get(String(entry.ip || ""));
     return {
-      ...item,
+      ...entry,
       listValue,
-      listItemId: existing ? existing.id || "" : "",
+      listItemId: existing ? String(existing.id || "") : "",
+      alreadyListed: Boolean(existing),
     };
   });
-  const itemsToAdd = ips.filter((item) => item.listValue && !item.listItemId);
+  const valuesToCreate = [...new Set(
+    normalized.filter((item) => item.listValue && !item.listItemId).map((item) => item.listValue),
+  )];
+  if (valuesToCreate.length === 0) return { items: normalized, mutationIds: [] };
 
-  if (itemsToAdd.length === 0) {
-    return { ...group, ips, updatedAt: new Date().toISOString() };
+  let mutation;
+  try {
+    mutation = await createManagedCloudflareListItems(env, valuesToCreate);
+  } catch (error) {
+    const mutationId = cloudflareMutationIdFromError(error);
+    if (mutationId) {
+      try {
+        await compensateCloudflareMutation(env, mutationId, null, Date.now(), lease);
+      } catch {
+        // The bounded ledger retains the marker for scheduled reconciliation.
+      }
+    }
+    // A post-compensation re-list can briefly return a deleted item because
+    // the Rules Lists API is eventually consistent. Never convert an
+    // ambiguous mutation into an unowned "already listed" success.
+    throw new Error("Cloudflare allowlist update failed");
   }
 
-  const response = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${env.ACCOUNT_ID}/rules/lists/${env.IP_LIST_ID}/items?per_page=100`,
-    {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(
-        itemsToAdd.map((item) => ({
-          ip: item.listValue,
-          comment: `sub2api uuid ${uuid} raw ${item.ip} ${new Date().toISOString()}`,
-        })),
-      ),
-    },
-  );
-  const payload = await response.json();
-
-  if (!response.ok || payload.success === false) {
-    console.error(JSON.stringify({ level: "error", message: "list_restore_failed", uuid, groupId: group.id, status: response.status, errors: payload.errors || [] }));
-    throw new Error("Cloudflare list item restore failed");
-  }
-
-  const createdByIp = new Map((Array.isArray(payload.result) ? payload.result : []).map((item) => [item.ip, item]));
+  const createdByIp = new Map(mutation.items.map((item) => [String(item.ip || ""), item]));
   return {
-    ...group,
-    updatedAt: new Date().toISOString(),
-    ips: ips.map((item) => {
+    mutationIds: [mutation.mutationId],
+    items: normalized.map((item) => {
       const created = createdByIp.get(item.listValue);
-      return {
-        ...item,
-        listItemId: created ? created.id || "" : item.listItemId,
-      };
+      return created ? { ...item, listItemId: created.id, alreadyListed: false } : item;
     }),
   };
 }
 
-async function deleteCloudflareListItemIds(env, ids) {
+async function addManualIpGroup(env, uuid, ipValue, expiresAt, lease = null) {
+  if (!isUuid(uuid)) {
+    throw new Error("Invalid UUID");
+  }
+  if (!expiresAt) {
+    throw new Error("Invalid expiration timestamp");
+  }
+  if (!lease) {
+    return await withIpRecordsLease(
+      env,
+      uuid,
+      async (claimedLease) => await addManualIpGroup(env, uuid, ipValue, expiresAt, claimedLease),
+    );
+  }
+
+  const invites = await getStoredInvites(env);
+  if (!invites.some((invite) => invite.uuid === uuid)) {
+    throw new Error("UUID not found");
+  }
+
+  const entries = expandManualIpEntries(ipValue);
+
+  const managed = await ensureManagedCloudflareEntries(env, entries, lease);
+
+  const now = new Date().toISOString();
+  const location = await lookupIpLocation(env, entries[0]?.ip || "", {});
+  const groups = await getIpRecords(env, uuid);
+  const group = {
+    id: randomHex(12),
+    addedAt: now,
+    updatedAt: now,
+    expiresAt,
+    country: location.country,
+    region: location.region,
+    city: location.city,
+    timezone: location.timezone,
+    colo: stringOrEmpty(location.colo),
+    asn: location.asn || "",
+    asOrganization: stringOrEmpty(location.asOrganization),
+    geoSource: location.source,
+    ips: managed.items,
+  };
+
+  const nextGroups = upsertIpGroup(groups, group).slice(0, 50);
+  try {
+    await putIpRecords(env, uuid, nextGroups, lease);
+  } catch (error) {
+    await compensateCloudflareMutationIds(env, managed.mutationIds, lease);
+    throw error;
+  }
+  await finalizeCloudflareMutationIds(env, managed.mutationIds);
+}
+
+export async function getInviteIpRecords(env, uuid) {
+  return await getIpRecords(env, uuid);
+}
+
+async function getIpRecords(env, uuid) {
+  const raw = await getRawIpRecords(env, uuid);
+  const records = parseJson(raw, []);
+  return Array.isArray(records) ? records.map(normalizeIpGroup) : [];
+}
+
+async function getAdminIpRecords(env, uuid) {
+  const raw = await getRawIpRecords(env, uuid);
+  if (typeof raw !== "string" || !raw) return { records: [], recordsOversized: false };
+  if (exceedsUtf8ByteLimit(raw, ADMIN_RECORD_PAYLOAD_MAX_BYTES)) {
+    console.error(JSON.stringify({ level: "error", message: "admin_ip_records_payload_too_large" }));
+    return { records: [], recordsOversized: true };
+  }
+  const records = parseJson(raw, []);
+  return {
+    records: Array.isArray(records) ? records.slice(0, 50).map(normalizeIpGroup) : [],
+    recordsOversized: false,
+  };
+}
+
+async function getRawIpRecords(env, uuid) {
+  return isAuthStateBindingConfigured(env)
+    ? await createAuthStateStore(env).getRecords(uuid)
+    : await env.INVITE_STORE.get(recordsKey(uuid));
+}
+
+async function restoreRawIpRecords(env, uuid, raw, lease) {
+  if (raw === null || raw === undefined || raw === "") {
+    await deleteIpRecords(env, uuid, lease);
+    return;
+  }
+  const records = parseJson(raw, null);
+  if (!Array.isArray(records)) throw new Error("ip_records_restore_invalid");
+  await putIpRecords(env, uuid, records, lease);
+}
+
+function exceedsUtf8ByteLimit(value, limit) {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x7f) bytes += 1;
+    else if (code <= 0x7ff) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff
+      && index + 1 < value.length
+      && value.charCodeAt(index + 1) >= 0xdc00
+      && value.charCodeAt(index + 1) <= 0xdfff) {
+      bytes += 4;
+      index += 1;
+    } else bytes += 3;
+    if (bytes > limit) return true;
+  }
+  return false;
+}
+
+async function putIpRecords(env, uuid, records, lease) {
+  requireIpRecordsLease(env, uuid, lease);
+  if (isAuthStateBindingConfigured(env)) {
+    await createAuthStateStore(env).putRecords(uuid, records);
+    return;
+  }
+  await env.INVITE_STORE.put(recordsKey(uuid), JSON.stringify(records));
+}
+
+async function deleteIpRecords(env, uuid, lease) {
+  requireIpRecordsLease(env, uuid, lease);
+  if (isAuthStateBindingConfigured(env)) {
+    await createAuthStateStore(env).deleteRecords(uuid);
+    return;
+  }
+  await env.INVITE_STORE.delete(recordsKey(uuid));
+}
+
+function normalizeIpGroup(record) {
+  const source = record && typeof record === "object" ? record : {};
+  if (Array.isArray(source.ips)) {
+    return {
+      id: boundedRecordText(source.id, 64) || randomHex(12),
+      addedAt: boundedRecordText(source.addedAt, 64),
+      updatedAt: boundedRecordText(source.updatedAt || source.addedAt, 64),
+      expiresAt: boundedRecordText(source.expiresAt, 64)
+        || addDaysIso(source.addedAt || new Date().toISOString(), DEFAULT_IP_TTL_DAYS),
+      country: boundedRecordText(source.country, 80),
+      region: boundedRecordText(source.region, 120),
+      city: boundedRecordText(source.city, 120),
+      timezone: boundedRecordText(source.timezone, 80),
+      colo: boundedRecordText(source.colo, 32),
+      asn: boundedRecordText(source.asn, 32),
+      asOrganization: boundedRecordText(source.asOrganization, 200),
+      geoSource: boundedRecordText(source.geoSource, 32),
+      ips: source.ips.map(normalizeIpItem).filter((item) => item.ip || item.listValue),
+    };
+  }
+
+  const ip = boundedRecordText(source.ip, 160);
+  const cidr = boundedRecordText(source.cidr, 180)
+    || (ip ? (ip.includes(":") ? `${ip}/128` : ipv4Cidr24(ip)) : "");
+  return {
+    id: boundedRecordText(source.id, 64) || randomHex(12),
+    addedAt: boundedRecordText(source.addedAt, 64),
+    updatedAt: boundedRecordText(source.updatedAt || source.addedAt, 64),
+    expiresAt: boundedRecordText(source.expiresAt, 64)
+      || addDaysIso(source.addedAt || new Date().toISOString(), DEFAULT_IP_TTL_DAYS),
+    country: boundedRecordText(source.country, 80),
+    region: boundedRecordText(source.region, 120),
+    city: boundedRecordText(source.city, 120),
+    timezone: boundedRecordText(source.timezone, 80),
+    colo: boundedRecordText(source.colo, 32),
+    asn: boundedRecordText(source.asn, 32),
+    asOrganization: boundedRecordText(source.asOrganization, 200),
+    geoSource: boundedRecordText(source.geoSource, 32),
+    ips: ip ? [{
+      ip,
+      version: ip.includes(":") ? "IPv6" : "IPv4",
+      cidr,
+      listValue: cidr,
+      listItemId: boundedRecordText(source.listItemId, 128),
+      alreadyListed: Boolean(source.alreadyListed),
+    }] : [],
+  };
+}
+
+function normalizeIpItem(item) {
+  const source = item && typeof item === "object" ? item : {};
+  const ip = boundedRecordText(source.ip, 160);
+  const cidr = boundedRecordText(source.cidr, 180);
+  return {
+    ip,
+    version: boundedRecordText(source.version, 8),
+    cidr,
+    listValue: boundedRecordText(source.listValue || cidr || ip, 180),
+    listItemId: boundedRecordText(source.listItemId, 128),
+    alreadyListed: Boolean(source.alreadyListed),
+  };
+}
+
+function boundedRecordText(value, maximum) {
+  return typeof value === "string" ? value.slice(0, maximum) : "";
+}
+
+async function deleteCloudflareListItems(env, ips, protectedKeys = new Set()) {
+  const currentItems = await findCloudflareListItems(env);
+  const ids = resolveCurrentCloudflareDeleteIds(ips, currentItems, protectedKeys);
   if (ids.length === 0) {
     return;
   }
+  await deleteCloudflareListItemIds(env, ids);
+}
 
-  const response = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${env.ACCOUNT_ID}/rules/lists/${env.IP_LIST_ID}/items?per_page=100`,
-    {
-      method: "DELETE",
-      headers: {
-        authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ items: ids.map((id) => ({ id })) }),
-    },
+function resolveCurrentCloudflareDeleteIds(ips, currentItems, protectedKeys = new Set()) {
+  const currentByValue = new Map(
+    (currentItems || []).map((item) => [String(item.ip || ""), String(item.id || "")]),
   );
-  const payload = await response.json();
+  const ids = new Set();
+  for (const item of ips || []) {
+    if (isIpReferenced(protectedKeys, item)) continue;
+    const value = String(item.listValue || item.cidr || item.ip || "");
+    const currentId = currentByValue.get(value);
+    if (currentId) ids.add(currentId);
+  }
+  return [...ids];
+}
 
-  if (!response.ok || payload.success === false) {
-    console.error(JSON.stringify({ level: "error", message: "list_delete_failed", ids, status: response.status, errors: payload.errors || [] }));
-    throw new Error("Cloudflare list item delete failed");
+async function restoreCloudflareListItems(env, group, uuid, lease = null) {
+  void uuid;
+  const managed = await ensureManagedCloudflareEntries(env, (group.ips || []).map((item) => ({
+    ...item,
+    listValue: item.listValue || item.cidr || item.ip,
+  })), lease);
+  const restored = {
+    ...group,
+    updatedAt: new Date().toISOString(),
+    ips: managed.items,
+  };
+  Object.defineProperty(restored, CLOUDFLARE_MUTATION_IDS, {
+    value: managed.mutationIds,
+    enumerable: false,
+  });
+  return restored;
+}
+
+async function finalizeCloudflareMutationIds(env, mutationIds) {
+  for (const mutationId of new Set(mutationIds || [])) {
+    try {
+      await resolveCloudflareMutation(env, mutationId);
+    } catch {
+      console.error(JSON.stringify({ level: "error", message: "cloudflare_mutation_finalize_deferred" }));
+    }
   }
 }
 
-async function deleteOrphanedCloudflareListItems(env, protectedKeys, activeUuids) {
+async function compensateCloudflareMutationIds(env, mutationIds, lease = null) {
+  let failed = false;
+  for (const mutationId of new Set(mutationIds || [])) {
+    try {
+      await compensateCloudflareMutation(env, mutationId, null, Date.now(), lease);
+    } catch {
+      failed = true;
+    }
+  }
+  if (failed) {
+    console.error(JSON.stringify({ level: "error", message: "cloudflare_mutation_compensation_failed" }));
+    throw new Error("cloudflare_mutation_compensation_failed");
+  }
+}
+
+async function compensateCloudflareMutation(
+  env,
+  mutationId,
+  marker = null,
+  now = Date.now(),
+  lease = null,
+) {
+  if (lease?.scope !== "all") {
+    return await withAllIpRecordsLease(
+      env,
+      async (maintenanceLease) => await compensateCloudflareMutation(
+        env,
+        mutationId,
+        marker,
+        now,
+        maintenanceLease,
+      ),
+      lease,
+    );
+  }
+  const store = createAuthStateStore(env);
+  const currentMarker = marker || await store.getCloudflareMutation(mutationId);
+  if (!currentMarker) return { deleted: 0, retained: 0, pending: false };
+
+  try {
+    const listItems = await findCloudflareListItems(env);
+    const candidates = await findCloudflareMutationCandidates(env, currentMarker, listItems);
+    if (candidates.length === 0 && now < currentMarker.notBefore) {
+      await store.releaseCloudflareMutation(mutationId, currentMarker.notBefore);
+      return { deleted: 0, retained: 0, pending: true };
+    }
+
+    const protectedKeys = await getReferencedIpKeys(env, {}, lease);
+    const deletable = candidates.filter((item) => !isIpReferenced(protectedKeys, {
+      listItemId: String(item.id || ""),
+      listValue: String(item.ip || ""),
+      ip: String(item.ip || ""),
+    }));
+    await deleteCloudflareListItemIds(
+      env,
+      deletable.map((item) => String(item.id || "")),
+    );
+    await store.resolveCloudflareMutation(mutationId);
+    return {
+      deleted: deletable.length,
+      retained: candidates.length - deletable.length,
+      pending: false,
+    };
+  } catch {
+    try {
+      await store.releaseCloudflareMutation(
+        mutationId,
+        Math.max(Number(currentMarker.notBefore || 0), now + CLOUDFLARE_MUTATION_RETRY_MS),
+      );
+    } catch {
+      // The lease expires automatically, so a later scheduler run can reclaim it.
+    }
+    throw new Error("cloudflare_mutation_compensation_failed");
+  }
+}
+
+async function reconcilePendingCloudflareMutations(env, now = Date.now(), lease = null) {
+  if (!isAuthStateBindingConfigured(env)) return { checked: 0, deleted: 0, retained: 0 };
+  const store = createAuthStateStore(env);
+  const markers = await store.claimCloudflareMutations(now, 25, 60_000);
+  let deleted = 0;
+  let retained = 0;
+  for (const marker of markers) {
+    try {
+      const result = await compensateCloudflareMutation(
+        env,
+        marker.mutationId,
+        marker,
+        now,
+        lease,
+      );
+      deleted += result.deleted;
+      retained += result.retained;
+    } catch {
+      console.error(JSON.stringify({ level: "error", message: "cloudflare_mutation_reconcile_deferred" }));
+    }
+  }
+  return { checked: markers.length, deleted, retained };
+}
+
+function cloudflareMutationIdsFromGroups(groups) {
+  return (groups || []).flatMap((group) => group?.[CLOUDFLARE_MUTATION_IDS] || []);
+}
+
+async function deleteCloudflareListItemIds(env, ids) {
+  if (!Array.isArray(ids)) throw new Error("Cloudflare list item delete failed");
+  const requestedIds = ids.map((id) => String(id || ""));
+  if (requestedIds.some((id) => !CLOUDFLARE_LIST_ITEM_ID.test(id))) {
+    throw new Error("Cloudflare list item delete failed");
+  }
+  const normalizedIds = [...new Set(requestedIds)].sort();
+  for (let offset = 0; offset < normalizedIds.length; offset += CLOUDFLARE_DELETE_BATCH_SIZE) {
+    const batch = normalizedIds.slice(offset, offset + CLOUDFLARE_DELETE_BATCH_SIZE);
+    const response = await cloudflareApiFetch(
+      env,
+      `/rules/lists/${env.IP_LIST_ID}/items?per_page=100`,
+      {
+        method: "DELETE",
+        body: JSON.stringify({ items: batch.map((id) => ({ id })) }),
+      },
+    );
+    const payload = await readCloudflareJson(response);
+    if (!response.ok || payload.success !== true) {
+      console.error(JSON.stringify({ level: "error", message: "list_delete_failed", status: response.status }));
+      throw new Error("Cloudflare list item delete failed");
+    }
+    if (!isCloudflareIdentifier(payload?.result?.operation_id)) {
+      console.error(JSON.stringify({ level: "error", message: "list_delete_operation_invalid" }));
+      throw new Error("Cloudflare list item delete failed");
+    }
+    await waitForCloudflareOperation(env, payload);
+  }
+}
+
+async function deleteOrphanedCloudflareListItems(env, protectedKeys, pendingMutationComments = new Set()) {
   const listItems = await findCloudflareListItems(env);
   const ids = [];
 
   for (const listItem of listItems) {
-    const uuid = managedListItemUuid(listItem.comment || "");
-    if (!uuid || activeUuids.has(uuid)) {
+    const comment = String(listItem.comment || "");
+    if (!MANAGED_CLOUDFLARE_COMMENT.test(comment) || pendingMutationComments.has(comment)) {
       continue;
     }
 
@@ -918,7 +2254,7 @@ async function deleteOrphanedCloudflareListItems(env, protectedKeys, activeUuids
       continue;
     }
 
-    ids.push(listItem.id);
+    if (isCloudflareIdentifier(listItem.id)) ids.push(String(listItem.id));
   }
 
   await deleteCloudflareListItemIds(env, ids);
@@ -926,27 +2262,19 @@ async function deleteOrphanedCloudflareListItems(env, protectedKeys, activeUuids
 }
 
 async function findCloudflareListItems(env) {
-  const response = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${env.ACCOUNT_ID}/rules/lists/${env.IP_LIST_ID}/items`,
-    {
-      headers: {
-        authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
-        "content-type": "application/json",
-      },
-    },
-  );
-
-  if (!response.ok) {
+  const result = await listCloudflareItems(env);
+  if (!result.ok) {
     throw new Error("Cloudflare list lookup failed");
   }
-
-  const payload = await response.json();
-  return Array.isArray(payload.result) ? payload.result : [];
+  return result.items;
 }
 
-async function getReferencedIpKeys(env, options = {}) {
+async function getReferencedIpKeys(env, options = {}, lease = null) {
+  if (isAuthStateBindingConfigured(env) && lease?.scope !== "all") {
+    throw new Error("ip_records_maintenance_lease_required");
+  }
   const keys = new Set();
-  const invites = await getInvites(env);
+  const invites = await getStoredInvites(env);
   const excludedGroups = options.excludedGroups || new Map();
 
   for (const invite of invites) {
@@ -988,11 +2316,6 @@ function isIpReferenced(keys, item) {
   );
 }
 
-function managedListItemUuid(comment) {
-  const match = String(comment).match(/^sub2api uuid ([0-9a-fA-F-]{36}) raw /);
-  return match && isUuid(match[1]) ? match[1] : "";
-}
-
 function hasCloudflareListConfig(env) {
   return Boolean(env.ACCOUNT_ID && env.IP_LIST_ID && env.CLOUDFLARE_API_TOKEN);
 }
@@ -1011,36 +2334,21 @@ async function findCloudflareListItem(env, ip) {
   return items.find((item) => item.ip === ip) || null;
 }
 
-async function isValidConfiguredKey(input, configuredKeys) {
-  const keys = configuredKeys
-    .split(",")
-    .map((key) => key.trim())
-    .filter(Boolean);
-
-  for (const key of keys) {
-    if (await timingSafeEqual(input, key)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-async function verifyPassword(password, expectedHash) {
-  return await timingSafeEqual(await sha256Hex(password), expectedHash.toLowerCase());
-}
-
 async function verifyTotp(secret, token) {
   if (!/^\d{6}$/.test(token)) {
     return false;
   }
 
-  const now = Math.floor(Date.now() / 1000 / 30);
-  for (const offset of [-1, 0, 1]) {
-    const expected = await totp(secret, now + offset);
-    if (await timingSafeEqual(token, expected)) {
-      return true;
+  try {
+    const now = Math.floor(Date.now() / 1000 / 30);
+    for (const offset of [-1, 0, 1]) {
+      const expected = await totp(secret, now + offset);
+      if (await timingSafeEqual(token, expected)) {
+        return true;
+      }
     }
+  } catch {
+    return false;
   }
 
   return false;
@@ -1072,7 +2380,10 @@ async function totp(secret, counter) {
 
 function base32Decode(value) {
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-  const clean = value.toUpperCase().replace(/[^A-Z2-7]/g, "");
+  const clean = String(value || "").trim().toUpperCase();
+  if (!/^[A-Z2-7]{16,128}$/.test(clean)) {
+    throw new Error("ADMIN_TOTP_SECRET must be 16-128 Base32 characters");
+  }
   let bits = "";
 
   for (const char of clean) {
@@ -1113,9 +2424,19 @@ function renderLogin(error = "") {
   `);
 }
 
-function renderAdmin(invites, trash, csrf, request, env) {
+function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
   const defaultBaseUrl = defaultSub2ApiBaseUrl(env, request);
-  return page("UUID Admin", `
+  const inviteCount = Number.isSafeInteger(dashboard.inviteCount) ? dashboard.inviteCount : invites.length;
+  const trashCount = Number.isSafeInteger(dashboard.trashCount) ? dashboard.trashCount : trash.length;
+  const unmigratedInviteCount = Number.isSafeInteger(dashboard.unmigratedInviteCount)
+    ? dashboard.unmigratedInviteCount
+    : invites.filter((invite) => !invite.accessKeyHmac).length;
+  const currentPage = Number.isSafeInteger(dashboard.page) ? dashboard.page : 1;
+  const currentTrashPage = Number.isSafeInteger(dashboard.trashPage) ? dashboard.trashPage : 1;
+  const selectedInvite = dashboard.selectedInvite || null;
+  const authStateStatus = dashboard.authStateStatus || null;
+  const legacyCleanupComplete = authStateStatus?.legacyCleanupComplete === true;
+  return page("UUID Admin", (nonce) => `
     <section class="admin">
       <header class="topbar">
         <div class="topbar-title">
@@ -1123,15 +2444,59 @@ function renderAdmin(invites, trash, csrf, request, env) {
           <div>
             <p class="eyebrow">Sub2API Admin</p>
             <h1>UUID Admin</h1>
-            <p>${invites.length} active UUID${invites.length === 1 ? "" : "s"} · ${trash.length} trashed item${trash.length === 1 ? "" : "s"}</p>
+            <p>${inviteCount} active UUID${inviteCount === 1 ? "" : "s"} · ${trashCount} trashed item${trashCount === 1 ? "" : "s"}</p>
           </div>
         </div>
-        <form method="post" action="${ADMIN_PATH}">
+        <div class="inline-actions">
+          <a class="secondary compact nav-link" href="${ADMIN_PATH}/requests">Usage Inspector</a>
+          <form method="post" action="${ADMIN_PATH}">
           <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
           <input type="hidden" name="action" value="logout" />
-          <button class="secondary" type="submit">Sign out</button>
-        </form>
+            <button class="secondary" type="submit">Sign out</button>
+          </form>
+        </div>
       </header>
+
+      <section class="panel create-panel">
+        <div class="section-head">
+          <div>
+            <h2>Access key migration</h2>
+            <p class="muted">${unmigratedInviteCount
+              ? `${unmigratedInviteCount} UUID account${unmigratedInviteCount === 1 ? "" : "s"} still require v2 access keys. Each run issues at most ${MAX_INVITE_CREDENTIAL_MIGRATION_BATCH}.`
+              : "All active UUID accounts use v2 access keys."}</p>
+          </div>
+          <span class="stat-pill ${unmigratedInviteCount ? "status-warn" : "status-ok"}">${unmigratedInviteCount ? "Migration required" : "Migration complete"}</span>
+        </div>
+        ${unmigratedInviteCount ? `
+          <form class="inline" method="post" action="${ADMIN_PATH}">
+            <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
+            <input type="hidden" name="action" value="migrate_invite_credentials" />
+            <label class="field"><span>2FA code</span><input name="step_up_token" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" required /></label>
+            <button type="submit">Generate next ${Math.min(unmigratedInviteCount, MAX_INVITE_CREDENTIAL_MIGRATION_BATCH)} keys</button>
+          </form>
+        ` : ""}
+      </section>
+
+      ${authStateStatus ? `<section class="panel create-panel">
+        <div class="section-head">
+          <div>
+            <h2>Legacy rollback state</h2>
+            <p class="muted">${legacyCleanupComplete
+              ? "Legacy invite and session KV has been explicitly removed."
+              : "Legacy KV remains available for rollback. Finalization is allowed only after every account has a v2 access key and every seven-day UUID transition has expired."}</p>
+          </div>
+          <span class="stat-pill ${legacyCleanupComplete ? "status-ok" : "status-warn"}">${legacyCleanupComplete ? "Cleanup complete" : "Cleanup pending"}</span>
+        </div>
+        ${!legacyCleanupComplete && unmigratedInviteCount === 0 ? `
+          <form class="inline" method="post" action="${ADMIN_PATH}" data-confirm="Permanently remove legacy invite and session rollback data? This cannot be undone.">
+            <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
+            <input type="hidden" name="action" value="finalize_legacy_auth_state_cleanup" />
+            <label class="field"><span>2FA code</span><input name="step_up_token" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" required /></label>
+            <button class="danger" type="submit">Finalize legacy cleanup</button>
+          </form>
+          <p class="hint">The server checks all transition deadlines again before deleting anything. An early request fails without deleting legacy state.</p>
+        ` : ""}
+      </section>` : ""}
 
       <section class="panel create-panel">
         <div class="section-head">
@@ -1173,6 +2538,25 @@ function renderAdmin(invites, trash, csrf, request, env) {
         </form>
       </section>
 
+      ${selectedInvite ? `
+        <section class="selected-invite-detail">
+          <div class="section-head">
+            <div>
+              <h2>Selected UUID</h2>
+              <p class="muted">IP groups and administrative actions load only for this UUID.</p>
+            </div>
+            <a class="secondary compact nav-link" href="${escapeHtml(adminPageHref(currentPage, currentTrashPage))}">Close details</a>
+          </div>
+          ${renderInviteRow(
+            selectedInvite,
+            csrf,
+            request,
+            env,
+            { page: currentPage, trashPage: currentTrashPage },
+          )}
+        </section>
+      ` : ""}
+
       <section class="invite-list">
         <div class="section-head">
           <div>
@@ -1180,9 +2564,13 @@ function renderAdmin(invites, trash, csrf, request, env) {
             <p class="muted">Edit users, rotate API keys, and manage IP groups.</p>
           </div>
         </div>
-        ${invites.length ? invites.map((invite) => renderInviteRow(invite, csrf, request, env)).join("") : `
+        ${invites.length ? invites.map((invite) => renderInviteListRow(
+          invite,
+          { page: currentPage, trashPage: currentTrashPage },
+        )).join("") : `
           <div class="panel empty">No UUIDs yet</div>
         `}
+        ${renderAdminPagination("invites", currentPage, inviteCount, currentPage, currentTrashPage)}
       </section>
 
       <section class="trash-list">
@@ -1195,9 +2583,10 @@ function renderAdmin(invites, trash, csrf, request, env) {
         ${trash.length ? trash.map((item) => renderTrashRow(item, csrf)).join("") : `
           <div class="panel empty">Recycle bin is empty</div>
         `}
+        ${renderAdminPagination("trash", currentTrashPage, trashCount, currentPage, currentTrashPage)}
       </section>
     </section>
-    <script>
+    <script nonce="${nonce}">
       const uuidInput = document.getElementById("uuid");
       const copyButton = document.getElementById("copy-uuid");
       const createEditor = document.getElementById("api-configs");
@@ -1249,6 +2638,42 @@ function renderAdmin(invites, trash, csrf, request, env) {
           }, 1400);
         });
       });
+      document.querySelectorAll("[data-manual-ip-input]").forEach((input) => {
+        const form = input.closest(".manual-ip-form");
+        const ipTarget = form?.querySelector("[data-preview-ip]");
+        const cidrTarget = form?.querySelector("[data-preview-cidr]");
+        const updatePreview = () => {
+          const value = String(input.value || "").trim();
+          const ipv4 = value.split(".");
+          const isIpv4 = ipv4.length === 4 && ipv4.every((part) => {
+            if (!part || part.trim() !== part || !Array.from(part).every((char) => char >= "0" && char <= "9")) return false;
+            const number = Number(part);
+            return Number.isInteger(number) && number >= 0 && number <= 255;
+          });
+          const isIpv6 = value.includes(":") && /^[0-9a-fA-F:]+$/.test(value);
+          if (ipTarget) ipTarget.textContent = value || "Awaiting input";
+          if (!value) {
+            if (cidrTarget) cidrTarget.textContent = "Auto /24 or /128";
+            input.setCustomValidity("");
+            return;
+          }
+          if (isIpv4) {
+            if (cidrTarget) cidrTarget.textContent = ipv4[0] + "." + ipv4[1] + "." + ipv4[2] + ".0/24";
+            input.setCustomValidity("");
+            return;
+          }
+          if (isIpv6) {
+            if (cidrTarget) cidrTarget.textContent = value + "/128";
+            input.setCustomValidity("");
+            return;
+          }
+          if (cidrTarget) cidrTarget.textContent = "Invalid IP";
+          input.setCustomValidity("Enter a valid IPv4 or IPv6 address.");
+        };
+        input.addEventListener("input", updatePreview);
+        input.addEventListener("blur", updatePreview);
+        updatePreview();
+      });
       document.querySelectorAll(".generate-key").forEach((button) => {
         button.addEventListener("click", () => {
           const editor = document.getElementById(button.dataset.editor);
@@ -1262,6 +2687,23 @@ function renderAdmin(invites, trash, csrf, request, env) {
           const editor = document.getElementById(button.dataset.editor);
           addApiRow(editor, "Sub2API", button.dataset.baseUrl || "", "");
         });
+      });
+      document.addEventListener("input", (event) => {
+        const input = event.target.closest('[data-field="api-key"]');
+        if (!input) return;
+        const field = input.closest(".api-key-field");
+        const hasValue = Boolean(input.value);
+        const revealButton = field?.querySelector(".toggle-api-key");
+        const copyButton = field?.querySelector(".copy-api-key");
+        if (revealButton) revealButton.disabled = !hasValue;
+        if (copyButton) copyButton.disabled = !hasValue;
+        if (!hasValue) {
+          input.type = "password";
+          if (revealButton) {
+            revealButton.textContent = "Show";
+            revealButton.setAttribute("aria-label", "Show API key");
+          }
+        }
       });
       document.addEventListener("click", async (event) => {
         const copyKeyButton = event.target.closest(".copy-api-key");
@@ -1292,15 +2734,26 @@ function renderAdmin(invites, trash, csrf, request, env) {
         const editor = button.closest(".api-config-editor");
         const rows = editor.querySelectorAll(".api-config-row");
         if (rows.length === 1) {
-          rows[0].querySelectorAll("input").forEach((input) => {
+          const row = rows[0];
+          row.querySelectorAll("input").forEach((input) => {
             input.value = "";
           });
+          delete row.dataset.existingCredentialId;
+          row.querySelector(".credential-meta")?.remove();
+          const keyInput = row.querySelector('[data-field="api-key"]');
+          if (keyInput) {
+            keyInput.placeholder = "sk-...";
+            keyInput.dispatchEvent(new Event("input", { bubbles: true }));
+          }
           return;
         }
         button.closest(".api-config-row").remove();
       });
       document.querySelectorAll("form").forEach((form) => {
         form.addEventListener("submit", (event) => {
+          form.querySelectorAll("[data-manual-ip-input]").forEach((input) => {
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+          });
           form.querySelectorAll(".api-config-editor").forEach(serializeApiEditor);
           const usernameInput = form.querySelector("[data-username-input]");
           if (!usernameInput) {
@@ -1329,10 +2782,10 @@ function renderAdmin(invites, trash, csrf, request, env) {
         const row = document.createElement("div");
         row.className = "api-config-row";
         row.innerHTML =
-          '<input type="text" data-field="name" maxlength="80" placeholder="Name" />' +
-          '<input type="url" data-field="base-url" placeholder="https://example.com/v1" />' +
+          '<input type="text" data-field="name" aria-label="API link name" maxlength="80" placeholder="Name" />' +
+          '<input type="url" data-field="base-url" aria-label="API base URL" placeholder="https://example.com/v1" />' +
           '<div class="api-key-field">' +
-            '<input type="password" data-field="api-key" placeholder="sk-..." autocomplete="off" spellcheck="false" />' +
+            '<input type="password" data-field="api-key" aria-label="API key" placeholder="sk-..." autocomplete="off" spellcheck="false" />' +
             '<button class="secondary compact toggle-api-key" type="button" aria-label="Show API key">Show</button>' +
             '<button class="secondary compact copy-api-key" type="button">Copy</button>' +
           '</div>' +
@@ -1370,8 +2823,12 @@ function renderAdmin(invites, trash, csrf, request, env) {
             const name = row.querySelector('[data-field="name"]').value.trim();
             const baseUrl = row.querySelector('[data-field="base-url"]').value.trim();
             const apiKey = row.querySelector('[data-field="api-key"]').value.trim();
-            if (!baseUrl && !apiKey) return "";
-            return [name || "Sub2API", baseUrl, apiKey].join(" | ");
+            const existingMarker = row.dataset.existingCredentialId
+              ? "${EXISTING_CREDENTIAL_MARKER_PREFIX}" + encodeURIComponent(row.dataset.existingCredentialId)
+              : "";
+            const credential = apiKey || existingMarker;
+            if (!baseUrl && !credential) return "";
+            return [name || "Sub2API", baseUrl, credential].join(" | ");
           })
           .filter(Boolean);
         editor.querySelector('[name="api_configs"]').value = lines.join("\\n");
@@ -1389,6 +2846,74 @@ function renderAdmin(invites, trash, csrf, request, env) {
   `, "wide");
 }
 
+function renderAdminPagination(kind, currentPage, totalCount, invitePage, trashPage) {
+  const totalPages = adminPageCount(totalCount);
+  if (totalPages <= 1) return "";
+  const label = kind === "invites" ? "UUID" : "Recycle bin";
+  const href = (targetPage) => kind === "invites"
+    ? adminPageHref(targetPage, trashPage)
+    : adminPageHref(invitePage, targetPage);
+  return `
+    <nav class="pagination" aria-label="${label} pagination">
+      <span class="muted">Page ${currentPage} of ${totalPages} · ${totalCount} total</span>
+      <div class="inline-actions">
+        ${currentPage > 1 ? `<a class="compact nav-link" href="${escapeHtml(href(currentPage - 1))}">Previous</a>` : ""}
+        ${currentPage < totalPages ? `<a class="compact nav-link" href="${escapeHtml(href(currentPage + 1))}">Next</a>` : ""}
+      </div>
+    </nav>
+  `;
+}
+
+function adminPageHref(page, trashPage) {
+  const params = new URLSearchParams();
+  if (page > 1) params.set("page", String(page));
+  if (trashPage > 1) params.set("trashPage", String(trashPage));
+  const query = params.toString();
+  return query ? `${ADMIN_PATH}?${query}` : ADMIN_PATH;
+}
+
+function adminInviteHref(uuid, pagination = {}, edit = false, ipPage = 1) {
+  const params = new URLSearchParams();
+  if (Number.isSafeInteger(pagination.page) && pagination.page > 1) {
+    params.set("page", String(pagination.page));
+  }
+  if (Number.isSafeInteger(pagination.trashPage) && pagination.trashPage > 1) {
+    params.set("trashPage", String(pagination.trashPage));
+  }
+  params.set(edit ? "edit" : "detail", String(uuid || ""));
+  if (Number.isSafeInteger(ipPage) && ipPage > 1) {
+    params.set("ipPage", String(ipPage));
+  }
+  return `${ADMIN_PATH}?${params.toString()}`;
+}
+
+function renderInviteListRow(invite, pagination = {}) {
+  const credentialStatus = inviteCredentialStatus(invite);
+  const storedApiConfigCount = Number(invite.apiConfigCount);
+  const apiConfigCount = Number.isSafeInteger(storedApiConfigCount) && storedApiConfigCount >= 0
+    ? storedApiConfigCount
+    : (Array.isArray(invite.apiConfigs) ? invite.apiConfigs.length : 0);
+  return `
+    <article class="panel invite-card invite-summary-card">
+      <div class="invite-meta">
+        <div class="invite-heading">
+          <strong>${escapeHtml(inviteUsername(invite) || invite.uuid)}</strong>
+          <div class="stat-row">
+            <span class="stat-pill ${credentialStatus.className}">${escapeHtml(credentialStatus.label)}</span>
+            <span class="stat-pill">${apiConfigCount} endpoint${apiConfigCount === 1 ? "" : "s"}</span>
+          </div>
+          ${invite.email ? `<small>${escapeHtml(invite.email)}</small>` : ""}
+          ${invite.remark ? `<small>${escapeHtml(invite.remark)}</small>` : ""}
+        </div>
+        <div class="inline-actions">
+          <a class="secondary compact nav-link" href="${escapeHtml(adminInviteHref(invite.uuid, pagination))}">View details</a>
+          <a class="secondary compact nav-link" href="${escapeHtml(adminInviteHref(invite.uuid, pagination, true))}">Edit</a>
+        </div>
+      </div>
+    </article>
+  `;
+}
+
 function renderTrashRow(item, csrf) {
   if (item.type === "uuid") {
     return renderUuidTrashRow(item, csrf);
@@ -1401,6 +2926,9 @@ function renderTrashRow(item, csrf) {
 
 function renderUuidTrashRow(item, csrf) {
   const invite = item.invite || {};
+  const recordCount = Number.isSafeInteger(Number(item.recordCount))
+    ? Math.max(0, Number(item.recordCount))
+    : 0;
   return `
     <article class="panel trash-card">
       <div class="trash-meta">
@@ -1408,19 +2936,21 @@ function renderUuidTrashRow(item, csrf) {
           <strong>UUID ${escapeHtml(invite.uuid || "")}</strong>
           ${inviteUsername(invite) ? `<small>${escapeHtml(inviteUsername(invite))}</small>` : ""}
           ${invite.email ? `<small>${escapeHtml(invite.email)}</small>` : ""}
-          <small>Deleted ${escapeHtml(formatDate(item.deletedAt) || "Unknown")} · ${(item.records || []).length} IP group${(item.records || []).length === 1 ? "" : "s"}</small>
+          <small>Deleted ${escapeHtml(formatDate(item.deletedAt) || "Unknown")} · ${recordCount} IP group${recordCount === 1 ? "" : "s"}</small>
         </div>
         <div class="inline-actions">
           <form method="post" action="${ADMIN_PATH}">
             <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
             <input type="hidden" name="action" value="restore_uuid" />
             <input type="hidden" name="trash_id" value="${escapeHtml(item.id)}" />
+            <input name="step_up_token" aria-label="2FA code for UUID restore" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />
             <button class="secondary compact" type="submit">Restore</button>
           </form>
-          <form method="post" action="${ADMIN_PATH}" onsubmit="return confirm('Permanently delete this UUID and its Sub2API records?')">
+          <form method="post" action="${ADMIN_PATH}" data-confirm="Permanently delete this UUID and its Sub2API records?">
             <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
             <input type="hidden" name="action" value="purge_uuid" />
             <input type="hidden" name="trash_id" value="${escapeHtml(item.id)}" />
+            <input name="step_up_token" aria-label="2FA code" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />
             <button class="danger compact" type="submit">Delete forever</button>
           </form>
         </div>
@@ -1432,13 +2962,16 @@ function renderUuidTrashRow(item, csrf) {
 function renderIpGroupTrashRow(item, csrf) {
   const group = item.group || {};
   const place = [group.country, group.region, group.city].filter(Boolean).join(" / ") || "Unknown location";
+  const ipCount = Number.isSafeInteger(Number(group.ipCount))
+    ? Math.max(0, Number(group.ipCount))
+    : 0;
   return `
     <article class="panel trash-card">
       <div class="trash-meta">
         <div>
           <strong>IP group for ${escapeHtml(item.uuid || "")}</strong>
           <small>${escapeHtml(place)}</small>
-          <small>Deleted ${escapeHtml(formatDate(item.deletedAt) || "Unknown")} · ${(group.ips || []).length} IP${(group.ips || []).length === 1 ? "" : "s"}</small>
+          <small>Deleted ${escapeHtml(formatDate(item.deletedAt) || "Unknown")} · ${ipCount} IP${ipCount === 1 ? "" : "s"}</small>
         </div>
         <div class="inline-actions">
           <form method="post" action="${ADMIN_PATH}">
@@ -1447,59 +2980,151 @@ function renderIpGroupTrashRow(item, csrf) {
             <input type="hidden" name="trash_id" value="${escapeHtml(item.id)}" />
             <button class="secondary compact" type="submit">Restore</button>
           </form>
-          <form method="post" action="${ADMIN_PATH}" onsubmit="return confirm('Permanently delete this IP group?')">
+          <form method="post" action="${ADMIN_PATH}" data-confirm="Permanently delete this IP group?">
             <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
             <input type="hidden" name="action" value="purge_ip_group" />
             <input type="hidden" name="trash_id" value="${escapeHtml(item.id)}" />
+            <input name="step_up_token" aria-label="2FA code" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />
             <button class="danger compact" type="submit">Delete forever</button>
           </form>
         </div>
-      </div>
-      <div class="ip-list">
-        ${(group.ips || []).map(renderIpItem).join("")}
       </div>
     </article>
   `;
 }
 
-function renderInviteRow(invite, csrf, request, env) {
+function renderInviteRow(invite, csrf, request, env, pagination = {}) {
   const groups = invite.records || [];
-  const apiConfigs = normalizeApiConfigs(invite.apiConfigs || []);
+  const recordCount = Number.isSafeInteger(invite.recordCount) ? invite.recordCount : groups.length;
+  const ipPage = Number.isSafeInteger(invite.ipPage) ? invite.ipPage : 1;
+  const recordsOversized = Boolean(invite.recordsOversized);
   const editorId = `api-${invite.uuid}`;
+  const isEditing = new URL(request.url).searchParams.get("edit") === invite.uuid;
+  const apiConfigs = isEditing
+    ? normalizeApiConfigEditorRows(invite.apiConfigs || [])
+    : (Array.isArray(invite.apiConfigs) ? invite.apiConfigs : []);
   const totalIps = groups.reduce((count, group) => count + (group.ips || []).length, 0);
   const latestGroup = groups[0] || null;
   const latestPlace = latestGroup ? formatGroupPlace(latestGroup) : "";
+  const credentialStatus = inviteCredentialStatus(invite);
   return `
     <article class="panel invite-card">
       <div class="invite-meta">
         <div class="invite-heading">
           <strong>${escapeHtml(inviteUsername(invite) || invite.uuid)}</strong>
           <div class="stat-row">
-            <span class="stat-pill">${groups.length} group${groups.length === 1 ? "" : "s"}</span>
-            <span class="stat-pill">${totalIps} IP${totalIps === 1 ? "" : "s"}</span>
+            ${recordsOversized
+              ? `<span class="stat-pill status-error">IP data unavailable</span>`
+              : `<span class="stat-pill">${recordCount} group${recordCount === 1 ? "" : "s"}</span><span class="stat-pill">${totalIps} IP${totalIps === 1 ? "" : "s"} on this page</span>`}
+            <span class="stat-pill ${credentialStatus.className}">${escapeHtml(credentialStatus.label)}</span>
             ${latestPlace ? `<span class="stat-pill">${escapeHtml(latestPlace)}</span>` : ""}
           </div>
           ${invite.email ? `<small>${escapeHtml(invite.email)}</small>` : ""}
           ${invite.remark ? `<small>${escapeHtml(invite.remark)}</small>` : ""}
         </div>
-        <form method="post" action="${ADMIN_PATH}" onsubmit="return confirm('Delete this UUID and all of its IP groups?')">
-          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
-          <input type="hidden" name="action" value="delete" />
-          <input type="hidden" name="uuid" value="${escapeHtml(invite.uuid)}" />
-          <button class="danger compact" type="submit">Delete UUID</button>
-        </form>
+        <div class="inline-actions">
+          <form method="post" action="${ADMIN_PATH}">
+            <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
+            <input type="hidden" name="action" value="rotate_access_key" />
+            <input type="hidden" name="uuid" value="${escapeHtml(invite.uuid)}" />
+            <input name="step_up_token" aria-label="2FA code for key rotation" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />
+            <button class="secondary compact" type="submit">${invite.accessKeyHmac ? "Rotate key" : "Create access key"}</button>
+          </form>
+          <form method="post" action="${ADMIN_PATH}" data-confirm="Reset this user's Sub2API login password?">
+            <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
+            <input type="hidden" name="action" value="reset_sub2api_password" />
+            <input type="hidden" name="uuid" value="${escapeHtml(invite.uuid)}" />
+            <input name="step_up_token" aria-label="2FA code for login reset" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />
+            <button class="secondary compact" type="submit">Reset login</button>
+          </form>
+          <form method="post" action="${ADMIN_PATH}">
+            <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
+            <input type="hidden" name="action" value="refresh_sub2api_status" />
+            <input type="hidden" name="uuid" value="${escapeHtml(invite.uuid)}" />
+            <button class="secondary compact" type="submit">Refresh Sub2API</button>
+          </form>
+          <form method="post" action="${ADMIN_PATH}" data-confirm="Delete this UUID and all of its IP groups?">
+            <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
+            <input type="hidden" name="action" value="delete" />
+            <input type="hidden" name="uuid" value="${escapeHtml(invite.uuid)}" />
+            <button class="danger compact" type="submit">Delete UUID</button>
+          </form>
+        </div>
       </div>
       <div class="invite-main">
-        ${renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env)}
+        ${isEditing ? renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env) : renderInviteSummary(invite, apiConfigs, ADMIN_PATH, pagination)}
         <section class="ip-panel">
           <div class="subhead">
             <h3>IP groups</h3>
-            <span class="muted">${groups.length} active group${groups.length === 1 ? "" : "s"}</span>
+            <span class="muted">${recordCount} active group${recordCount === 1 ? "" : "s"}</span>
           </div>
-          ${groups.length ? groups.map((group, index) => renderIpGroup(group, invite.uuid, csrf, index === 0)).join("") : `<span class="muted">No IP groups yet</span>`}
+          ${recordsOversized
+            ? `<span class="error">IP group data is too large to display safely.</span>`
+            : `${renderManualIpGroupForm(invite.uuid, csrf)}${groups.length ? groups.map((group, index) => renderIpGroup(group, invite.uuid, csrf, index === 0)).join("") : `<span class="muted">No IP groups yet</span>`}${renderIpGroupPagination(invite.uuid, ipPage, recordCount, pagination, isEditing)}`}
         </section>
       </div>
     </article>
+  `;
+}
+
+function renderIpGroupPagination(uuid, currentPage, totalCount, pagination, isEditing) {
+  const totalPages = Math.max(1, Math.ceil(totalCount / ADMIN_IP_GROUP_PAGE_SIZE));
+  if (totalPages <= 1) return "";
+  const href = (targetPage) => adminInviteHref(
+    uuid,
+    pagination,
+    isEditing,
+    targetPage,
+  );
+  return `
+    <nav class="pagination" aria-label="IP group pagination">
+      <span class="muted">Page ${currentPage} of ${totalPages} · ${totalCount} groups</span>
+      <div class="inline-actions">
+        ${currentPage > 1 ? `<a class="secondary compact nav-link" href="${escapeHtml(href(currentPage - 1))}">Previous</a>` : ""}
+        ${currentPage < totalPages ? `<a class="secondary compact nav-link" href="${escapeHtml(href(currentPage + 1))}">Next</a>` : ""}
+      </div>
+    </nav>
+  `;
+}
+
+function renderManualIpGroupForm(uuid, csrf) {
+  return `
+    <form class="manual-ip-form" method="post" action="${ADMIN_PATH}">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
+      <input type="hidden" name="action" value="add_ip_group" />
+      <input type="hidden" name="uuid" value="${escapeHtml(uuid)}" />
+      <input class="expiration-mode" type="hidden" name="expiration_mode" value="days" />
+      <div class="subhead compact-subhead">
+        <h3>Add IP</h3>
+        <span class="hint">Enter one IP. Only the matching network is added to the allowlist.</span>
+      </div>
+      <div class="manual-ip-layout">
+        <label class="field manual-ip-input" for="manual-ip-value-${escapeHtml(uuid)}">
+          <span>IP address (IPv4 authorizes its /24 network)</span>
+          <input id="manual-ip-value-${escapeHtml(uuid)}" name="ip_value" type="text" inputmode="text" autocomplete="off" spellcheck="false" placeholder="192.168.1.1" data-manual-ip-input required />
+        </label>
+        <div class="manual-ip-preview" data-manual-ip-preview>
+          <span class="preview-label">Allowlist entry</span>
+          <div class="ip-list preview-pills">
+            <span class="ip-pill muted-pill"><b>IP</b><code data-preview-ip>Awaiting input</code></span>
+            <span class="ip-pill muted-pill"><b>Net</b><code data-preview-cidr>Auto /24 or /128</code></span>
+          </div>
+        </div>
+      </div>
+      <div class="manual-ip-grid">
+        <label class="expiry-field" for="manual-expires-days-${escapeHtml(uuid)}">
+          <span>Days left</span>
+          <input id="manual-expires-days-${escapeHtml(uuid)}" name="expires_in_days" type="number" min="0" step="1" value="${DEFAULT_IP_TTL_DAYS}" required />
+        </label>
+        <label class="expiry-field" for="manual-expires-at-${escapeHtml(uuid)}">
+          <span>Custom expires</span>
+          <input id="manual-expires-at-${escapeHtml(uuid)}" class="expires-at" name="expires_at" type="datetime-local" value="" />
+        </label>
+        <div class="manual-ip-action">
+          <button class="secondary compact" type="submit">Add IP group</button>
+        </div>
+      </div>
+    </form>
   `;
 }
 
@@ -1513,7 +3138,7 @@ function renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env) 
         <div class="field span-2">
           <label for="uuid-${escapeHtml(invite.uuid)}">UUID</label>
           <div class="uuid-cell">
-            <input id="uuid-${escapeHtml(invite.uuid)}" name="uuid" type="text" pattern="[0-9a-fA-F-]{36}" value="${escapeHtml(invite.uuid)}" required />
+            <input id="uuid-${escapeHtml(invite.uuid)}" name="uuid" type="text" value="${escapeHtml(invite.uuid)}" readonly />
             <button class="secondary compact copy-row" type="button" data-copy="${escapeHtml(invite.uuid)}">Copy</button>
           </div>
         </div>
@@ -1532,7 +3157,10 @@ function renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env) 
       </div>
       ${renderApiConfigEditor(editorId, apiConfigs, defaultSub2ApiBaseUrl(env, request))}
       <div class="form-footer">
-        <span class="hint">Existing links are split into fields for easier editing.</span>
+        <label class="field">
+          <span>2FA code</span>
+          <input name="step_up_token" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" required />
+        </label>
         <button class="secondary compact" type="submit">Save user</button>
       </div>
     </form>
@@ -1540,11 +3168,11 @@ function renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env) 
 }
 
 function renderApiConfigEditor(editorId, apiConfigs, defaultBaseUrl) {
-  const rows = normalizeApiConfigs(apiConfigs);
+  const rows = normalizeApiConfigEditorRows(apiConfigs);
   const visibleRows = rows.length ? rows : [{ name: "Sub2API", baseUrl: defaultBaseUrl, apiKey: "" }];
   return `
     <section class="api-config-editor" id="${escapeHtml(editorId)}">
-      <input type="hidden" name="api_configs" value="${escapeHtml(formatApiConfigs(rows))}" />
+      <input type="hidden" name="api_configs" value="${escapeHtml(formatApiConfigEditorRows(rows))}" />
       <div class="subhead">
         <h3>OpenAI API links</h3>
         <div class="inline-actions">
@@ -1566,14 +3194,20 @@ function renderApiConfigEditor(editorId, apiConfigs, defaultBaseUrl) {
 }
 
 function renderApiConfigInputRow(config) {
+  const credentialId = config.credentialConfigured ? String(config.id || "") : "";
+  const apiKey = credentialId ? "" : String(config.apiKey || "");
+  const credentialAttributes = credentialId
+    ? ` data-existing-credential-id="${escapeHtml(credentialId)}"`
+    : "";
   return `
-    <div class="api-config-row">
-      <input type="text" data-field="name" maxlength="80" placeholder="Name" value="${escapeHtml(config.name || "")}" />
-      <input type="url" data-field="base-url" placeholder="https://example.com/v1" value="${escapeHtml(config.baseUrl || "")}" />
+    <div class="api-config-row"${credentialAttributes}>
+      <input type="text" data-field="name" aria-label="API link name" maxlength="80" placeholder="Name" value="${escapeHtml(config.name || "")}" />
+      <input type="url" data-field="base-url" aria-label="API base URL" placeholder="https://example.com/v1" value="${escapeHtml(config.baseUrl || "")}" />
       <div class="api-key-field">
-        <input type="password" data-field="api-key" placeholder="sk-..." value="${escapeHtml(config.apiKey || "")}" autocomplete="off" spellcheck="false" />
-        <button class="secondary compact toggle-api-key" type="button" aria-label="Show API key">Show</button>
-        <button class="secondary compact copy-api-key" type="button"${config.apiKey ? "" : " disabled"}>Copy</button>
+        <input type="password" data-field="api-key" aria-label="API key" placeholder="${credentialId ? "Saved - leave blank to keep" : "sk-..."}" value="${escapeHtml(apiKey)}" autocomplete="new-password" spellcheck="false" />
+        <button class="secondary compact toggle-api-key" type="button" aria-label="Show API key"${apiKey ? "" : " disabled"}>Show</button>
+        <button class="secondary compact copy-api-key" type="button"${apiKey ? "" : " disabled"}>Copy</button>
+        ${credentialId ? `<small class="credential-meta">Credential ID: ${escapeHtml(credentialId)}. Saved; leave blank to keep this credential. Enter a new key to replace it.</small>` : ""}
       </div>
       <button class="secondary compact remove-api-link" type="button">Remove</button>
     </div>
@@ -1605,7 +3239,7 @@ function renderIpGroup(group, uuid, csrf, isInitiallyOpen = false) {
       </summary>
       <div class="ip-group-body">
         <div class="ip-group-toolbar">
-          <form method="post" action="${ADMIN_PATH}" onsubmit="return confirm('Delete this IP group from the Cloudflare list?')">
+          <form method="post" action="${ADMIN_PATH}" data-confirm="Delete this IP group from the Cloudflare list?">
             <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
             <input type="hidden" name="action" value="delete_ip_group" />
             <input type="hidden" name="uuid" value="${escapeHtml(uuid)}" />
@@ -1688,6 +3322,45 @@ function formatDate(value) {
   return `${parts.year}年${parts.month}月${parts.day}日 ${parts.hour}:${parts.minute}:${parts.second}`;
 }
 
+function renderResponsePills(item) {
+  const pills = [];
+  const status = Number(item?.responseStatus || 0);
+  if (status > 0) {
+    pills.push(`<span class="stat-pill ${escapeHtml(responseStatusClass(status))}">HTTP ${escapeHtml(String(status))}</span>`);
+  } else {
+    pills.push('<span class="stat-pill pending">Response pending</span>');
+  }
+  if (item?.upstreamStatus) {
+    pills.push(`<span class="stat-pill">Upstream ${escapeHtml(String(item.upstreamStatus))}</span>`);
+  }
+  if (Number(item?.requestTimeMs || 0) > 0) {
+    pills.push(`<span class="stat-pill">${escapeHtml(formatMilliseconds(item.requestTimeMs))}</span>`);
+  }
+  if (item?.responseContentType) {
+    pills.push(`<span class="stat-pill">${escapeHtml(String(item.responseContentType))}</span>`);
+  }
+  return pills.join("");
+}
+
+function responseStatusClass(status) {
+  const code = Number(status || 0);
+  if (code >= 500) return "status-error";
+  if (code >= 400) return "status-warn";
+  if (code >= 200) return "status-ok";
+  return "pending";
+}
+
+function formatMilliseconds(value) {
+  const amount = Number(value || 0);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return "";
+  }
+  if (amount < 1000) {
+    return `${Math.round(amount)} ms`;
+  }
+  return `${(amount / 1000).toFixed(amount >= 10000 ? 0 : 2)} s`;
+}
+
 function toDateTimeLocalValue(value) {
   if (!value) {
     return "";
@@ -1711,6 +3384,13 @@ function parseDateTimeLocal(value) {
 }
 
 function parseExpirationInput(dateTimeLocal, daysValue, mode) {
+  if (String(dateTimeLocal || "").trim()) {
+    const parsed = parseDateTimeLocal(dateTimeLocal);
+    if (parsed) {
+      return parsed;
+    }
+  }
+
   const days = Number(daysValue);
   if (mode === "days" && Number.isFinite(days) && days >= 0 && String(daysValue).trim() !== "") {
     return addDaysIso(new Date().toISOString(), Math.floor(days));
@@ -1786,19 +3466,18 @@ async function lookupIpLocation(env, ip, cf) {
     return fallback;
   }
 
-  const endpoint = String(env.GEOIP_LOOKUP_URL || `https://api.ip.sb/geoip/${encodeURIComponent(ip)}`);
-  if (!endpoint) {
-    return fallback;
-  }
-  const lookupUrl = endpoint.replace("{ip}", encodeURIComponent(ip));
-  if (!lookupUrl.startsWith("https://")) {
+  const lookupUrl = resolveGeoIpLookupUrl(env, ip);
+  if (!lookupUrl) {
     return fallback;
   }
 
   try {
-    const response = await fetch(lookupUrl, {
+    const response = await fetchWithTimeout(lookupUrl, {
       headers: { accept: "application/json" },
-    });
+      // Workers supports follow/manual only. Manual prevents an unapproved
+      // redirect from becoming a second outbound request.
+      redirect: "manual",
+    }, GEOIP_TIMEOUT_MS);
     if (!response.ok) {
       return fallback;
     }
@@ -1821,46 +3500,47 @@ async function lookupIpLocation(env, ip, cf) {
       source: "geoip",
     };
   } catch (error) {
-    console.error(JSON.stringify({ level: "warn", message: "geoip_lookup_failed", error: error.message }));
+    console.error(JSON.stringify({ level: "warn", message: "geoip_lookup_failed" }));
     return fallback;
   }
 }
 
-async function readJsonWithLimit(response, maxBytes) {
-  const contentLength = Number(response.headers.get("content-length") || "0");
-  if (contentLength > maxBytes) {
-    throw new Error("response_too_large");
+function parseGeoIpAllowedHostnames(value) {
+  return parseApprovedHostnames(value);
+}
+
+function resolveGeoIpLookupUrl(env, ip) {
+  const template = String(env.GEOIP_LOOKUP_URL || "").trim();
+  const allowedHosts = parseGeoIpAllowedHostnames(env.GEOIP_ALLOWED_HOSTNAMES);
+  if (
+    !template
+    || !ip
+    || allowedHosts.length === 0
+    || (template.match(/\{ip\}/g) || []).length !== 1
+  ) {
+    return "";
   }
-
-  if (!response.body) {
-    return await response.json();
+  const url = parseApprovedHttpsUrl(
+    template.replace("{ip}", encodeURIComponent(ip)),
+    allowedHosts,
+    { allowSearch: true },
+  );
+  if (!url) {
+    return "";
   }
+  return url.href;
+}
 
-  const reader = response.body.getReader();
-  const chunks = [];
-  let total = 0;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-    total += value.byteLength;
-    if (total > maxBytes) {
-      await reader.cancel();
-      throw new Error("response_too_large");
-    }
-    chunks.push(value);
+function validateGeoIpConfig(env) {
+  const template = String(env.GEOIP_LOOKUP_URL || "").trim();
+  const allowedHosts = String(env.GEOIP_ALLOWED_HOSTNAMES || "").trim();
+  if (!template && !allowedHosts) return;
+  if (!template || !allowedHosts) {
+    throw new Error("GEOIP_LOOKUP_URL and GEOIP_ALLOWED_HOSTNAMES must be configured together");
   }
-
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
+  if (!resolveGeoIpLookupUrl(env, "192.0.2.1")) {
+    throw new Error("GEOIP_LOOKUP_URL must contain one {ip} placeholder and use an approved HTTPS hostname");
   }
-
-  return JSON.parse(new TextDecoder().decode(bytes));
 }
 
 async function provisionSub2ApiUser(env, invite) {
@@ -1869,10 +3549,14 @@ async function provisionSub2ApiUser(env, invite) {
 
 async function deprovisionSub2ApiUser(env, invite) {
   const sync = invite.sub2apiSync || {};
+  const apiKeyId = safePositiveIdentifier(sync.apiKeyId)
+    || safePositiveIdentifier(sync.tokenId);
   return await callSub2ApiSync(env, "deprovision", {
     uuid: invite.uuid,
+    username: desiredSub2ApiUsername(inviteUsername(invite), invite.uuid),
     sub2apiUserId: sync.userId || 0,
-    sub2apiTokenId: sync.tokenId || 0,
+    sub2apiApiKeyId: apiKeyId,
+    tokenId: apiKeyId,
   });
 }
 
@@ -1882,44 +3566,244 @@ async function purgeSub2ApiUser(env, invite) {
   }
 
   const sync = invite.sub2apiSync || {};
+  const apiKeyId = safePositiveIdentifier(sync.apiKeyId)
+    || safePositiveIdentifier(sync.tokenId);
   return await callSub2ApiSync(env, "purge", {
     uuid: invite.uuid,
+    username: desiredSub2ApiUsername(inviteUsername(invite), invite.uuid),
     sub2apiUserId: sync.userId || 0,
-    sub2apiTokenId: sync.tokenId || 0,
+    sub2apiApiKeyId: apiKeyId,
+    tokenId: apiKeyId,
   });
 }
 
-async function callSub2ApiSync(env, action, payload) {
+function safePositiveIdentifier(value) {
+  const identifier = Number(value || 0);
+  return Number.isSafeInteger(identifier) && identifier > 0 ? identifier : 0;
+}
+
+function renderUsageInspector(data, _csrf, request) {
+  const safeData = sanitizeUsageInspectorData(data);
+  return page("Usage Inspector", renderUsageInspectorBody(safeData, request, ADMIN_PATH), "wide");
+}
+
+
+async function listUsageMetadata(env, request) {
+  const url = new URL(request.url);
+  return await callSub2ApiSync(env, "usage_logs_list", {
+    query: String(url.searchParams.get("q") || "").trim(),
+    requestId: String(url.searchParams.get("requestId") || "").trim(),
+    model: String(url.searchParams.get("model") || "").trim(),
+    timePreset: String(url.searchParams.get("timePreset") || "1h").trim().toLowerCase(),
+    dateFrom: parseDateTimeLocal(String(url.searchParams.get("dateFrom") || "")),
+    dateTo: parseDateTimeLocal(String(url.searchParams.get("dateTo") || "")),
+    cursorId: parseUsageIdentifier(url.searchParams.get("cursorId")),
+    cursorCreatedAt: String(url.searchParams.get("cursorCreatedAt") || ""),
+    pageSize: 25,
+  }, 262_144);
+}
+
+async function getUsageMetadataDetail(env, request) {
+  const url = new URL(request.url);
+  const id = parseUsageIdentifier(url.searchParams.get("id"));
+  if (id <= 0) {
+    throw new Error("Invalid request log id");
+  }
+  return await callSub2ApiSync(env, "usage_log_detail", { id }, 262_144);
+}
+
+function parseUsageIdentifier(value) {
+  const text = String(value ?? "");
+  if (!/^\d+$/.test(text)) return 0;
+  const number = Number(text);
+  return Number.isSafeInteger(number) && number >= 0 ? number : 0;
+}
+
+async function callSub2ApiSync(env, action, payload, maxBytes = 0) {
   const syncUrl = sub2apiSyncUrl(env);
   const syncSecret = sub2apiSyncSecret(env);
   if (!syncUrl || !syncSecret) {
     throw new Error("Missing Sub2API sync configuration");
   }
-  validateSub2ApiSyncConfig(env, syncUrl, syncSecret);
+  const validatedSyncUrl = validateSub2ApiSyncConfig(env, syncUrl, syncSecret);
 
   const body = JSON.stringify({
-    action,
     ...payload,
+    action,
   });
   const timestamp = String(Math.floor(Date.now() / 1000));
   const nonce = randomHex(16);
   const signature = await hmacSha256Hex(syncSecret, `${timestamp}.${nonce}.${body}`);
-  const response = await fetch(syncUrl, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-sub2api-sync-timestamp": timestamp,
-      "x-sub2api-sync-nonce": nonce,
-      "x-sub2api-sync-signature": signature,
-    },
-    body,
-  });
-
-  const result = await readJsonWithLimit(response, 16_384).catch(() => ({}));
-  if (!response.ok || result.ok === false) {
-    throw new Error(result.error || `Sub2API sync failed with HTTP ${response.status}`);
+  let response;
+  try {
+    response = await fetch(validatedSyncUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-sub2api-sync-timestamp": timestamp,
+        "x-sub2api-sync-nonce": nonce,
+        "x-sub2api-sync-signature": signature,
+      },
+      // Workers supports follow/manual only. Manual prevents an unapproved
+      // redirect from becoming a second outbound request.
+      redirect: "manual",
+      signal: AbortSignal.timeout(SUB2API_SYNC_TIMEOUT_MS),
+      body,
+    });
+  } catch {
+    throw new Error("Sub2API sync request failed");
   }
+
+  let result;
+  try {
+    result = await readJsonWithLimit(
+      response,
+      resolveSub2ApiSyncResponseLimit(action, maxBytes),
+    );
+  } catch {
+    throw new Error("Sub2API sync request failed");
+  }
+  if (
+    !response.ok
+    || !result
+    || typeof result !== "object"
+    || Array.isArray(result)
+    || result.ok !== true
+    || result.action !== action
+  ) {
+    throw new Error("Sub2API sync request failed");
+  }
+  validateSub2ApiSyncResult(result, action, payload);
   return result;
+}
+
+function resolveSub2ApiSyncResponseLimit(action, requestedMaxBytes) {
+  if (Number.isSafeInteger(requestedMaxBytes) && requestedMaxBytes > 0) {
+    return requestedMaxBytes;
+  }
+  return action === "provision" || action === "status"
+    ? SUB2API_SYNC_ACCOUNT_RESPONSE_MAX_BYTES
+    : SUB2API_SYNC_DEFAULT_RESPONSE_MAX_BYTES;
+}
+
+function validateSub2ApiSyncResult(result, action, requestPayload) {
+  const requestedUuid = Object.hasOwn(requestPayload || {}, "uuid")
+    ? String(requestPayload.uuid || "").toLowerCase()
+    : "";
+  if (requestedUuid) {
+    if (!isUuid(requestedUuid) || result.uuid !== requestedUuid) {
+      throw new Error("Sub2API sync request failed");
+    }
+  }
+
+  validateSyncApiKey(result, "apiKey");
+  validateSyncApiKey(result, "tokenKey");
+  validateOptionalSyncString(result, "loginPassword", 512);
+  if (Object.hasOwn(result, "passwordHash")) {
+    throw new Error("Sub2API sync request failed");
+  }
+  if (Object.hasOwn(result, "passwordHashFingerprint")) {
+    const fingerprint = result.passwordHashFingerprint;
+    if (typeof fingerprint !== "string" || !/^[a-f0-9]{64}$/i.test(fingerprint)) {
+      throw new Error("Sub2API sync request failed");
+    }
+  }
+
+  if (Object.hasOwn(result, "tokens")) {
+    if (!Array.isArray(result.tokens) || result.tokens.length > SUB2API_SYNC_MAX_TOKENS) {
+      throw new Error("Sub2API sync request failed");
+    }
+    for (const token of result.tokens) validateSyncToken(token);
+  }
+
+  if (action === "login") {
+    validateSyncAuth(result.auth);
+  } else if (Object.hasOwn(result, "auth")) {
+    throw new Error("Sub2API sync request failed");
+  }
+}
+
+function validateSyncToken(token) {
+  if (!isPlainJsonObject(token)) throw new Error("Sub2API sync request failed");
+  validateSyncApiKey(token, "apiKey");
+  validateSyncApiKey(token, "tokenKey");
+  validateOptionalSyncString(token, "name", 100);
+  for (const field of ["apiKeyId", "tokenId"]) {
+    if (Object.hasOwn(token, field)
+        && (!Number.isSafeInteger(token[field]) || token[field] <= 0)) {
+      throw new Error("Sub2API sync request failed");
+    }
+  }
+  if (Object.hasOwn(token, "status")
+      && ![0, 1, true, false, "active", "disabled"].includes(token.status)) {
+    throw new Error("Sub2API sync request failed");
+  }
+}
+
+function validateSyncApiKey(value, field) {
+  if (!Object.hasOwn(value, field)) return;
+  const credential = value[field];
+  if (typeof credential !== "string"
+      || (credential !== "" && !isSub2ApiTokenKey(credential))) {
+    throw new Error("Sub2API sync request failed");
+  }
+}
+
+function validateOptionalSyncString(value, field, maximumLength) {
+  if (!Object.hasOwn(value, field)) return;
+  if (typeof value[field] !== "string" || value[field].length > maximumLength) {
+    throw new Error("Sub2API sync request failed");
+  }
+}
+
+function validateSyncAuth(auth) {
+  if (!isPlainJsonObject(auth)) throw new Error("Sub2API sync request failed");
+  if (Object.keys(auth).some((field) => !SYNC_AUTH_KEYS.has(field))) {
+    throw new Error("Sub2API sync request failed");
+  }
+  if (typeof auth.access_token !== "string"
+      || !auth.access_token
+      || exceedsUtf8ByteLimit(auth.access_token, SUB2API_SYNC_MAX_AUTH_TOKEN_BYTES)) {
+    throw new Error("Sub2API sync request failed");
+  }
+  if (Object.hasOwn(auth, "refresh_token")
+      && (typeof auth.refresh_token !== "string"
+        || exceedsUtf8ByteLimit(auth.refresh_token, SUB2API_SYNC_MAX_AUTH_TOKEN_BYTES))) {
+    throw new Error("Sub2API sync request failed");
+  }
+  if (Object.hasOwn(auth, "expires_in")
+      && (!Number.isSafeInteger(auth.expires_in)
+        || auth.expires_in < 0
+        || auth.expires_in > 31_536_000)) {
+    throw new Error("Sub2API sync request failed");
+  }
+  if (Object.hasOwn(auth, "user")) {
+    if (!isPlainJsonObject(auth.user)) throw new Error("Sub2API sync request failed");
+    for (const [field, value] of Object.entries(auth.user)) {
+      if (!SYNC_AUTH_USER_KEYS.has(field)) {
+        throw new Error("Sub2API sync request failed");
+      }
+      if (typeof value === "boolean" || Number.isSafeInteger(value)) continue;
+      if (typeof value === "string"
+          && !exceedsUtf8ByteLimit(value, SUB2API_SYNC_MAX_AUTH_USER_FIELD_BYTES)) {
+        continue;
+      }
+      throw new Error("Sub2API sync request failed");
+    }
+    let encoded;
+    try {
+      encoded = JSON.stringify(auth.user);
+    } catch {
+      throw new Error("Sub2API sync request failed");
+    }
+    if (exceedsUtf8ByteLimit(encoded, SUB2API_SYNC_MAX_AUTH_USER_BYTES)) {
+      throw new Error("Sub2API sync request failed");
+    }
+  }
+}
+
+function isPlainJsonObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function desiredSub2ApiUsername(name, uuid) {
@@ -2049,7 +3933,7 @@ function desiredSub2ApiTokens(env, configs) {
 }
 
 function sub2apiTokenConfigs(env, syncResult) {
-  const baseUrl = normalizeBaseUrl(syncResult?.baseUrl || configuredSub2ApiBaseUrl(env));
+  const baseUrl = approvedPublicHttpsUrl(env, syncResult?.baseUrl || configuredSub2ApiBaseUrl(env));
   if (!baseUrl) {
     return [];
   }
@@ -2081,21 +3965,23 @@ function normalizeApiName(name) {
   return String(name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function sub2apiSyncMetadata(syncResult) {
+async function sub2apiSyncMetadata(env, syncResult) {
   return {
     userId: Number(syncResult?.userId || 0),
     tokenId: Number(syncResult?.tokenId || 0),
     username: String(syncResult?.username || ""),
     email: String(syncResult?.email || ""),
     loginPassword: String(syncResult?.loginPassword || ""),
-    loginUrl: normalizeBaseUrl(syncResult?.loginUrl || "https://api.example.com"),
-    passwordHash: String(syncResult?.passwordHash || ""),
+    loginUrl: approvedPublicHttpsUrl(env, syncResult?.loginUrl || ""),
+    passwordHashFingerprint: syncResult?.passwordHash
+      ? await passwordHashFingerprint(env.INVITE_ACCESS_HMAC_KEY, syncResult.passwordHash)
+      : String(syncResult?.passwordHashFingerprint || ""),
     syncedAt: String(syncResult?.syncedAt || new Date().toISOString()),
   };
 }
 
 function configuredSub2ApiBaseUrl(env) {
-  return normalizeBaseUrl(env.SUB2API_DEFAULT_BASE_URL || env.SUB2API_BASE_URL || "https://api.example.com/v1");
+  return approvedPublicHttpsUrl(env, env.SUB2API_DEFAULT_BASE_URL || env.SUB2API_BASE_URL || "");
 }
 
 function sub2apiSyncUrl(env) {
@@ -2121,17 +4007,21 @@ function validateSub2ApiSyncConfig(env, syncUrl, syncSecret) {
   if (url.protocol !== "https:") {
     throw new Error("SUB2API_SYNC_URL must use https");
   }
+  if (url.username || url.password) {
+    throw new Error("SUB2API_SYNC_URL must not include URL credentials");
+  }
+  if (url.pathname !== "/_sub2api-sync/provision" || url.search || url.hash) {
+    throw new Error("SUB2API_SYNC_URL must use the dedicated /_sub2api-sync/provision endpoint");
+  }
 
-  const allowedHosts = String(env.ALLOWED_HOSTNAMES || "")
-    .split(",")
-    .map((host) => host.trim().toLowerCase())
-    .filter(Boolean);
-  if (allowedHosts.length > 0 && !allowedHosts.includes(url.hostname.toLowerCase())) {
+  const approved = parseApprovedHttpsUrl(syncUrl, env.ALLOWED_HOSTNAMES);
+  if (!approved) {
     throw new Error("SUB2API_SYNC_URL hostname must be in ALLOWED_HOSTNAMES");
   }
+  return approved.href;
 }
 
-function parseApiConfigs(value) {
+function parseApiConfigs(value, env, { allowExistingCredentialReferences = false } = {}) {
   return value
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -2139,13 +4029,104 @@ function parseApiConfigs(value) {
     .map((line) => {
       const parts = line.split("|").map((part) => part.trim());
       if (parts.length >= 3) {
-        return { name: parts[0], baseUrl: parts[1], apiKey: parts.slice(2).join("|").trim() };
+        const credential = parts.slice(2).join("|").trim();
+        const existingCredentialId = parseExistingCredentialMarker(credential);
+        if (existingCredentialId !== null) {
+          if (!allowExistingCredentialReferences) {
+            throw new Error("Stored API credential references are only valid for invite updates");
+          }
+          return {
+            name: parts[0],
+            baseUrl: requireApprovedApiConfigUrl(env, parts[0], parts[1]),
+            apiKey: "",
+            existingCredentialId,
+          };
+        }
+        return { name: parts[0], baseUrl: requireApprovedApiConfigUrl(env, parts[0], parts[1]), apiKey: credential };
       }
       if (parts.length === 2) {
-        return { name: parts[0], baseUrl: parts[1], apiKey: "" };
+        return { name: parts[0], baseUrl: requireApprovedApiConfigUrl(env, parts[0], parts[1]), apiKey: "" };
       }
-      return { name: "Sub2API", baseUrl: parts[0], apiKey: "" };
+      return { name: "Sub2API", baseUrl: requireApprovedApiConfigUrl(env, "Sub2API", parts[0]), apiKey: "" };
     });
+}
+
+function existingCredentialMarker(credentialId) {
+  const id = String(credentialId || "");
+  if (!id || id.length > 128) {
+    throw new Error("Stored API credential reference is invalid");
+  }
+  return `${EXISTING_CREDENTIAL_MARKER_PREFIX}${encodeURIComponent(id)}`;
+}
+
+function parseExistingCredentialMarker(value) {
+  const marker = String(value || "");
+  if (!marker.startsWith(EXISTING_CREDENTIAL_MARKER_PREFIX)) return null;
+  const encodedId = marker.slice(EXISTING_CREDENTIAL_MARKER_PREFIX.length);
+  let id;
+  try {
+    id = decodeURIComponent(encodedId);
+  } catch {
+    throw new Error("Stored API credential reference is invalid");
+  }
+  if (!id || id.length > 128 || encodeURIComponent(id) !== encodedId) {
+    throw new Error("Stored API credential reference is invalid");
+  }
+  return id;
+}
+
+function resolveExistingCredentialReferences(env, configs, storedInvite, revealedInvite) {
+  const storedConfigs = Array.isArray(storedInvite?.apiConfigs) ? storedInvite.apiConfigs : [];
+  const revealedConfigs = Array.isArray(revealedInvite?.apiConfigs) ? revealedInvite.apiConfigs : [];
+  const storedById = uniqueCredentialConfigMap(storedConfigs);
+  const revealedById = uniqueCredentialConfigMap(revealedConfigs);
+  const referencedIds = new Set();
+
+  return (Array.isArray(configs) ? configs : []).map((config) => {
+    const credentialId = String(config?.existingCredentialId || "");
+    if (!credentialId) return config;
+    if (referencedIds.has(credentialId)) {
+      throw new Error("Stored API credential reference is invalid");
+    }
+    referencedIds.add(credentialId);
+
+    const storedConfig = storedById.get(credentialId);
+    const revealedConfig = revealedById.get(credentialId);
+    if (
+      !storedConfig
+      || !revealedConfig
+      || !(storedConfig.apiKeyEncrypted || storedConfig.apiKey)
+      || !String(revealedConfig.apiKey || "").trim()
+    ) {
+      throw new Error("Stored API credential reference is invalid");
+    }
+
+    const storedBaseUrl = approvedApiConfigUrl(env, storedConfig);
+    const submittedBaseUrl = approvedApiConfigUrl(env, config);
+    if (!storedBaseUrl || submittedBaseUrl !== storedBaseUrl) {
+      throw new Error("Stored API credential endpoint cannot be changed without a new API key");
+    }
+
+    return {
+      id: credentialId,
+      name: config.name,
+      baseUrl: storedBaseUrl,
+      apiKey: String(revealedConfig.apiKey),
+    };
+  });
+}
+
+function uniqueCredentialConfigMap(configs) {
+  const result = new Map();
+  const duplicates = new Set();
+  for (const config of configs) {
+    const id = String(config?.id || "");
+    if (!id) continue;
+    if (result.has(id)) duplicates.add(id);
+    result.set(id, config);
+  }
+  for (const id of duplicates) result.delete(id);
+  return result;
 }
 
 function normalizeApiConfigs(configs) {
@@ -2164,6 +4145,23 @@ function normalizeApiConfigs(configs) {
     .slice(0, 8);
 }
 
+function normalizeApiConfigEditorRows(configs) {
+  if (!Array.isArray(configs)) return [];
+  return configs
+    .map((config) => ({
+      id: String(config?.id || "").slice(0, 128),
+      name: displayApiName(config?.name).slice(0, 80),
+      baseUrl: normalizeBaseUrl(config?.baseUrl),
+      apiKey: String(config?.apiKey || "").trim(),
+      credentialConfigured: Boolean(config?.credentialConfigured || config?.apiKeyEncrypted),
+    }))
+    .filter((config) => (
+      config.baseUrl
+      && (config.apiKey || (config.credentialConfigured && config.id))
+    ))
+    .slice(0, 8);
+}
+
 function isUsableApiConfig(config) {
   return config && normalizeBaseUrl(config.baseUrl) && String(config.apiKey || "").trim();
 }
@@ -2176,26 +4174,102 @@ function normalizeBaseUrl(value) {
 
   try {
     const url = new URL(input);
+    if (url.protocol !== "https:" || url.username || url.password) return "";
     return url.href.replace(/\/$/, "");
   } catch {
     return "";
   }
 }
 
-function formatApiConfigs(configs) {
-  return normalizeApiConfigs(configs)
-    .map((config) => `${config.name} | ${config.baseUrl} | ${config.apiKey}`)
+function approvedPublicHttpsUrl(env, value) {
+  const approved = parseApprovedHttpsUrl(value, env.ALLOWED_HOSTNAMES);
+  return approved ? approved.href.replace(/\/$/, "") : "";
+}
+
+function approvedProviderHttpsUrl(env, value) {
+  const publicHostnames = new Set(parseApprovedHostnames(env.ALLOWED_HOSTNAMES));
+  const providerHostnames = parseApprovedHostnames(env.PROVIDER_ALLOWED_HOSTNAMES);
+  if (providerHostnames.some((hostname) => publicHostnames.has(hostname))) {
+    return "";
+  }
+  const approved = parseApprovedHttpsUrl(value, providerHostnames);
+  return approved ? approved.href.replace(/\/$/, "") : "";
+}
+
+function validateHostnameAllowlistSeparation(env) {
+  const publicHostnames = parseApprovedHostnames(env.ALLOWED_HOSTNAMES);
+  if (publicHostnames.length === 0) {
+    throw new Error("ALLOWED_HOSTNAMES must contain valid public hostnames");
+  }
+
+  const providerRaw = String(env.PROVIDER_ALLOWED_HOSTNAMES || "").trim();
+  const providerHostnames = parseApprovedHostnames(providerRaw);
+  if (providerRaw && providerHostnames.length === 0) {
+    throw new Error("PROVIDER_ALLOWED_HOSTNAMES must contain valid provider hostnames");
+  }
+  const publicSet = new Set(publicHostnames);
+  if (providerHostnames.some((hostname) => publicSet.has(hostname))) {
+    throw new Error("PROVIDER_ALLOWED_HOSTNAMES must not contain a public ALLOWED_HOSTNAMES hostname");
+  }
+  return { publicHostnames, providerHostnames };
+}
+
+function isManagedSub2ApiConfig(env, config) {
+  const id = String(config?.id || "");
+  const name = normalizeApiName(config?.name);
+  const baseUrl = normalizeBaseUrl(config?.baseUrl);
+  const configuredBaseUrl = configuredSub2ApiBaseUrl(env);
+  return name === "sub2api"
+    || id === "sub2api-sync"
+    || id.startsWith("sub2api-token-")
+    || Boolean(baseUrl && configuredBaseUrl && baseUrl === configuredBaseUrl);
+}
+
+function approvedApiConfigUrl(env, config) {
+  const value = config?.baseUrl || "";
+  return isManagedSub2ApiConfig(env, config)
+    ? approvedPublicHttpsUrl(env, value)
+    : approvedProviderHttpsUrl(env, value);
+}
+
+function requireApprovedApiConfigUrl(env, name, value) {
+  const normalized = approvedApiConfigUrl(env, { name, baseUrl: value });
+  if (!normalized) {
+    throw new Error("API Base URL must use HTTPS and an approved hostname for its endpoint type");
+  }
+  return normalized;
+}
+
+function sanitizeInviteUrls(env, invite) {
+  const sync = invite.sub2apiSync || {};
+  return {
+    ...invite,
+    apiConfigs: (invite.apiConfigs || [])
+      .map((config) => ({ ...config, baseUrl: approvedApiConfigUrl(env, config) }))
+      .filter((config) => config.baseUrl),
+    sub2apiSync: { ...sync, loginUrl: approvedPublicHttpsUrl(env, sync.loginUrl) },
+  };
+}
+
+function formatApiConfigEditorRows(configs) {
+  return normalizeApiConfigEditorRows(configs)
+    .map((config) => {
+      const credential = config.credentialConfigured
+        ? existingCredentialMarker(config.id)
+        : config.apiKey;
+      return `${config.name} | ${config.baseUrl} | ${credential}`;
+    })
     .join("\n");
 }
 
 function defaultSub2ApiBaseUrl(env, request) {
-  const configured = normalizeBaseUrl(env.SUB2API_DEFAULT_BASE_URL || env.SUB2API_BASE_URL || "");
+  const configured = approvedPublicHttpsUrl(env, env.SUB2API_DEFAULT_BASE_URL || env.SUB2API_BASE_URL || "");
   if (configured) {
     return configured;
   }
 
   try {
-    return `${new URL(request.url).origin}/v1`;
+    return approvedPublicHttpsUrl(env, `${new URL(request.url).origin}/v1`);
   } catch {
     return "";
   }
@@ -2221,6 +4295,40 @@ function renderMessage(title, message) {
   `);
 }
 
+function prepareIssuedAccessKeysResponse(items, remainingCount = 0) {
+  const response = html(
+    renderIssuedAccessKeys(items, remainingCount),
+    200,
+    ISSUED_ACCESS_KEYS_HTML_MAX_BYTES,
+  );
+  if (response.status !== 200) {
+    throw new Error("issued_access_key_response_too_large");
+  }
+  return response;
+}
+
+function renderIssuedAccessKeys(items, remainingCount = 0) {
+  const rows = items.length
+    ? items.map((item) => `
+      <div class="endpoint-summary">
+        <strong>${escapeHtml(item.username || item.uuid)}</strong>
+        <code>${escapeHtml(item.accessKey)}</code>
+        <button class="secondary compact copy-value" type="button" data-copy="${escapeHtml(item.accessKey)}">Copy</button>
+      </div>
+    `).join("")
+    : `<p>No unmigrated UUID accounts were found.</p>`;
+  return page("Access keys issued", `
+    <section class="message wide">
+      <p class="eyebrow">One-time credentials</p>
+      <h1>Access keys issued</h1>
+      <p>These keys are shown once. Distribute them securely before leaving this page.</p>
+      <div class="endpoint-summary-list">${rows}</div>
+      ${remainingCount > 0 ? `<p class="muted">${escapeHtml(String(remainingCount))} account${remainingCount === 1 ? "" : "s"} remain. Return to admin and run the next batch after saving these keys.</p>` : ""}
+      <a href="${ADMIN_PATH}">Return to admin</a>
+    </section>
+  `, "wide");
+}
+
 function sub2apiIcon(size = "") {
   return `
     <span class="sub2api-icon ${escapeHtml(size)}" aria-hidden="true">
@@ -2230,8 +4338,11 @@ function sub2apiIcon(size = "") {
 }
 
 function page(title, body, layout = "narrow") {
-  const mainClass = layout === "wide" ? "wide" : "";
-  return `<!doctype html>
+  return (nonce) => {
+    const mainClass = layout === "wide" ? "wide" : "";
+    const bodyClass = layout === "wide" ? "wide-layout" : "";
+    const renderedBody = typeof body === "function" ? body(nonce) : String(body);
+    return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -2252,15 +4363,20 @@ function page(title, body, layout = "narrow") {
       min-height: 100vh;
       margin: 0;
       display: grid;
+      grid-template-columns: minmax(0, 1fr);
       place-items: center;
       padding: 40px 20px;
-      background:
-        radial-gradient(ellipse at 50% 0%, rgba(255, 255, 255, 0.9), transparent 50%),
-        linear-gradient(180deg, #fbfbfd 0%, #f5f5f7 100%);
+      background: #f5f5f7;
     }
-    main { width: min(100%, 420px); }
-    main.wide { width: min(100%, 1320px); }
-    form, .message, .admin, .create, .hero { display: grid; gap: 16px; }
+    .wide-layout { align-items: start; }
+    main { width: 100%; max-width: 420px; min-width: 0; justify-self: center; }
+    main.wide { max-width: 1320px; }
+    form, .message, .admin, .create, .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      min-width: 0;
+      gap: 16px;
+    }
     .hero { margin-bottom: 32px; text-align: center; }
     .sub2api-icon {
       width: 72px;
@@ -2283,6 +4399,10 @@ function page(title, body, layout = "narrow") {
     }
     .sub2api-icon img { width: 100%; height: 100%; display: block; }
     .admin { gap: 28px; }
+    .create-panel, .invite-list, .trash-list, .invite-card, .api-config-editor, .api-config-rows {
+      grid-template-columns: minmax(0, 1fr);
+      min-width: 0;
+    }
     .create-panel { display: grid; gap: 20px; }
     .section-head, .subhead, .invite-meta, .form-footer {
       display: flex;
@@ -2290,8 +4410,15 @@ function page(title, body, layout = "narrow") {
       justify-content: space-between;
       gap: 14px;
     }
+    .pagination {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 36px;
+    }
     .section-head h2, .subhead h3 { margin: 0; color: #1d1d1f; line-height: 1.2; }
-    .section-head h2 { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }
+    .section-head h2 { font-size: 20px; font-weight: 700; letter-spacing: 0; }
     .subhead h3 { font-size: 14px; font-weight: 600; }
     .invite-list, .trash-list { display: grid; gap: 16px; }
     .invite-card { display: grid; gap: 20px; }
@@ -2306,8 +4433,25 @@ function page(title, body, layout = "narrow") {
       border-bottom: 0.5px solid rgba(0, 0, 0, 0.08);
     }
     .invite-meta > div { min-width: 0; }
-    .invite-heading { display: grid; gap: 8px; }
+    .invite-heading { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; gap: 8px; }
+    .invite-heading small { min-width: 0; overflow-wrap: anywhere; }
     .trash-card { display: grid; gap: 12px; }
+    .inspector-panel, .inspector-filters, .detail-card { display: grid; gap: 16px; }
+    .inspector-filter-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .nav-link { text-decoration: none; }
+    .usage-list { display: grid; gap: 10px; }
+    .usage-row { display: grid; grid-template-columns: minmax(220px, 1fr) auto auto; align-items: center; gap: 14px; padding: 14px 0; border-bottom: 1px solid rgba(0, 0, 0, 0.08); }
+    .usage-row:last-child { border-bottom: 0; }
+    .usage-row-main { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; min-width: 0; }
+    .usage-row-main strong, .usage-row-main span { min-width: 0; overflow-wrap: anywhere; }
+    .usage-row-main code { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .usage-detail { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; margin: 0; background: rgba(0, 0, 0, 0.08); }
+    .usage-detail div { min-width: 0; padding: 14px; background: #fff; }
+    .usage-detail dt { color: #5f6065; font-size: 13px; }
+    .usage-detail dd { margin: 5px 0 0; font-size: 14px; overflow-wrap: anywhere; }
+    .invite-summary, .endpoint-summary-list { display: grid; gap: 12px; min-width: 0; }
+    .endpoint-summary { display: grid; gap: 5px; padding: 12px; border: 1px solid rgba(0, 0, 0, 0.08); border-radius: 8px; }
+    .invite-card { content-visibility: auto; contain-intrinsic-size: auto 520px; }
     .trash-meta {
       display: flex;
       align-items: center;
@@ -2323,11 +4467,11 @@ function page(title, body, layout = "narrow") {
     .panel, .message {
       padding: 20px;
       border: 0.5px solid rgba(0, 0, 0, 0.06);
-      border-radius: 16px;
+      border-radius: 8px;
       background: rgba(255, 255, 255, 0.72);
       box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.06);
-      backdrop-filter: saturate(180%) blur(20px);
-      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
     }
     .topbar {
       display: flex;
@@ -2343,12 +4487,12 @@ function page(title, body, layout = "narrow") {
       min-width: 0;
     }
     .topbar form { display: block; }
-    .topbar p, .muted, small, .lede, .eyebrow { color: #86868b; }
+    .topbar p, .muted, small, .lede, .eyebrow { color: #5f6065; }
     .eyebrow {
       margin: 0;
       font-size: 13px;
       font-weight: 600;
-      letter-spacing: 0.02em;
+      letter-spacing: 0;
       text-transform: uppercase;
     }
     .lede { font-size: 17px; font-weight: 400; line-height: 1.47; }
@@ -2361,9 +4505,9 @@ function page(title, body, layout = "narrow") {
       color: #1d1d1f;
       font-size: 13px;
       font-weight: 600;
-      letter-spacing: -0.01em;
+      letter-spacing: 0;
     }
-    input, textarea {
+    input, textarea, select {
       width: 100%;
       border: 1px solid rgba(0, 0, 0, 0.1);
       border-radius: 10px;
@@ -2388,7 +4532,7 @@ function page(title, body, layout = "narrow") {
       min-width: 0;
       padding: 16px;
       border: 0.5px solid rgba(0, 0, 0, 0.06);
-      border-radius: 12px;
+      border-radius: 8px;
       background: rgba(0, 0, 0, 0.02);
     }
     .api-config-labels, .api-config-row {
@@ -2397,7 +4541,7 @@ function page(title, body, layout = "narrow") {
       gap: 8px;
       align-items: center;
     }
-    .api-config-labels { color: #86868b; font-size: 12px; font-weight: 600; }
+    .api-config-labels { color: #5f6065; font-size: 13px; font-weight: 600; }
     .api-config-rows { display: grid; gap: 8px; }
     .api-config-row input { min-width: 0; }
     .api-key-field {
@@ -2407,7 +4551,12 @@ function page(title, body, layout = "narrow") {
       min-width: 0;
     }
     .api-key-field input { min-width: 0; }
-    input:focus, textarea:focus {
+    .credential-meta {
+      grid-column: 1 / -1;
+      color: #5f6065;
+      overflow-wrap: anywhere;
+    }
+    input:focus, textarea:focus, select:focus {
       border-color: #0071e3;
       box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16);
     }
@@ -2447,7 +4596,7 @@ function page(title, body, layout = "narrow") {
     button.danger:hover { background: #ff453a; }
     button:disabled {
       background: #d2d2d7;
-      color: #86868b;
+      color: #5f6065;
       box-shadow: none;
       cursor: not-allowed;
       transform: none;
@@ -2461,10 +4610,10 @@ function page(title, body, layout = "narrow") {
     }
     h1 {
       margin: 0;
-      font-size: 36px;
+      font-size: 32px;
       font-weight: 700;
       line-height: 1.1;
-      letter-spacing: -0.025em;
+      letter-spacing: 0;
     }
     p { margin: 0; line-height: 1.53; }
     .error { color: #d70015; font-weight: 600; }
@@ -2477,7 +4626,7 @@ function page(title, body, layout = "narrow") {
       vertical-align: top;
     }
     tbody tr:last-child td { border-bottom: 0; }
-    th { font-size: 12px; color: #86868b; text-transform: uppercase; font-weight: 600; letter-spacing: 0.02em; }
+    th { font-size: 13px; color: #5f6065; text-transform: uppercase; font-weight: 600; letter-spacing: 0; }
     code {
       font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
       font-size: 13px;
@@ -2492,12 +4641,14 @@ function page(title, body, layout = "narrow") {
     }
     .invite-edit { display: grid; gap: 14px; min-width: 0; }
     .inline-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-    .hint { color: #86868b; font-size: 12px; line-height: 1.4; }
+    .hint { color: #5f6065; font-size: 13px; line-height: 1.4; }
     .invite-meta strong { display: block; overflow-wrap: anywhere; }
     td > strong, td > small { display: block; overflow-wrap: anywhere; }
     .stat-row {
       display: flex;
       flex-wrap: wrap;
+      min-width: 0;
+      max-width: 100%;
       gap: 8px;
     }
     .stat-pill {
@@ -2508,14 +4659,18 @@ function page(title, body, layout = "narrow") {
       border-radius: 999px;
       background: rgba(0, 0, 0, 0.045);
       color: #4f4f53;
-      font-size: 12px;
+      font-size: 13px;
       font-weight: 600;
       line-height: 1;
     }
+    .stat-pill.status-ok { background: rgba(46, 125, 50, 0.14); color: #1b5e20; }
+    .stat-pill.status-warn { background: rgba(245, 124, 0, 0.14); color: #b45309; }
+    .stat-pill.status-error { background: rgba(198, 40, 40, 0.14); color: #b3261e; }
+    .stat-pill.pending { background: rgba(0, 113, 227, 0.12); color: #0054b8; }
     .ip-group {
       min-width: 220px;
       border: 0.5px solid rgba(0, 0, 0, 0.08);
-      border-radius: 14px;
+      border-radius: 8px;
       background: rgba(0, 0, 0, 0.02);
       overflow: hidden;
     }
@@ -2564,7 +4719,7 @@ function page(title, body, layout = "narrow") {
       border-radius: 999px;
       background: rgba(0, 0, 0, 0.045);
       color: #4f4f53;
-      font-size: 12px;
+      font-size: 13px;
     }
     .ip-preview {
       max-width: min(100%, 280px);
@@ -2579,7 +4734,7 @@ function page(title, body, layout = "narrow") {
       grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
       align-items: end;
     }
-    .time-grid span { display: grid; gap: 4px; color: #86868b; font-size: 13px; }
+    .time-grid span { display: grid; gap: 4px; color: #5f6065; font-size: 13px; }
     .expiry-form {
       display: grid;
       grid-template-columns: minmax(220px, 1fr) minmax(88px, 0.35fr) auto;
@@ -2588,7 +4743,43 @@ function page(title, body, layout = "narrow") {
       min-width: 0;
     }
     .expiry-field { display: grid; gap: 4px; min-width: 0; }
-    .expiry-field span { color: #86868b; font-size: 13px; }
+    .expiry-field span { color: #5f6065; font-size: 13px; }
+    .manual-ip-form {
+      display: grid;
+      gap: 14px;
+      padding: 14px;
+      border-radius: 8px;
+      border: 0.5px solid rgba(0, 0, 0, 0.08);
+      background: rgba(0, 0, 0, 0.02);
+    }
+    .compact-subhead { align-items: start; }
+    .manual-ip-layout {
+      display: grid;
+      grid-template-columns: minmax(220px, 0.9fr) minmax(260px, 1.1fr);
+      gap: 12px;
+      align-items: end;
+    }
+    .manual-ip-input input { height: 36px; }
+    .manual-ip-preview {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: rgba(0, 0, 0, 0.035);
+      border: 0.5px solid rgba(0, 0, 0, 0.05);
+    }
+    .preview-label { color: #5f6065; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0; }
+    .preview-pills { gap: 8px; }
+    .muted-pill { opacity: 0.78; }
+    .manual-ip-grid {
+      display: grid;
+      grid-template-columns: minmax(120px, 0.35fr) minmax(220px, 0.75fr) auto;
+      gap: 8px;
+      align-items: end;
+    }
+    .manual-ip-action { display: flex; justify-content: flex-end; }
+    .manual-ip-action button { height: 32px; }
     .expiry-form input { height: 32px; border-radius: 8px; font-size: 13px; }
     .expiry-form input[type="datetime-local"] { min-width: 220px; }
     .ip-pill {
@@ -2600,19 +4791,45 @@ function page(title, body, layout = "narrow") {
       border-radius: 8px;
       background: rgba(0, 0, 0, 0.04);
     }
-    .ip-pill code { font-size: 12px; }
+    .ip-pill code { font-size: 13px; }
     .row-actions { min-width: 128px; }
-    .empty { color: #86868b; text-align: center; padding: 24px 0; }
+    .empty { color: #5f6065; text-align: center; padding: 24px 0; }
+    button:focus-visible, a:focus-visible, input:focus-visible,
+    textarea:focus-visible, select:focus-visible, summary:focus-visible {
+      outline: 3px solid rgba(0, 113, 227, 0.32);
+      outline-offset: 2px;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        scroll-behavior: auto !important;
+        transition: none !important;
+      }
+    }
+    @media (max-width: 1100px) {
+      .invite-main { grid-template-columns: minmax(0, 1fr); }
+    }
+    @media (max-width: 920px) {
+      .inspector-filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
     @media (max-width: 680px) {
       body { place-items: start; padding: 20px 16px; }
-      .topbar, .section-head, .subhead, .invite-meta, .trash-meta, .form-footer, .ip-group-summary { display: grid; }
-      .inline, .form-grid, .invite-main, .api-config-labels, .api-config-row {
+      .topbar, .section-head, .subhead, .invite-meta, .trash-meta, .form-footer, .ip-group-summary, .pagination {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        min-width: 0;
+      }
+      .inline, .form-grid, .invite-main, .api-config-labels, .api-config-row, .inspector-filter-grid {
         grid-template-columns: minmax(0, 1fr);
       }
+      .usage-row, .usage-detail {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .usage-row { align-items: stretch; }
+      .usage-row .nav-link { width: 100%; }
       .api-config-labels { display: none; }
       .api-key-field { grid-template-columns: minmax(0, 1fr); }
       .uuid-cell { grid-template-columns: minmax(0, 1fr); }
-      .time-grid, .expiry-form { grid-template-columns: minmax(0, 1fr); }
+      .time-grid, .expiry-form, .manual-ip-layout, .manual-ip-grid { grid-template-columns: minmax(0, 1fr); }
       .ip-group-summary { padding: 14px; }
       .ip-group-body { padding: 0 14px 14px; }
       .ip-group-toolbar { justify-content: stretch; }
@@ -2621,22 +4838,44 @@ function page(title, body, layout = "narrow") {
       .ip-preview { max-width: 100%; }
       th, td { padding: 10px 8px; }
       h1 { font-size: 28px; }
-      .panel, .message { padding: 16px; border-radius: 14px; }
+      .panel, .message { padding: 16px; border-radius: 8px; }
+    }
+    @media (max-width: 240px) {
+      body { padding: 16px 6px; }
+      .panel, .message { padding: 12px 6px; }
+      .topbar-title {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .sub2api-icon.compact { width: 40px; height: 40px; }
+      .ip-group,
+      .expiry-form input[type="datetime-local"],
+      .manual-ip-grid input[type="datetime-local"] { min-width: 0; max-width: 100%; }
+      .ip-group-summary { padding: 12px 6px; }
+      .ip-group-body { padding: 0 6px 12px; }
+      button, a {
+        min-width: 0;
+        padding-inline: 8px;
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }
     }
     @media (prefers-color-scheme: dark) {
       :root { background: #000; color: #f5f5f7; }
-      body {
-        background:
-          radial-gradient(ellipse at 50% 0%, rgba(44, 44, 46, 0.6), transparent 50%),
-          linear-gradient(180deg, #1c1c1e 0%, #000 100%);
+      body { background: #000; }
+      .sub2api-icon {
+        background: #f5f5f7;
+        box-shadow:
+          0 4px 12px rgba(0, 0, 0, 0.28),
+          0 0 0 1px rgba(255, 255, 255, 0.12);
       }
       .panel, .message {
         border-color: rgba(255, 255, 255, 0.08);
         background: rgba(28, 28, 30, 0.72);
         box-shadow: 0 1px 3px rgba(0,0,0,0.2), 0 8px 24px rgba(0,0,0,0.3);
       }
-      label, input, textarea { color: #f5f5f7; }
-      input, textarea {
+      label, input, textarea, select { color: #f5f5f7; }
+      input, textarea, select {
         background: rgba(255, 255, 255, 0.06);
         border-color: rgba(255, 255, 255, 0.15);
       }
@@ -2660,20 +4899,53 @@ function page(title, body, layout = "narrow") {
         border-color: rgba(255, 255, 255, 0.08);
         background: rgba(255, 255, 255, 0.04);
       }
+      .manual-ip-form, .manual-ip-preview { background: rgba(255, 255, 255, 0.04); border-color: rgba(255, 255, 255, 0.08); }
+      .endpoint-badge { background: rgba(10, 132, 255, 0.22); color: #b4d8ff; }
+      .preset-chip.active { background: #f5f5f7; color: #1d1d1f; box-shadow: none; }
       .api-config-labels { color: #98989d; }
+      .credential-meta { color: #aeaeb2; }
       .ip-pill, .stat-pill, .ip-preview, .ip-preview-more { background: rgba(255, 255, 255, 0.08); color: #d2d2d7; }
+      .stat-pill.status-ok { background: rgba(48, 209, 88, 0.18); color: #b8f5c6; }
+      .stat-pill.status-warn { background: rgba(255, 159, 10, 0.18); color: #ffd39a; }
+      .stat-pill.status-error { background: rgba(255, 69, 58, 0.2); color: #ffb4ae; }
+      .stat-pill.pending { background: rgba(10, 132, 255, 0.18); color: #b4d8ff; }
+      .usage-row { border-color: rgba(255, 255, 255, 0.08); }
+      .usage-detail { background: rgba(255, 255, 255, 0.08); }
+      .usage-detail div { background: #1c1c1e; color: #f5f5f7; }
+      .usage-detail dt { color: #aeaeb2; }
       th, td { border-color: rgba(255, 255, 255, 0.08); }
       th, .topbar p, .muted, small { color: #98989d; }
+      .hint, .lede, .eyebrow, .preview-label, .expiry-field span, .time-grid span { color: #aeaeb2; }
       .ip-group { border-color: rgba(255, 255, 255, 0.08); background: rgba(255, 255, 255, 0.04); }
       .ip-group-body { border-color: rgba(255, 255, 255, 0.08); }
-      .empty { color: #636366; }
+      .empty { color: #98989d; }
     }
   </style>
 </head>
-<body>
-  <main class="${mainClass}">${body}</main>
+<body class="${bodyClass}">
+  <main class="${mainClass}">${renderedBody}</main>
+  <script nonce="${nonce}">
+    document.querySelectorAll("form[data-confirm]").forEach((form) => {
+      form.addEventListener("submit", (event) => {
+        if (!window.confirm(form.dataset.confirm || "Confirm this action?")) event.preventDefault();
+      });
+    });
+    document.querySelectorAll(".copy-value").forEach((button) => {
+      button.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(button.dataset.copy || "");
+          const previous = button.textContent;
+          button.textContent = "Copied";
+          window.setTimeout(() => { button.textContent = previous; }, 1400);
+        } catch {
+          button.textContent = "Copy failed";
+        }
+      });
+    });
+  </script>
 </body>
 </html>`;
+  };
 }
 
 function redirect(location, cookie = "") {
@@ -2683,6 +4955,9 @@ function redirect(location, cookie = "") {
     "strict-transport-security": "max-age=31536000; includeSubDomains",
     "x-content-type-options": "nosniff",
     "referrer-policy": "no-referrer",
+    "cross-origin-opener-policy": "same-origin",
+    "cross-origin-resource-policy": "same-origin",
+    "x-permitted-cross-domain-policies": "none",
   });
   if (cookie) {
     headers.set("set-cookie", cookie);
@@ -2690,8 +4965,17 @@ function redirect(location, cookie = "") {
   return new Response(null, { status: 303, headers });
 }
 
-function html(body, status = 200) {
-  return new Response(body, {
+function html(body, status = 200, maximumBytes = 0) {
+  const nonce = randomHex(16);
+  let securedBody = renderTrustedHtml(body, nonce);
+  if (maximumBytes > 0 && exceedsUtf8ByteLimit(securedBody, maximumBytes)) {
+    securedBody = renderTrustedHtml(renderMessage(
+      "Admin page unavailable",
+      "Admin page is too large to display safely. Narrow the selected view and try again.",
+    ), nonce);
+    status = 500;
+  }
+  return new Response(securedBody, {
     status,
     headers: {
       "content-type": "text/html; charset=utf-8",
@@ -2699,10 +4983,19 @@ function html(body, status = 200) {
       "strict-transport-security": "max-age=31536000; includeSubDomains",
       "x-content-type-options": "nosniff",
       "referrer-policy": "no-referrer",
-      "content-security-policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+      "cross-origin-opener-policy": "same-origin",
+      "cross-origin-resource-policy": "same-origin",
+      "x-permitted-cross-domain-policies": "none",
+      "content-security-policy": `default-src 'none'; object-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`,
       "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=()",
     },
   });
+}
+
+function renderTrustedHtml(document, nonce) {
+  return typeof document === "function"
+    ? String(document(nonce))
+    : String(document);
 }
 
 function text(body, status = 200, extraHeaders = {}) {
@@ -2722,17 +5015,34 @@ function isUserFacingAdminError(error) {
   return Boolean(
     message === "Invalid UUID" ||
     message === "UUID already exists" ||
+    message === "UUID is immutable" ||
     message === "Username is required" ||
-    message === "Username already exists"
+    message === "Username already exists" ||
+    message === "UUID not found" ||
+    message === "A valid 2FA code is required" ||
+    message === "Stored API credential reference is invalid" ||
+    message === "Stored API credential references are only valid for invite updates" ||
+    message === "Stored API credential endpoint cannot be changed without a new API key" ||
+    message === "Invalid expiration timestamp" ||
+    message.startsWith("Invalid IP address:") ||
+    message === "Cloudflare allowlist update failed"
   );
+}
+
+function isAuthStateConflict(error) {
+  return String(error?.message || "") === "auth_state_conflict";
 }
 
 function getAdminSetupError(env) {
   const missing = [
     "INVITE_STORE",
+    "AUTH_RATE_LIMITER",
     "ADMIN_USERNAME",
-    "ADMIN_PASSWORD_HASH",
+    "ADMIN_PASSWORD_PBKDF2",
     "ADMIN_TOTP_SECRET",
+    "CREDENTIAL_ENCRYPTION_KEY",
+    "INVITE_ACCESS_HMAC_KEY",
+    "ALLOWED_HOSTNAMES",
     "ACCOUNT_ID",
     "IP_LIST_ID",
     "CLOUDFLARE_API_TOKEN",
@@ -2748,14 +5058,42 @@ function getAdminSetupError(env) {
   if (missing.length) {
     return `Missing admin configuration: ${missing.join(", ")}`;
   }
-  if (!/^[a-f0-9]{64}$/i.test(env.ADMIN_PASSWORD_HASH)) {
-    return "ADMIN_PASSWORD_HASH must be the SHA-256 hex digest of the admin password.";
+  if (!isCloudflareIdentifier(env.ACCOUNT_ID) || !isCloudflareIdentifier(env.IP_LIST_ID)) {
+    return "ACCOUNT_ID and IP_LIST_ID must use valid Cloudflare identifier formats.";
+  }
+  if (!isValidAdminPasswordRecord(env.ADMIN_PASSWORD_PBKDF2)) {
+    return "ADMIN_PASSWORD_PBKDF2 must be a valid PBKDF2-HMAC-SHA256 record.";
+  }
+  try {
+    base32Decode(env.ADMIN_TOTP_SECRET);
+  } catch {
+    return "ADMIN_TOTP_SECRET must be 16-128 Base32 characters.";
+  }
+  try {
+    if (base64UrlByteLength(env.CREDENTIAL_ENCRYPTION_KEY) !== 32) {
+      return "CREDENTIAL_ENCRYPTION_KEY must decode to 32 bytes.";
+    }
+  } catch {
+    return "CREDENTIAL_ENCRYPTION_KEY must be valid base64url.";
+  }
+  if (String(env.INVITE_ACCESS_HMAC_KEY || "").length < 32) {
+    return "INVITE_ACCESS_HMAC_KEY must be at least 32 characters.";
   }
   if (String(env.SUB2API_SYNC_SECRET || "").length < 32) {
     return "SUB2API_SYNC_SECRET must be at least 32 characters.";
   }
   try {
+    validateHostnameAllowlistSeparation(env);
     validateSub2ApiSyncConfig(env, sub2apiSyncUrl(env), sub2apiSyncSecret(env));
+    if (env.SUB2API_DEFAULT_BASE_URL
+        && !approvedPublicHttpsUrl(env, env.SUB2API_DEFAULT_BASE_URL)) {
+      throw new Error("SUB2API_DEFAULT_BASE_URL must use HTTPS and an approved hostname in the public allowlist");
+    }
+    if (env.SUB2API_LOGIN_URL
+        && !approvedPublicHttpsUrl(env, env.SUB2API_LOGIN_URL)) {
+      throw new Error("SUB2API_LOGIN_URL must use HTTPS and an approved hostname in the public allowlist");
+    }
+    validateGeoIpConfig(env);
   } catch (error) {
     return error.message;
   }
@@ -2766,9 +5104,28 @@ function recordsKey(uuid) {
   return `records:${uuid}`;
 }
 
-function loginAttemptKey(request, username) {
+async function loginAttemptKey(env, request) {
   const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-  return `login-attempt:${ip}:${username || "blank"}`;
+  const fingerprint = await hmacSha256Hex(
+    env.INVITE_ACCESS_HMAC_KEY,
+    `admin-login-attempt:${ip}`,
+  );
+  return `login-attempt:${fingerprint}`;
+}
+
+async function stepUpAttemptKey(env, sessionHash) {
+  if (!/^[a-f0-9]{64}$/.test(String(sessionHash || ""))) {
+    throw new Error("Invalid admin session");
+  }
+  const fingerprint = await hmacSha256Hex(
+    env.INVITE_ACCESS_HMAC_KEY,
+    `admin-totp-step-up:${sessionHash}`,
+  );
+  return `totp-attempt:${fingerprint}`;
+}
+
+function requiresStepUpAction(action) {
+  return STEP_UP_ACTIONS.has(String(action || ""));
 }
 
 function sessionKey(hash) {
@@ -2779,6 +5136,33 @@ function randomHex(byteLength) {
   const bytes = new Uint8Array(byteLength);
   crypto.getRandomValues(bytes);
   return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function base64UrlByteLength(value) {
+  return base64UrlDecode(value).byteLength;
+}
+
+function isValidAdminPasswordRecord(record) {
+  const parts = String(record || "").split("$");
+  if (
+    parts.length !== 4
+    || parts[0] !== "pbkdf2_sha256"
+    || !/^\d+$/.test(parts[1])
+    || !/^[A-Za-z0-9_-]+$/.test(parts[2])
+    || !/^[A-Za-z0-9_-]+$/.test(parts[3])
+  ) {
+    return false;
+  }
+  const iterations = Number(parts[1]);
+  if (!Number.isInteger(iterations) || iterations < 100_000 || iterations > 2_000_000) {
+    return false;
+  }
+  try {
+    return base64UrlByteLength(parts[2]) >= 16
+      && base64UrlByteLength(parts[3]) === 32;
+  } catch {
+    return false;
+  }
 }
 
 function parseCookies(header) {
@@ -2823,20 +5207,6 @@ async function hmacSha256Hex(secret, value) {
   return [...new Uint8Array(signature)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function timingSafeEqual(left, right) {
-  const encoder = new TextEncoder();
-  const leftBytes = encoder.encode(left);
-  const rightBytes = encoder.encode(right);
-  const maxLength = Math.max(leftBytes.length, rightBytes.length);
-  let diff = leftBytes.length ^ rightBytes.length;
-
-  for (let index = 0; index < maxLength; index += 1) {
-    diff |= (leftBytes[index] || 0) ^ (rightBytes[index] || 0);
-  }
-
-  return diff === 0;
-}
-
 function isUuid(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
@@ -2849,12 +5219,92 @@ function cleanText(value, maxLength) {
   return String(value || "").trim().slice(0, maxLength);
 }
 
+
+function expandManualIpEntries(value) {
+  const ip = String(value || "").trim();
+  const version = detectIpVersion(ip);
+  if (!version) {
+    throw new Error(`Invalid IP address: ${ip}`);
+  }
+
+  const cidr = version === "IPv4" ? ipv4Cidr24(ip) : `${ip}/128`;
+  return [{
+    ip,
+    version,
+    cidr,
+    listValue: cidr,
+  }];
+}
+
+function detectIpVersion(value) {
+  if (isIPv4(value)) {
+    return "IPv4";
+  }
+  if (isIPv6(value)) {
+    return "IPv6";
+  }
+  return "";
+}
+
+function isIPv4(value) {
+  const parts = String(value || "").split(".");
+  if (parts.length !== 4) {
+    return false;
+  }
+  return parts.every((part) => {
+    if (!/^\d{1,3}$/.test(part)) return false;
+    const number = Number(part);
+    return number >= 0 && number <= 255 && String(number) === part;
+  });
+}
+
+function isIPv6(value) {
+  const input = String(value || "").trim();
+  if (!input.includes(":") || !/^[0-9a-f:.]+$/i.test(input)) {
+    return false;
+  }
+  try {
+    return new URL(`http://[${input}]/`).hostname.startsWith("[");
+  } catch {
+    return false;
+  }
+}
+
+
 function ipv4Cidr24(ip) {
   const parts = String(ip || "").split(".");
   if (parts.length !== 4) {
     return ip;
   }
   return `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
+}
+
+function inviteCredentialStatus(invite, now = Date.now()) {
+  if (!invite?.accessKeyHmac) {
+    return { state: "migration_required", className: "status-warn", label: "Access key required" };
+  }
+  const legacyDeadline = Date.parse(String(invite.legacyUuidLoginUntil || ""));
+  if (!Number.isFinite(legacyDeadline)) {
+    return { state: "access_key_only", className: "status-ok", label: "Access key only" };
+  }
+  const remainingSeconds = Math.ceil((legacyDeadline - Number(now)) / 1000);
+  if (remainingSeconds <= 0) {
+    return { state: "legacy_expired", className: "status-ok", label: "Legacy UUID expired" };
+  }
+  const remainingHours = Math.ceil(remainingSeconds / 3600);
+  if (remainingHours <= 48) {
+    return {
+      state: "legacy_window",
+      className: "status-warn",
+      label: `Legacy UUID: ${remainingHours} hour${remainingHours === 1 ? "" : "s"} remaining`,
+    };
+  }
+  const remainingDays = Math.ceil(remainingSeconds / 86400);
+  return {
+    state: "legacy_window",
+    className: "status-warn",
+    label: `Legacy UUID: ${remainingDays} day${remainingDays === 1 ? "" : "s"} remaining`,
+  };
 }
 
 function escapeHtml(value) {
@@ -2865,3 +5315,58 @@ function escapeHtml(value) {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
 }
+
+function shouldRefreshInvitesOnAdminGet() {
+  return false;
+}
+
+export const __test = Object.freeze({
+  sanitizeUsageInspectorData,
+  renderUsageInspector,
+  shouldRefreshInvitesOnAdminGet,
+  getAdminSetupError,
+  handleAdminLogin,
+  requireStepUpTotp,
+  stepUpAttemptKey,
+  requiresStepUpAction,
+  inviteCredentialStatus,
+  detectIpVersion,
+  resolveCurrentCloudflareDeleteIds,
+  deleteCloudflareListItemIds,
+  deleteOrphanedCloudflareListItems,
+  ensureManagedCloudflareEntries,
+  addManualIpGroup,
+  restoreIpGroupFromTrash,
+  compensateCloudflareMutation,
+  compensateCloudflareMutationIds,
+  reconcilePendingCloudflareMutations,
+  parseUsageIdentifier,
+  getAdminDashboard,
+  parseAdminPageNumber,
+  renderAdminPagination,
+  ADMIN_PAGE_SIZE,
+  ADMIN_RECORD_PAYLOAD_MAX_BYTES,
+  exceedsUtf8ByteLimit,
+  SUB2API_SYNC_TIMEOUT_MS,
+  totp,
+  verifyTotp,
+  createInvite,
+  updateInvite,
+  deleteInvite,
+  restoreInviteFromTrash,
+  compensateProvisionConflict,
+  reconcileAuthoritativeInviteAfterConflict,
+  restoreAuthoritativeIpAccess,
+  rollbackRestoredExternalState,
+  rollbackRestoredIpAccess,
+  callSub2ApiSync,
+  deprovisionSub2ApiUser,
+  purgeSub2ApiUser,
+  lookupIpLocation,
+  resolveGeoIpLookupUrl,
+  validateGeoIpConfig,
+  approvedApiConfigUrl,
+  validateHostnameAllowlistSeparation,
+  html,
+  renderTrustedHtml,
+});

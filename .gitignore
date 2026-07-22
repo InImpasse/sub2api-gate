@@ -7,6 +7,7 @@ __pycache__/
 data/
 logs/
 *.bak
+*.orig
 *.pem
 *.key
 *.crt
@@ -15,3 +16,14 @@ logs/
 worker-allow-ip/.wrangler/
 worker-allow-ip/wrangler.local.jsonc
 worker-allow-ip/wrangler.private.jsonc
+worker-allow-ip/.dev.vars
+worker-allow-ip/.dev.vars.*
+.env.*
+!.env.example
+!.env.*.example
+.local/
+/.local/worker-secret-state/
+**/config.local.yaml
+**/secrets.local.*
+postgres_data/
+redis_data/

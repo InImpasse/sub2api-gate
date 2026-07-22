@@ -1,0 +1,219 @@
+name: sub2api-gate-preflight-canary
+
+# This stack is an isolated empty-data preflight only. It proves that the pinned
+# binary boots and stays healthy without persistent logs. It must never be used
+# as an Nginx upstream or as evidence that migrated production data is ready.
+services:
+  canary-postgres:
+    profiles: ["preflight-canary"]
+    image: postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    restart: "no"
+    user: "70:70"
+    command:
+      - postgres
+      - -c
+      - logging_collector=off
+      - -c
+      - log_destination=stderr
+      - -c
+      - log_directory=log
+      - -c
+      - log_statement=none
+      - -c
+      - log_min_error_statement=panic
+      - -c
+      - log_min_messages=panic
+      - -c
+      - log_error_verbosity=terse
+      - -c
+      - log_parameter_max_length=0
+      - -c
+      - log_parameter_max_length_on_error=0
+      - -c
+      - log_duration=off
+      - -c
+      - log_min_duration_statement=-1
+      - -c
+      - log_min_duration_sample=-1
+      - -c
+      - log_statement_sample_rate=0
+      - -c
+      - log_transaction_sample_rate=0
+      - -c
+      - log_connections=off
+      - -c
+      - log_disconnections=off
+      - -c
+      - log_replication_commands=off
+      - -c
+      - log_checkpoints=off
+      - -c
+      - log_lock_waits=off
+      - -c
+      - log_temp_files=-1
+      - -c
+      - log_autovacuum_min_duration=-1
+      - -c
+      - debug_print_parse=off
+      - -c
+      - debug_print_rewritten=off
+      - -c
+      - debug_print_plan=off
+      - -c
+      - log_parser_stats=off
+      - -c
+      - log_planner_stats=off
+      - -c
+      - log_executor_stats=off
+      - -c
+      - log_statement_stats=off
+    read_only: true
+    logging:
+      driver: "none"
+    environment:
+      POSTGRES_USER: sub2api_canary_owner
+      POSTGRES_PASSWORD: ${SUB2API_CANARY_POSTGRES_PASSWORD:?SUB2API_CANARY_POSTGRES_PASSWORD is required}
+      POSTGRES_DB: sub2api_canary
+      PGDATA: /var/lib/postgresql/18/docker
+      POSTGRES_INITDB_ARGS: --data-checksums --auth-host=scram-sha-256
+    tmpfs:
+      - /var/lib/postgresql:rw,noexec,nosuid,nodev,size=256m,mode=0700,uid=70,gid=70
+      - /var/run/postgresql:rw,noexec,nosuid,nodev,size=8m,mode=0770,uid=70,gid=70
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=70,gid=70
+    networks:
+      - canary-data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          postgres --version | grep -E ' 18\.' >/dev/null &&
+          pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  canary-redis:
+    profiles: ["preflight-canary"]
+    image: redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005
+    restart: "no"
+    user: "999:1000"
+    read_only: true
+    mem_limit: 256m
+    logging:
+      driver: "none"
+    environment:
+      SUB2API_CANARY_REDIS_PASSWORD: ${SUB2API_CANARY_REDIS_PASSWORD:?SUB2API_CANARY_REDIS_PASSWORD is required}
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        digest="$$(printf '%s' "$${SUB2API_CANARY_REDIS_PASSWORD}" | sha256sum | cut -d ' ' -f 1)"
+        printf 'user default reset on #%s ~* +@all\n' "$${digest}" > /tmp/users.acl
+        exec redis-server --aclfile /tmp/users.acl --appendonly no --save "" \
+          --maxmemory 128mb --maxmemory-policy noeviction
+    tmpfs:
+      - /data:rw,noexec,nosuid,nodev,size=64m,mode=0700,uid=999,gid=1000
+      - /tmp:rw,noexec,nosuid,nodev,size=8m,mode=0700,uid=999,gid=1000
+    networks:
+      - canary-data
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          redis-server --version | grep -F 'v=8.8.0' >/dev/null &&
+          REDISCLI_AUTH="$${SUB2API_CANARY_REDIS_PASSWORD}" redis-cli --user default ping | grep -qx PONG
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  sub2api-canary:
+    profiles: ["preflight-canary"]
+    image: weishaw/sub2api@sha256:469790e0389bf31379978687149280a4e135393ad98a9a401951b6be9b1df444
+    restart: "no"
+    user: "1000:1000"
+    init: true
+    read_only: true
+    logging:
+      driver: "none"
+    labels:
+      sub2api-gate.canary-purpose: empty-data-preflight-only
+    ports:
+      # Traffic cutover tools reserve 8081. Publishing the empty preflight on a
+      # different loopback port makes accidental Nginx switching fail closed.
+      - "127.0.0.1:18081:8080"
+    tmpfs:
+      - /app/data:rw,noexec,nosuid,nodev,size=64m,mode=0700,uid=1000,gid=1000
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=1000,gid=1000
+    environment:
+      AUTO_SETUP: "true"
+      ADMIN_EMAIL: canary-admin@sub2api.local
+      ADMIN_PASSWORD: ${SUB2API_CANARY_ADMIN_PASSWORD:?SUB2API_CANARY_ADMIN_PASSWORD is required}
+      DATA_DIR: /app/data
+      PRICING_DATA_DIR: /app/data
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: "8080"
+      SERVER_MODE: release
+      RUN_MODE: ${SUB2API_CANARY_RUN_MODE:-standard}
+      DATABASE_HOST: canary-postgres
+      DATABASE_PORT: "5432"
+      DATABASE_USER: sub2api_canary_owner
+      DATABASE_PASSWORD: ${SUB2API_CANARY_POSTGRES_PASSWORD:?SUB2API_CANARY_POSTGRES_PASSWORD is required}
+      DATABASE_DBNAME: sub2api_canary
+      DATABASE_SSLMODE: disable
+      DATABASE_MAX_OPEN_CONNS: "5"
+      DATABASE_MAX_IDLE_CONNS: "1"
+      REDIS_HOST: canary-redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${SUB2API_CANARY_REDIS_PASSWORD:?SUB2API_CANARY_REDIS_PASSWORD is required}
+      REDIS_DB: "0"
+      REDIS_ENABLE_TLS: "false"
+      JWT_SECRET: ${SUB2API_CANARY_JWT_SECRET:?SUB2API_CANARY_JWT_SECRET is required}
+      TOTP_ENCRYPTION_KEY: ${SUB2API_CANARY_TOTP_ENCRYPTION_KEY:?SUB2API_CANARY_TOTP_ENCRYPTION_KEY is required}
+      TZ: ${SUB2API_CANARY_TZ:-UTC}
+      SECURITY_URL_ALLOWLIST_ENABLED: "true"
+      SECURITY_URL_ALLOWLIST_ALLOW_INSECURE_HTTP: "false"
+      SECURITY_URL_ALLOWLIST_ALLOW_PRIVATE_HOSTS: "false"
+      SECURITY_URL_ALLOWLIST_UPSTREAM_HOSTS: ${SUB2API_CANARY_UPSTREAM_HOSTS:?SUB2API_CANARY_UPSTREAM_HOSTS is required}
+      LOG_OUTPUT_TO_FILE: "false"
+      LOG_OUTPUT_TO_STDOUT: "true"
+      GATEWAY_LOG_UPSTREAM_ERROR_BODY: "false"
+      RISK_CONTROL_ENABLED: "false"
+      IMAGE_STORAGE_ENABLED: "false"
+    depends_on:
+      canary-postgres:
+        condition: service_healthy
+      canary-redis:
+        condition: service_healthy
+    networks:
+      - canary-data
+      - canary-egress
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          /app/sub2api --version 2>&1 | grep -F 'Sub2API 0.1.162' >/dev/null &&
+          wget -q -T 5 -O /dev/null http://127.0.0.1:8080/health
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+
+networks:
+  canary-data:
+    internal: true
+  canary-egress: {}

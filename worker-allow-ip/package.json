@@ -3,10 +3,21 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
+    "deploy": "bash ../deploy/deploy-worker.sh check",
+    "deploy:apply": "bash ../deploy/deploy-worker.sh --apply",
+    "deploy:dry-run": "bash ../deploy/deploy-worker.sh check",
+    "dev": "wrangler dev --config wrangler.private.jsonc",
+    "comments:check": "node ../deploy/migrate-cloudflare-comments.mjs check",
+    "comments:apply": "node ../deploy/migrate-cloudflare-comments.mjs --apply",
+    "test": "node --test",
+    "test:browser-ui": "playwright test --config playwright.ui.config.js"
   },
   "devDependencies": {
-    "wrangler": "^4.0.0"
+    "@playwright/test": "1.61.1",
+    "miniflare": "4.20260714.0",
+    "wrangler": "4.112.0"
+  },
+  "overrides": {
+    "sharp": "0.35.3"
   }
 }

@@ -1,0 +1,282 @@
+name: sub2api-gate-traffic-canary
+
+# This stack is the only traffic-capable canary. It consumes the already
+# sanitized target under /mnt/data/sub2api-gate and must be started only by
+# deploy/traffic-canary.py after its storage and legacy-identity gates pass.
+# The isolated empty-data preflight remains in docker-compose.canary.yml on
+# port 18081 and is intentionally unrelated to this stack.
+x-required-data-root: ${SUB2API_DATA_ROOT:?SUB2API_DATA_ROOT must be /mnt/data/sub2api-gate}
+
+services:
+  traffic-canary-postgres:
+    profiles: ["traffic-canary"]
+    image: postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    pull_policy: never
+    container_name: sub2api-traffic-canary-postgres
+    restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - logging_collector=off
+      - -c
+      - log_destination=stderr
+      - -c
+      - log_directory=log
+      - -c
+      - log_statement=none
+      - -c
+      - log_min_error_statement=panic
+      - -c
+      - log_min_messages=panic
+      - -c
+      - log_error_verbosity=terse
+      - -c
+      - log_parameter_max_length=0
+      - -c
+      - log_parameter_max_length_on_error=0
+      - -c
+      - log_duration=off
+      - -c
+      - log_min_duration_statement=-1
+      - -c
+      - log_min_duration_sample=-1
+      - -c
+      - log_statement_sample_rate=0
+      - -c
+      - log_transaction_sample_rate=0
+      - -c
+      - log_connections=off
+      - -c
+      - log_disconnections=off
+      - -c
+      - log_replication_commands=off
+      - -c
+      - log_checkpoints=off
+      - -c
+      - log_lock_waits=off
+      - -c
+      - log_temp_files=-1
+      - -c
+      - log_autovacuum_min_duration=-1
+      - -c
+      - debug_print_parse=off
+      - -c
+      - debug_print_rewritten=off
+      - -c
+      - debug_print_plan=off
+      - -c
+      - log_parser_stats=off
+      - -c
+      - log_planner_stats=off
+      - -c
+      - log_executor_stats=off
+      - -c
+      - log_statement_stats=off
+    user: "70:70"
+    read_only: true
+    logging:
+      driver: "none"
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
+    volumes:
+      - type: bind
+        source: /mnt/data/sub2api-gate/postgres
+        target: /var/lib/postgresql
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /var/run/postgresql:rw,noexec,nosuid,nodev,size=8m,mode=0770,uid=70,gid=70
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=70,gid=70
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sub2api}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-sub2api}
+      PGDATA: /var/lib/postgresql/18/docker
+      TZ: ${TZ:-UTC}
+    networks:
+      - traffic-canary-data
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          postgres --version | grep -E ' 18\.' >/dev/null &&
+          pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  traffic-canary-redis:
+    profiles: ["traffic-canary"]
+    image: redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005
+    pull_policy: never
+    container_name: sub2api-traffic-canary-redis
+    restart: unless-stopped
+    user: "999:1000"
+    read_only: true
+    mem_limit: 256m
+    logging:
+      driver: "none"
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
+    volumes:
+      - type: bind
+        source: /mnt/data/sub2api-gate/redis/users.acl
+        target: /etc/redis/users.acl
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /data:rw,noexec,nosuid,nodev,size=128m,mode=0700,uid=999,gid=1000
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=999,gid=1000
+    command:
+      - redis-server
+      - --aclfile
+      - /etc/redis/users.acl
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - noeviction
+      - --rdbcompression
+      - "yes"
+      - --rdbchecksum
+      - "yes"
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      TZ: ${TZ:-UTC}
+    networks:
+      - traffic-canary-data
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          redis-server --version | grep -F 'v=8.8.0' >/dev/null &&
+          redis-cli --user default ping | grep -qx PONG
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  sub2api-traffic-canary:
+    profiles: ["traffic-canary"]
+    image: weishaw/sub2api@sha256:469790e0389bf31379978687149280a4e135393ad98a9a401951b6be9b1df444
+    pull_policy: never
+    container_name: sub2api-traffic-canary
+    restart: unless-stopped
+    user: "1000:1000"
+    init: true
+    read_only: true
+    logging:
+      driver: "none"
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
+    labels:
+      sub2api-gate.canary-purpose: migrated-target-traffic-only
+      sub2api-gate.request-path: direct-nginx-only
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - type: bind
+        source: /mnt/data/sub2api-gate/app
+        target: /app/data
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=1000,gid=1000
+    environment:
+      AUTO_SETUP: "false"
+      DATA_DIR: /app/data
+      PRICING_DATA_DIR: /app/data
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: "8080"
+      SERVER_MODE: release
+      RUN_MODE: standard
+      DATABASE_HOST: traffic-canary-postgres
+      DATABASE_PORT: "5432"
+      DATABASE_USER: sub2api_app
+      DATABASE_PASSWORD: ${SUB2API_APP_DATABASE_PASSWORD:?SUB2API_APP_DATABASE_PASSWORD is required}
+      DATABASE_DBNAME: ${POSTGRES_DB:-sub2api}
+      DATABASE_SSLMODE: disable
+      DATABASE_MAX_OPEN_CONNS: ${DATABASE_MAX_OPEN_CONNS:-50}
+      DATABASE_MAX_IDLE_CONNS: ${DATABASE_MAX_IDLE_CONNS:-10}
+      DATABASE_CONN_MAX_LIFETIME_MINUTES: ${DATABASE_CONN_MAX_LIFETIME_MINUTES:-30}
+      DATABASE_CONN_MAX_IDLE_TIME_MINUTES: ${DATABASE_CONN_MAX_IDLE_TIME_MINUTES:-5}
+      REDIS_HOST: traffic-canary-redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      REDIS_DB: ${REDIS_DB:-0}
+      REDIS_POOL_SIZE: ${REDIS_POOL_SIZE:-1024}
+      REDIS_MIN_IDLE_CONNS: ${REDIS_MIN_IDLE_CONNS:-10}
+      REDIS_ENABLE_TLS: "false"
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      JWT_EXPIRE_HOUR: ${JWT_EXPIRE_HOUR:-24}
+      TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY:?TOTP_ENCRYPTION_KEY is required}
+      TZ: ${TZ:-UTC}
+      GEMINI_OAUTH_CLIENT_ID: ${GEMINI_OAUTH_CLIENT_ID:-}
+      GEMINI_OAUTH_CLIENT_SECRET: ${GEMINI_OAUTH_CLIENT_SECRET:-}
+      GEMINI_OAUTH_SCOPES: ${GEMINI_OAUTH_SCOPES:-}
+      GEMINI_QUOTA_POLICY: ${GEMINI_QUOTA_POLICY:-}
+      GEMINI_CLI_OAUTH_CLIENT_SECRET: ${GEMINI_CLI_OAUTH_CLIENT_SECRET:-}
+      ANTIGRAVITY_OAUTH_CLIENT_SECRET: ${ANTIGRAVITY_OAUTH_CLIENT_SECRET:-}
+      SECURITY_URL_ALLOWLIST_ENABLED: "true"
+      SECURITY_URL_ALLOWLIST_ALLOW_INSECURE_HTTP: "false"
+      SECURITY_URL_ALLOWLIST_ALLOW_PRIVATE_HOSTS: "false"
+      SECURITY_URL_ALLOWLIST_UPSTREAM_HOSTS: ${SECURITY_URL_ALLOWLIST_UPSTREAM_HOSTS:?SECURITY_URL_ALLOWLIST_UPSTREAM_HOSTS is required}
+      LOG_OUTPUT_TO_FILE: "false"
+      LOG_OUTPUT_TO_STDOUT: "true"
+      GATEWAY_LOG_UPSTREAM_ERROR_BODY: "false"
+      RISK_CONTROL_ENABLED: "false"
+      IMAGE_STORAGE_ENABLED: "false"
+      UPDATE_PROXY_URL: ${UPDATE_PROXY_URL:-}
+      GATEWAY_IMAGE_STREAM_DATA_INTERVAL_TIMEOUT: ${GATEWAY_IMAGE_STREAM_DATA_INTERVAL_TIMEOUT:-900}
+      GATEWAY_IMAGE_STREAM_KEEPALIVE_INTERVAL: ${GATEWAY_IMAGE_STREAM_KEEPALIVE_INTERVAL:-10}
+      GATEWAY_IMAGE_CONCURRENCY_ENABLED: ${GATEWAY_IMAGE_CONCURRENCY_ENABLED:-false}
+      GATEWAY_IMAGE_CONCURRENCY_MAX_CONCURRENT_REQUESTS: ${GATEWAY_IMAGE_CONCURRENCY_MAX_CONCURRENT_REQUESTS:-0}
+      GATEWAY_IMAGE_CONCURRENCY_OVERFLOW_MODE: ${GATEWAY_IMAGE_CONCURRENCY_OVERFLOW_MODE:-reject}
+      GATEWAY_IMAGE_CONCURRENCY_WAIT_TIMEOUT_SECONDS: ${GATEWAY_IMAGE_CONCURRENCY_WAIT_TIMEOUT_SECONDS:-30}
+      GATEWAY_IMAGE_CONCURRENCY_MAX_WAITING_REQUESTS: ${GATEWAY_IMAGE_CONCURRENCY_MAX_WAITING_REQUESTS:-100}
+    depends_on:
+      traffic-canary-postgres:
+        condition: service_healthy
+      traffic-canary-redis:
+        condition: service_healthy
+    networks:
+      - traffic-canary-data
+      - traffic-canary-egress
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          /app/sub2api --version 2>&1 | grep -F 'Sub2API 0.1.162' >/dev/null &&
+          wget -q -T 5 -O /dev/null http://127.0.0.1:8080/health
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+networks:
+  traffic-canary-data:
+    internal: true
+  traffic-canary-egress: {}

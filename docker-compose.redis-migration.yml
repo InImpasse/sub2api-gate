@@ -1,0 +1,21 @@
+# Temporary override for the nonce-only Redis migration. Combine this with
+# docker-compose.sync-canary.yml and remove it before a sync runtime starts.
+services:
+  sync-canary-redis-nonce:
+    ports:
+      - "127.0.0.1:16379:6379"
+    volumes:
+      - type: bind
+        source: /run/sub2api-gate/redis-migration.acl
+        target: /etc/redis/users.acl
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      REDISCLI_AUTH: ${SUB2API_TARGET_REDIS_PASSWORD:?SUB2API_TARGET_REDIS_PASSWORD is required}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          redis-server --version | grep -F 'v=8.8.0' >/dev/null &&
+          redis-cli --user sub2api_migration ping | grep -qx PONG

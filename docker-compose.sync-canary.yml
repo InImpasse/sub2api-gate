@@ -1,0 +1,156 @@
+name: sub2api-gate-sync-canary
+
+# Provisioning-only canary for the already validated migrated target. This
+# stack is intentionally separate from both traffic canary and /v1 routing.
+x-required-data-root: ${SUB2API_DATA_ROOT:?SUB2API_DATA_ROOT must be /mnt/data/sub2api-gate}
+
+x-sync-environment: &sync-environment
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+  SUB2API_SYNC_HOST: 0.0.0.0
+  SUB2API_SYNC_PORT: "3021"
+  SUB2API_SYNC_SECRET: ${SUB2API_SYNC_SECRET:?SUB2API_SYNC_SECRET is required}
+  SUB2API_SYNC_DATABASE_HOST: traffic-canary-postgres
+  SUB2API_SYNC_DATABASE_PORT: "5432"
+  SUB2API_SYNC_DATABASE_NAME: ${POSTGRES_DB:-sub2api}
+  SUB2API_SYNC_DATABASE_USER: sub2api_sync
+  SUB2API_SYNC_DATABASE_PASSWORD: ${SUB2API_SYNC_DATABASE_PASSWORD:?SUB2API_SYNC_DATABASE_PASSWORD is required}
+  SUB2API_SYNC_REDIS_HOST: sync-canary-redis-nonce
+  SUB2API_SYNC_REDIS_PORT: "6379"
+  SUB2API_SYNC_REDIS_USERNAME: sub2api_sync
+  SUB2API_SYNC_REDIS_PASSWORD: ${SUB2API_SYNC_REDIS_PASSWORD:?SUB2API_SYNC_REDIS_PASSWORD is required}
+  SUB2API_SYNC_REDIS_DB: ${REDIS_DB:-0}
+  SUB2API_INTERNAL_LOGIN_URL: http://sub2api-traffic-canary:8080/api/v1/auth/login
+  SUB2API_SYNC_DEFAULT_GROUP: openai-default
+  SUB2API_LOGIN_URL: ${SUB2API_LOGIN_URL:?SUB2API_LOGIN_URL is required}
+  SUB2API_PUBLIC_BASE_URL: ${SUB2API_PUBLIC_BASE_URL:?SUB2API_PUBLIC_BASE_URL is required}
+
+x-sync-service: &sync-service
+  # prepare-image builds and records the exact local image ID before any
+  # canary or stable service is allowed to start.
+  image: sub2api-gate/sub2api-sync:pg18.4-r1
+  pull_policy: never
+  user: "65532:65532"
+  read_only: true
+  init: true
+  restart: unless-stopped
+  logging:
+    driver: "none"
+  environment: *sync-environment
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=65532,gid=65532
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  mem_limit: 128m
+  cpus: 0.50
+  ulimits:
+    core:
+      soft: 0
+      hard: 0
+  depends_on:
+    sync-canary-redis-nonce:
+      condition: service_healthy
+  networks:
+    - migrated-target-data
+  healthcheck:
+    test:
+      - CMD
+      - python3
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://127.0.0.1:3021/healthz', timeout=4)
+    interval: 5s
+    timeout: 5s
+    retries: 12
+    start_period: 10s
+
+services:
+  sync-canary-redis-nonce:
+    profiles: ["sync-canary", "sync-stable"]
+    image: redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005
+    container_name: sub2api-sync-canary-redis-nonce
+    user: "999:1000"
+    read_only: true
+    mem_limit: 128m
+    restart: unless-stopped
+    logging:
+      driver: "none"
+    volumes:
+      - type: bind
+        source: /mnt/data/sub2api-gate/redis/nonce
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /mnt/data/sub2api-gate/redis/nonce-users.acl
+        target: /etc/redis/users.acl
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=999,gid=1000
+    command:
+      - redis-server
+      - --aclfile
+      - /etc/redis/users.acl
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - "always"
+      - --save
+      - ""
+      - --maxmemory
+      - 32mb
+      - --maxmemory-policy
+      - noeviction
+      - --aof-use-rdb-preamble
+      - "yes"
+    environment:
+      REDISCLI_AUTH: ${SUB2API_SYNC_REDIS_PASSWORD:?SUB2API_SYNC_REDIS_PASSWORD is required}
+      TZ: ${TZ:-UTC}
+    networks:
+      - migrated-target-data
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          redis-server --version | grep -F 'v=8.8.0' >/dev/null &&
+          redis-cli --user sub2api_sync ping | grep -qx PONG
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  sub2api-sync-canary:
+    <<: *sync-service
+    profiles: ["sync-canary"]
+    container_name: sub2api-sync-canary
+    labels:
+      sub2api-gate.canary-purpose: provisioning-sync-only
+      sub2api-gate.request-path: never-v1
+    ports:
+      - "127.0.0.1:3022:3021"
+
+  sub2api-sync-stable:
+    <<: *sync-service
+    profiles: ["sync-stable"]
+    container_name: sub2api-sync-stable
+    labels:
+      sub2api-gate.canary-purpose: provisioning-sync-stable
+      sub2api-gate.request-path: never-v1
+    ports:
+      - "127.0.0.1:3021:3021"
+
+networks:
+  migrated-target-data:
+    external: true
+    name: sub2api-gate-traffic-canary_traffic-canary-data

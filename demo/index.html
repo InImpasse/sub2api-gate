@@ -11,29 +11,29 @@
   <style>
     :root {
       color-scheme: light;
-      --bg: #f4efe7;
-      --bg-strong: #efe4d4;
-      --surface: rgba(255, 251, 245, 0.84);
-      --surface-strong: #fffaf3;
-      --surface-muted: rgba(109, 82, 52, 0.08);
-      --text: #21160d;
-      --text-soft: #6b5846;
-      --text-faint: #8a7662;
-      --line: rgba(84, 57, 31, 0.14);
-      --line-strong: rgba(84, 57, 31, 0.24);
-      --accent: #b6542e;
-      --accent-strong: #8f3f21;
-      --accent-soft: rgba(182, 84, 46, 0.12);
+      --bg: #edf2f4;
+      --bg-strong: #e2e9ec;
+      --surface: rgba(255, 255, 255, 0.92);
+      --surface-strong: #ffffff;
+      --surface-muted: rgba(25, 59, 68, 0.07);
+      --text: #172126;
+      --text-soft: #4b5c64;
+      --text-faint: #5f7078;
+      --line: rgba(23, 50, 58, 0.14);
+      --line-strong: rgba(23, 50, 58, 0.24);
+      --accent: #007a78;
+      --accent-strong: #005f5d;
+      --accent-soft: rgba(0, 122, 120, 0.13);
       --success: #237253;
       --success-soft: rgba(35, 114, 83, 0.12);
       --error: #a33422;
       --error-soft: rgba(163, 52, 34, 0.12);
-      --shadow-lg: 0 24px 80px rgba(59, 35, 14, 0.12);
-      --shadow-md: 0 14px 36px rgba(59, 35, 14, 0.08);
-      --radius-xl: 28px;
-      --radius-lg: 20px;
-      --radius-md: 14px;
-      --radius-sm: 10px;
+      --shadow-lg: 0 24px 80px rgba(13, 35, 42, 0.12);
+      --shadow-md: 0 14px 36px rgba(13, 35, 42, 0.08);
+      --radius-xl: 8px;
+      --radius-lg: 8px;
+      --radius-md: 8px;
+      --radius-sm: 6px;
       --font-display: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, Georgia, serif;
       --font-body: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
       --font-mono: "SFMono-Regular", "Cascadia Code", "Fira Code", Consolas, monospace;
@@ -42,19 +42,19 @@
     @media (prefers-color-scheme: dark) {
       :root {
         color-scheme: dark;
-        --bg: #19130e;
-        --bg-strong: #241b13;
-        --surface: rgba(39, 29, 20, 0.84);
-        --surface-strong: #2a2018;
-        --surface-muted: rgba(255, 232, 212, 0.06);
-        --text: #f7ecde;
-        --text-soft: #d6c4b0;
-        --text-faint: #ac9884;
-        --line: rgba(255, 233, 212, 0.12);
-        --line-strong: rgba(255, 233, 212, 0.22);
-        --accent: #ff8e5f;
-        --accent-strong: #ffaf8e;
-        --accent-soft: rgba(255, 142, 95, 0.14);
+        --bg: #101416;
+        --bg-strong: #182023;
+        --surface: rgba(29, 39, 43, 0.94);
+        --surface-strong: #222d31;
+        --surface-muted: rgba(214, 239, 241, 0.06);
+        --text: #f3f7f8;
+        --text-soft: #b8c7cc;
+        --text-faint: #9aabb1;
+        --line: rgba(225, 244, 246, 0.12);
+        --line-strong: rgba(225, 244, 246, 0.22);
+        --accent: #51c7c2;
+        --accent-strong: #78ddd8;
+        --accent-soft: rgba(81, 199, 194, 0.16);
         --success: #67d6aa;
         --success-soft: rgba(103, 214, 170, 0.12);
         --error: #ff8d7c;
@@ -77,10 +77,7 @@
       margin: 0;
       font-family: var(--font-body);
       color: var(--text);
-      background:
-        radial-gradient(circle at top left, rgba(255, 223, 183, 0.42), transparent 32%),
-        radial-gradient(circle at 85% 18%, rgba(182, 84, 46, 0.14), transparent 26%),
-        linear-gradient(180deg, var(--bg-strong) 0%, var(--bg) 48%, var(--bg) 100%);
+      background: var(--bg);
       -webkit-font-smoothing: antialiased;
       -moz-osx-font-smoothing: grayscale;
     }
@@ -152,36 +149,8 @@
       color: var(--text-soft);
       font-size: 12px;
       font-weight: 700;
-      letter-spacing: 0.08em;
+      letter-spacing: 0;
       text-transform: uppercase;
-    }
-
-    .ambient-orb,
-    .ambient-grid {
-      position: fixed;
-      inset: auto;
-      pointer-events: none;
-      z-index: 0;
-    }
-
-    .ambient-orb {
-      width: 320px;
-      height: 320px;
-      right: -80px;
-      bottom: -80px;
-      border-radius: 50%;
-      background: radial-gradient(circle, rgba(182, 84, 46, 0.18), transparent 68%);
-      filter: blur(8px);
-    }
-
-    .ambient-grid {
-      inset: 0;
-      opacity: 0.26;
-      background-image:
-        linear-gradient(var(--line) 1px, transparent 1px),
-        linear-gradient(90deg, var(--line) 1px, transparent 1px);
-      background-size: 36px 36px;
-      mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.24), transparent 80%);
     }
 
     .app-layout {
@@ -197,7 +166,7 @@
     .workspace {
       border: 1px solid var(--line);
       background: var(--surface);
-      backdrop-filter: blur(18px) saturate(135%);
+      backdrop-filter: none;
       box-shadow: var(--shadow-lg);
     }
 
@@ -206,21 +175,11 @@
       top: 24px;
       overflow: hidden;
       border-radius: var(--radius-xl);
-      min-height: 760px;
+      min-height: 640px;
       padding: 28px;
       display: grid;
       grid-template-rows: auto auto 1fr auto;
       gap: 28px;
-    }
-
-    .intro-panel::before {
-      content: "";
-      position: absolute;
-      inset: 0;
-      background:
-        radial-gradient(circle at 18% 16%, rgba(255, 214, 178, 0.38), transparent 24%),
-        linear-gradient(135deg, transparent 0%, rgba(182, 84, 46, 0.06) 100%);
-      pointer-events: none;
     }
 
     .workspace {
@@ -261,18 +220,16 @@
       border-radius: 20px;
       display: grid;
       place-items: center;
-      background:
-        linear-gradient(145deg, rgba(255, 255, 255, 0.92), rgba(255, 239, 223, 0.72));
+      background: var(--surface-strong);
       box-shadow:
         inset 0 1px 0 rgba(255, 255, 255, 0.6),
-        0 16px 34px rgba(123, 67, 37, 0.18);
+        0 16px 34px rgba(13, 35, 42, 0.16);
       border: 1px solid rgba(255, 255, 255, 0.55);
     }
 
     @media (prefers-color-scheme: dark) {
       .brand-mark {
-        background:
-          linear-gradient(145deg, rgba(255, 255, 255, 0.08), rgba(255, 170, 122, 0.14));
+        background: #f5f5f7;
         border-color: rgba(255, 255, 255, 0.08);
       }
     }
@@ -287,7 +244,7 @@
       color: var(--text-faint);
       font-size: 12px;
       font-weight: 700;
-      letter-spacing: 0.14em;
+      letter-spacing: 0;
       text-transform: uppercase;
     }
 
@@ -296,7 +253,7 @@
       font-family: var(--font-display);
       font-size: 24px;
       font-weight: 700;
-      letter-spacing: -0.03em;
+      letter-spacing: 0;
       line-height: 1;
     }
 
@@ -304,9 +261,9 @@
     h1 {
       margin: 0;
       font-family: var(--font-display);
-      font-size: clamp(2.7rem, 5vw, 4.5rem);
-      line-height: 0.96;
-      letter-spacing: -0.05em;
+      font-size: 42px;
+      line-height: 1.08;
+      letter-spacing: 0;
       font-weight: 700;
       max-width: 10ch;
     }
@@ -368,14 +325,14 @@
       font-family: var(--font-display);
       font-size: 1.7rem;
       line-height: 1;
-      letter-spacing: -0.04em;
+      letter-spacing: 0;
     }
 
     .metric-label {
       margin: 0;
       color: var(--text-faint);
       font-size: 12px;
-      letter-spacing: 0.08em;
+      letter-spacing: 0;
       text-transform: uppercase;
     }
 
@@ -396,7 +353,7 @@
       margin: 0;
       font-size: 13px;
       font-weight: 700;
-      letter-spacing: 0.12em;
+      letter-spacing: 0;
       text-transform: uppercase;
       color: var(--text-faint);
     }
@@ -456,7 +413,7 @@
 
     .workspace-copy h1 {
       max-width: none;
-      font-size: clamp(2rem, 4vw, 3.3rem);
+      font-size: 42px;
     }
 
     .workspace-actions {
@@ -486,7 +443,7 @@
       font-family: var(--font-display);
       font-size: 1.55rem;
       line-height: 1.08;
-      letter-spacing: -0.03em;
+      letter-spacing: 0;
     }
 
     .panel-subtitle {
@@ -507,7 +464,7 @@
     .helper-callout strong,
     .status-strip strong {
       font-size: 13px;
-      letter-spacing: 0.08em;
+      letter-spacing: 0;
       text-transform: uppercase;
     }
 
@@ -515,7 +472,7 @@
       color: var(--text);
       font-size: 13px;
       font-weight: 700;
-      letter-spacing: 0.04em;
+      letter-spacing: 0;
       text-transform: uppercase;
     }
 
@@ -539,7 +496,7 @@
       grid-template-columns: minmax(0, 1fr) auto;
       min-height: 56px;
       padding: 6px;
-      border-radius: 16px;
+      border-radius: 8px;
       border: 1px solid var(--line);
       background: rgba(255, 255, 255, 0.54);
     }
@@ -578,7 +535,7 @@
       text-decoration: none;
       font-size: 14px;
       font-weight: 700;
-      letter-spacing: 0.01em;
+      letter-spacing: 0;
     }
 
     button:hover,
@@ -594,7 +551,7 @@
     .btn-primary {
       background: var(--accent);
       color: #fff;
-      box-shadow: 0 12px 26px rgba(182, 84, 46, 0.22);
+      box-shadow: 0 12px 26px rgba(0, 122, 120, 0.2);
     }
 
     .btn-primary:hover {
@@ -648,7 +605,7 @@
 
     .cf-turnstile-mock {
       padding: 16px;
-      border-radius: 16px;
+      border-radius: 8px;
       border: 1px dashed var(--line-strong);
       background: var(--surface-muted);
     }
@@ -715,7 +672,7 @@
     .copy-secret {
       min-height: 42px;
       border: 1px solid var(--line);
-      border-radius: 12px;
+      border-radius: 8px;
       padding: 0 12px;
       background: transparent;
     }
@@ -736,7 +693,7 @@
       color: var(--text-faint);
       font-size: 12px;
       font-weight: 700;
-      letter-spacing: 0.08em;
+      letter-spacing: 0;
       text-transform: uppercase;
     }
 
@@ -746,7 +703,7 @@
       padding: 18px;
       border-radius: var(--radius-lg);
       border: 1px solid rgba(35, 114, 83, 0.18);
-      background: linear-gradient(180deg, var(--success-soft), rgba(255, 255, 255, 0.03));
+      background: var(--success-soft);
     }
 
     .status-banner p {
@@ -790,7 +747,7 @@
     .tab.active {
       background: var(--surface-strong);
       color: var(--text);
-      box-shadow: 0 8px 20px rgba(59, 35, 14, 0.08);
+      box-shadow: 0 8px 20px rgba(13, 35, 42, 0.08);
     }
 
     .tab-panel {
@@ -855,13 +812,19 @@
     .fade-up {
       opacity: 0;
       transform: translateY(18px);
-      animation: fadeUp 620ms ease forwards;
+      animation: fadeUp 220ms ease forwards;
     }
 
-    .delay-1 { animation-delay: 70ms; }
-    .delay-2 { animation-delay: 140ms; }
-    .delay-3 { animation-delay: 210ms; }
-    .delay-4 { animation-delay: 280ms; }
+    #app.no-entry-motion .fade-up {
+      opacity: 1;
+      transform: none;
+      animation: none;
+    }
+
+    .delay-1 { animation-delay: 30ms; }
+    .delay-2 { animation-delay: 60ms; }
+    .delay-3 { animation-delay: 90ms; }
+    .delay-4 { animation-delay: 120ms; }
 
     @keyframes fadeUp {
       to {
@@ -881,12 +844,19 @@
         animation: none !important;
         transition: none !important;
       }
+
+      .fade-up {
+        opacity: 1;
+        transform: none;
+      }
     }
 
     @media (max-width: 980px) {
       .app-layout {
         grid-template-columns: 1fr;
       }
+
+      .workspace { order: -1; }
 
       .intro-panel {
         position: static;
@@ -901,8 +871,9 @@
       }
 
       .demo-badge {
-        top: 12px;
-        right: 12px;
+        position: static;
+        display: inline-flex;
+        margin: 12px 10px 0;
       }
 
       .intro-panel,
@@ -910,6 +881,8 @@
       .panel {
         padding: 18px;
       }
+
+      .hero-title, .workspace-copy h1, h1 { font-size: 32px; }
 
       .metric-grid,
       .dashboard-grid,
@@ -927,7 +900,60 @@
       .workspace-header,
       .panel-head,
       .top-nav {
+        display: grid;
         grid-template-columns: 1fr;
+      }
+
+      .workspace-actions {
+        display: grid;
+        grid-template-columns: 1fr;
+        justify-content: stretch;
+      }
+    }
+
+    @media (max-width: 240px) {
+      .page-shell {
+        width: calc(100% - 12px);
+        padding-top: 12px;
+      }
+
+      .demo-badge {
+        max-width: calc(100% - 12px);
+        margin: 8px 6px 0;
+        white-space: normal;
+      }
+
+      .intro-panel,
+      .workspace,
+      .panel,
+      .section-card {
+        padding: 8px;
+      }
+
+      .brand-row,
+      .step {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .brand-mark {
+        width: 52px;
+        height: 52px;
+        border-radius: 8px;
+      }
+
+      .hero-title, .workspace-copy h1, h1 { font-size: 28px; }
+
+      .tag,
+      .step-pill,
+      .micro-badge,
+      button,
+      a.btn-primary,
+      a.btn-secondary {
+        min-width: 0;
+        max-width: 100%;
+        padding-inline: 8px;
+        white-space: normal;
+        overflow-wrap: anywhere;
       }
     }
   </style>
@@ -935,12 +961,11 @@
 <body>
   <a class="skip-link" href="#app">Skip to content</a>
   <span class="demo-badge">Demo</span>
-  <div class="ambient-grid" aria-hidden="true"></div>
-  <div class="ambient-orb" aria-hidden="true"></div>
   <main class="page-shell" id="app"></main>
 
   <script>
     let view = "form";
+    let renderCount = 0;
     let turnstilePassed = false;
     let currentInvite = null;
     let adminStatusMessage = 'Try adding a user, then test a duplicate like <code>Alice!!</code> to see normalization and conflict handling.';
@@ -1027,7 +1052,7 @@
               <p class="hero-copy">${esc(summary)}</p>
               <div class="hero-tags">
                 <span class="tag">Cloudflare allowlist</span>
-                <span class="tag">UUID-based access</span>
+                <span class="tag">Access-key migration</span>
                 <span class="tag">Operator-friendly demo</span>
               </div>
             </section>
@@ -1055,7 +1080,7 @@
                     <span class="step-index">01</span>
                     <div>
                       <strong>Verify the visitor</strong>
-                      <small>Use an access key or UUID before touching the edge allowlist.</small>
+                      <small>Use an access key or an eligible legacy UUID before touching the edge allowlist.</small>
                     </div>
                   </div>
                   <div class="step">
@@ -1121,7 +1146,7 @@
           <div class="step-pills">
             <span class="step-pill">1. Enter invite</span>
             <span class="step-pill">2. Pass Turnstile</span>
-            <span class="step-pill">3. Add current IP</span>
+            <span class="step-pill">3. Authorize network</span>
           </div>
         </section>
 
@@ -1130,14 +1155,14 @@
             <div>
               <h2 class="panel-title">Access verification</h2>
               <p class="panel-subtitle">
-                Use a short-lived access key or the user UUID tied to this session request.
+                Use the assigned access key. A legacy UUID is accepted only during its migration window.
               </p>
             </div>
             <span class="micro-badge">Primary task</span>
           </div>
 
           <div class="field">
-            <label for="invite_key">Access key or UUID</label>
+            <label for="invite_key">Access key or legacy UUID</label>
             <p class="field-hint">
               Demo values: <code>demo-key-001</code> or <code>demo-invite-001</code>
             </p>
@@ -1149,7 +1174,7 @@
                 autocomplete="one-time-code"
                 required
                 autofocus
-                placeholder="Paste invite key or UUID"
+                placeholder="Paste access key or eligible legacy UUID"
               />
               <button class="ghost toggle-secret" type="button" aria-controls="invite_key" aria-pressed="false">
                 Show
@@ -1171,7 +1196,7 @@
           </div>
 
           <div class="action-row">
-            <button id="submitBtn" class="btn-primary" type="submit" disabled>Add current IP</button>
+            <button id="submitBtn" class="btn-primary" type="submit" disabled>Authorize current network</button>
             <button class="ghost-wide" type="button" id="previewDemo">Load demo key</button>
           </div>
         </form>
@@ -1325,11 +1350,11 @@
 
         <section class="panel panel-stack">
           <div class="tabs" role="tablist" aria-label="Admin sections">
-            <button class="tab active" type="button" data-tab="users" role="tab" aria-selected="true">Users</button>
-            <button class="tab" type="button" data-tab="add" role="tab" aria-selected="false">Add user</button>
+            <button class="tab active" id="tab-users-button" type="button" data-tab="users" role="tab" aria-selected="true" aria-controls="tab-users" tabindex="0">Users</button>
+            <button class="tab" id="tab-add-button" type="button" data-tab="add" role="tab" aria-selected="false" aria-controls="tab-add" tabindex="-1">Add user</button>
           </div>
 
-          <div class="tab-panel active" id="tab-users" role="tabpanel">
+          <div class="tab-panel active" id="tab-users" role="tabpanel" aria-labelledby="tab-users-button">
             <div class="panel-head">
               <div>
                 <h2 class="panel-title">Current UUID users</h2>
@@ -1339,7 +1364,7 @@
             <div class="user-list">${userCards}</div>
           </div>
 
-          <div class="tab-panel" id="tab-add" role="tabpanel">
+          <div class="tab-panel" id="tab-add" role="tabpanel" aria-labelledby="tab-add-button" hidden>
             <div class="panel-head">
               <div>
                 <h2 class="panel-title">Create a user</h2>
@@ -1387,21 +1412,29 @@
 
     function render() {
       const app = document.getElementById("app");
+      app.classList.toggle("no-entry-motion", renderCount > 0);
+      renderCount += 1;
       if (view === "form") app.innerHTML = renderForm();
       if (view === "dashboard") app.innerHTML = renderDashboard();
       if (view === "admin") app.innerHTML = renderAdmin();
       bindEvents();
     }
 
-    function switchTab(tabName) {
+    function switchTab(tabName, moveFocus = false) {
+      let activeTab = null;
       document.querySelectorAll(".tab").forEach((tab) => {
         const active = tab.dataset.tab === tabName;
         tab.classList.toggle("active", active);
         tab.setAttribute("aria-selected", String(active));
+        tab.setAttribute("tabindex", active ? "0" : "-1");
+        if (active) activeTab = tab;
       });
       document.querySelectorAll(".tab-panel").forEach((panel) => {
-        panel.classList.toggle("active", panel.id === `tab-${tabName}`);
+        const active = panel.id === `tab-${tabName}`;
+        panel.classList.toggle("active", active);
+        panel.hidden = !active;
       });
+      if (moveFocus) activeTab?.focus();
     }
 
     function bindEvents() {
@@ -1515,9 +1548,20 @@
         });
       }
 
-      document.querySelectorAll(".tab").forEach((tab) => {
+      const tabs = Array.from(document.querySelectorAll(".tab"));
+      tabs.forEach((tab, index) => {
         tab.addEventListener("click", () => {
           switchTab(tab.dataset.tab);
+        });
+        tab.addEventListener("keydown", (event) => {
+          let targetIndex = null;
+          if (event.key === "ArrowLeft") targetIndex = (index - 1 + tabs.length) % tabs.length;
+          if (event.key === "ArrowRight") targetIndex = (index + 1) % tabs.length;
+          if (event.key === "Home") targetIndex = 0;
+          if (event.key === "End") targetIndex = tabs.length - 1;
+          if (targetIndex === null) return;
+          event.preventDefault();
+          switchTab(tabs[targetIndex].dataset.tab, true);
         });
       });
 

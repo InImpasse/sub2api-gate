@@ -1,0 +1,155 @@
+{
+  "version": 2,
+  "reviewed_sub2api_version": "0.1.162",
+  "reviewed_source_revision": "27f094e0960ebd8e52de7ff7e763c6fec2ff4057",
+  "categories": {
+    "session": [],
+    "oauth": [],
+    "scheduler": [],
+    "billing": [],
+    "concurrency": [],
+    "sync_nonce": [
+      {
+        "prefix": "sub2api-sync:nonce:",
+        "key_pattern": "^sub2api-sync:nonce:[0-9a-f]{64}$",
+        "redis_type": "string",
+        "value_format": "one_marker",
+        "source": "sub2api-sync/sub2api_sync.py"
+      }
+    ]
+  },
+  "discard_prefixes": [
+    {
+      "prefix": "refresh_token:",
+      "reason": "refresh-session metadata is rebuilt and must not enter persistent nonce storage",
+      "source": "backend/internal/repository/refresh_token_cache.go"
+    },
+    {
+      "prefix": "user_refresh_tokens:",
+      "reason": "refresh-token indexes are rebuilt and must not enter persistent nonce storage",
+      "source": "backend/internal/repository/refresh_token_cache.go"
+    },
+    {
+      "prefix": "token_family:",
+      "reason": "token-family indexes are rebuilt and must not enter persistent nonce storage",
+      "source": "backend/internal/repository/refresh_token_cache.go"
+    },
+    {
+      "prefix": "billing:",
+      "reason": "billing cache is rebuilt from PostgreSQL and is not nonce migration data",
+      "source": "backend/internal/repository/billing_cache.go"
+    },
+    {
+      "prefix": "apikey:",
+      "reason": "API key cache is rebuilt from PostgreSQL and is not nonce migration data",
+      "source": "backend/internal/repository/api_key_cache.go"
+    },
+    {
+      "prefix": "window_cost:",
+      "reason": "rolling cost state is rebuilt and is not nonce migration data",
+      "source": "backend/internal/repository/session_limit_cache.go"
+    },
+    {
+      "prefix": "rpm:",
+      "reason": "rate counters are volatile and are not nonce migration data",
+      "source": "backend/internal/repository/rpm_cache.go"
+    },
+    {
+      "prefix": "sticky_session:",
+      "reason": "runtime-only routing hash to numeric account ID; volatile app Redis is discarded, never migrated",
+      "source": "backend/internal/repository/gateway_cache.go"
+    },
+    {
+      "prefix": "masked_session:",
+      "reason": "short-lived random masking session is regenerated after restart",
+      "source": "backend/internal/repository/identity_cache.go"
+    },
+    {
+      "prefix": "cyber_session_block:",
+      "reason": "runtime-only SHA-256 session reference with one-marker value; discarded instead of migrated",
+      "source": "backend/internal/repository/gateway_cache.go"
+    },
+    {
+      "prefix": "session_limit:account:",
+      "reason": "set members are request session identifiers and active state is stale after stop",
+      "source": "backend/internal/repository/session_limit_cache.go"
+    },
+    {
+      "prefix": "totp:setup:",
+      "reason": "temporary setup state may contain a TOTP secret",
+      "source": "backend/internal/repository/totp_cache.go"
+    },
+    {
+      "prefix": "totp:login:",
+      "reason": "temporary authentication token and login state are not migrated",
+      "source": "backend/internal/repository/totp_cache.go"
+    },
+    {
+      "prefix": "totp:attempts:",
+      "reason": "short-lived attempt counter is rebuilt after restart",
+      "source": "backend/internal/repository/totp_cache.go"
+    },
+    {
+      "prefix": "totp:stepup:",
+      "reason": "temporary privileged authentication grant must not survive migration",
+      "source": "backend/internal/repository/totp_cache.go"
+    },
+    {
+      "prefix": "oauth:token:",
+      "reason": "value is a raw short-lived upstream access token and is refreshable",
+      "source": "backend/internal/repository/gemini_token_cache.go"
+    },
+    {
+      "prefix": "oauth:refresh_lock:",
+      "reason": "refresh coordination lock is stale after writers stop",
+      "source": "backend/internal/repository/gemini_token_cache.go"
+    },
+    {
+      "prefix": "sched:",
+      "reason": "scheduler snapshots are rebuildable and full account payloads can contain credentials",
+      "source": "backend/internal/repository/scheduler_cache.go"
+    },
+    {
+      "prefix": "temp_unsched:account:",
+      "reason": "temporary scheduler state is rebuilt from current account state",
+      "source": "backend/internal/repository/temp_unsched_cache.go"
+    },
+    {
+      "prefix": "leader:lock:",
+      "reason": "process ownership lock is invalid after restart",
+      "source": "backend/internal/repository/leader_lock_cache.go"
+    },
+    {
+      "prefix": "concurrency:",
+      "reason": "request identifiers and active process leases are stale after writers stop",
+      "source": "backend/internal/repository/concurrency_cache.go"
+    },
+    {
+      "prefix": "umq:",
+      "reason": "request-ID lock and completion metadata is stale after writers stop",
+      "source": "backend/internal/repository/user_msg_queue_cache.go"
+    },
+    {
+      "prefix": "wait:account:",
+      "reason": "runtime-only expiring integer wait counter; stale after writers stop and never migrated",
+      "source": "backend/internal/repository/concurrency_cache.go"
+    },
+    {
+      "prefix": "subscription:cache:invalidate",
+      "reason": "pubsub channel state is not persistent migration data",
+      "source": "backend/internal/repository/billing_cache.go"
+    }
+  ],
+  "forbidden_prefixes": [
+    "openai:response",
+    "sub2api:prompt_audit:payload:",
+    "sub2api:prompt_guard:",
+    "content_moderation:",
+    "image_task:",
+    "batch_image:",
+    "request:",
+    "response:",
+    "prompt:",
+    "conversation:"
+  ]
+}

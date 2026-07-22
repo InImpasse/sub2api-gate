@@ -1,0 +1,6 @@
+# Temporary override for the sanitized PostgreSQL logical stream. Combine this
+# with docker-compose.traffic-canary.yml and remove it before Sub2API starts.
+services:
+  traffic-canary-postgres:
+    ports:
+      - "127.0.0.1:15432:5432"

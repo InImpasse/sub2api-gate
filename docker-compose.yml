@@ -1,65 +1,84 @@
 # =============================================================================
-# Sub2API Docker Compose - Local Directory Version
+# Sub2API Docker Compose - Privacy-Preserving Production Layout
 # =============================================================================
-# This configuration uses local directories for data storage instead of named
-# volumes, making it easy to migrate the entire deployment by simply copying
-# the deploy directory.
+# Persistent state lives below an explicitly configured /mnt/data root. Compose
+# must never create a missing host directory because an empty bind mount can
+# make a failed migration look like a clean installation.
 #
 # Quick Start:
-#   1. Copy .env.example to .env and configure
-#   2. mkdir -p data postgres_data redis_data
-#   3. docker compose up -d
-#   4. Check logs: docker compose logs -f sub2api
-#   5. Access: http://localhost:8080
-#
-# Migration to New Server:
-#   1. docker compose down
-#   2. tar czf sub2api-stack.tar.gz .
-#   3. Transfer to new server and extract
-#   4. docker compose up -d
+#   1. Copy .env.example to .env and configure it with mode 0600.
+#   2. Pre-create app, postgres, redis/nonce, safe-backup, and exports below
+#      /mnt/data/sub2api-gate with the ownership documented in deploy/README.md.
+#   3. Run deploy/security-preflight.sh check before any Compose action.
 # =============================================================================
+
+# Force direct Compose callers to provide the reviewed root while keeping every
+# bind source fixed below. Preflight additionally verifies the value is exact.
+x-required-data-root: ${SUB2API_DATA_ROOT:?SUB2API_DATA_ROOT must be /mnt/data/sub2api-gate}
 
 services:
   # ===========================================================================
   # Sub2API Application
   # ===========================================================================
   sub2api:
-    image: weishaw/sub2api:latest
+    image: weishaw/sub2api@sha256:469790e0389bf31379978687149280a4e135393ad98a9a401951b6be9b1df444
     container_name: sub2api
     restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    init: true
+    # This upstream version has error paths that can print response bodies even
+    # when body logging is disabled. Discard stdout/stderr at the Docker layer.
+    logging:
+      driver: "none"
     ulimits:
+      core:
+        soft: 0
+        hard: 0
       nofile:
         soft: 100000
         hard: 100000
     ports:
-      - "${BIND_HOST:-127.0.0.1}:${SERVER_PORT:-8080}:8080"
+      # Nginx has a fixed loopback upstream at 127.0.0.1:8080. Keeping this
+      # literal prevents a stale shell or .env override from exposing Sub2API
+      # directly or disconnecting it from the reviewed request path.
+      - "127.0.0.1:8080:8080"
     volumes:
-      # Local directory mapping for easy migration
-      - ./data:/app/data
-      # Optional: Mount custom config.yaml (uncomment and create the file first)
-      # Copy config.example.yaml to config.yaml, modify it, then uncomment:
-      # - ./config.yaml:/app/data/config.yaml
+      - type: bind
+        source: /mnt/data/sub2api-gate/app
+        target: /app/data
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=1000,gid=1000
     environment:
       # =======================================================================
       # Auto Setup (REQUIRED for Docker deployment)
       # =======================================================================
-      - AUTO_SETUP=true
+      - AUTO_SETUP=false
+      # Sub2API 0.1.162 probes DATA_DIR for writability and its pricing service
+      # atomically refreshes reviewed model metadata here. The bind itself is
+      # owner-only; the container root filesystem remains read-only.
+      - DATA_DIR=/app/data
+      - PRICING_DATA_DIR=/app/data
 
       # =======================================================================
       # Server Configuration
       # =======================================================================
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8080
-      - SERVER_MODE=${SERVER_MODE:-release}
-      - RUN_MODE=${RUN_MODE:-standard}
+      - SERVER_MODE=release
+      - RUN_MODE=standard
 
       # =======================================================================
       # Database Configuration (PostgreSQL)
       # =======================================================================
       - DATABASE_HOST=postgres
       - DATABASE_PORT=5432
-      - DATABASE_USER=${POSTGRES_USER:-sub2api}
-      - DATABASE_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      # Schema/bootstrap migrations use the owner out of band. The runtime is
+      # deliberately unable to disable privacy triggers or perform DDL.
+      - DATABASE_USER=sub2api_app
+      - DATABASE_PASSWORD=${SUB2API_APP_DATABASE_PASSWORD:?SUB2API_APP_DATABASE_PASSWORD is required}
       - DATABASE_DBNAME=${POSTGRES_DB:-sub2api}
       - DATABASE_SSLMODE=disable
       - DATABASE_MAX_OPEN_CONNS=${DATABASE_MAX_OPEN_CONNS:-50}
@@ -72,17 +91,11 @@ services:
       # =======================================================================
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD is required}
       - REDIS_DB=${REDIS_DB:-0}
       - REDIS_POOL_SIZE=${REDIS_POOL_SIZE:-1024}
       - REDIS_MIN_IDLE_CONNS=${REDIS_MIN_IDLE_CONNS:-10}
       - REDIS_ENABLE_TLS=${REDIS_ENABLE_TLS:-false}
-
-      # =======================================================================
-      # Admin Account (auto-created on first run)
-      # =======================================================================
-      - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@sub2api.local}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
 
       # =======================================================================
       # JWT Configuration
@@ -91,7 +104,7 @@ services:
       # invalidated after container restarts. If left empty, a random secret
       # will be generated on each startup.
       # Generate a secure secret: openssl rand -hex 32
-      - JWT_SECRET=${JWT_SECRET:-}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
       - JWT_EXPIRE_HOUR=${JWT_EXPIRE_HOUR:-24}
 
       # =======================================================================
@@ -102,7 +115,7 @@ services:
       # TOTP configurations to become invalid (users won't be able to login
       # with 2FA).
       # Generate a secure key: openssl rand -hex 32
-      - TOTP_ENCRYPTION_KEY=${TOTP_ENCRYPTION_KEY:-}
+      - TOTP_ENCRYPTION_KEY=${TOTP_ENCRYPTION_KEY:?TOTP_ENCRYPTION_KEY is required}
 
       # =======================================================================
       # Timezone Configuration
@@ -132,13 +145,20 @@ services:
       # Security Configuration (URL Allowlist)
       # =======================================================================
       # Enable URL allowlist validation (false to skip allowlist checks)
-      - SECURITY_URL_ALLOWLIST_ENABLED=${SECURITY_URL_ALLOWLIST_ENABLED:-false}
+      - SECURITY_URL_ALLOWLIST_ENABLED=true
       # Allow insecure HTTP URLs when allowlist is disabled (default: false, requires https)
-      - SECURITY_URL_ALLOWLIST_ALLOW_INSECURE_HTTP=${SECURITY_URL_ALLOWLIST_ALLOW_INSECURE_HTTP:-false}
+      - SECURITY_URL_ALLOWLIST_ALLOW_INSECURE_HTTP=false
       # Allow private IP addresses for upstream/pricing/CRS (for internal deployments)
-      - SECURITY_URL_ALLOWLIST_ALLOW_PRIVATE_HOSTS=${SECURITY_URL_ALLOWLIST_ALLOW_PRIVATE_HOSTS:-false}
+      - SECURITY_URL_ALLOWLIST_ALLOW_PRIVATE_HOSTS=false
       # Upstream hosts whitelist (comma-separated, only used when enabled=true)
-      - SECURITY_URL_ALLOWLIST_UPSTREAM_HOSTS=${SECURITY_URL_ALLOWLIST_UPSTREAM_HOSTS:-}
+      - SECURITY_URL_ALLOWLIST_UPSTREAM_HOSTS=${SECURITY_URL_ALLOWLIST_UPSTREAM_HOSTS:?SECURITY_URL_ALLOWLIST_UPSTREAM_HOSTS is required}
+
+      # Never persist upstream request/response content in application logs.
+      - LOG_OUTPUT_TO_FILE=false
+      - LOG_OUTPUT_TO_STDOUT=true
+      - GATEWAY_LOG_UPSTREAM_ERROR_BODY=false
+      - RISK_CONTROL_ENABLED=false
+      - IMAGE_STORAGE_ENABLED=false
 
       # =======================================================================
       # Update Configuration (在线更新配置)
@@ -164,41 +184,190 @@ services:
         condition: service_healthy
     networks:
       - sub2api-network
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "wget", "-q", "-T", "5", "-O", "/dev/null", "http://localhost:8080/health"]
+      test:
+        - CMD-SHELL
+        - >-
+          /app/sub2api --version 2>&1 | grep -F 'Sub2API 0.1.162' >/dev/null &&
+          wget -q -T 5 -O /dev/null http://localhost:8080/health
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
 
+  sub2api-sync:
+    # Built and attested before the maintenance window by sync-canary.py.
+    # Runtime Compose is deliberately unable to build or pull this image.
+    image: sub2api-gate/sub2api-sync:pg18.4-r1
+    pull_policy: never
+    container_name: sub2api-sync
+    restart: unless-stopped
+    # Sync emits stable codes only, but the host must not retain stderr output.
+    logging:
+      driver: "none"
+    user: "65532:65532"
+    read_only: true
+    init: true
+    ports:
+      - "127.0.0.1:3021:3021"
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+      - SUB2API_SYNC_HOST=0.0.0.0
+      - SUB2API_SYNC_PORT=3021
+      - SUB2API_SYNC_SECRET=${SUB2API_SYNC_SECRET:?SUB2API_SYNC_SECRET is required}
+      - SUB2API_SYNC_DATABASE_HOST=postgres
+      - SUB2API_SYNC_DATABASE_PORT=5432
+      - SUB2API_SYNC_DATABASE_NAME=${POSTGRES_DB:-sub2api}
+      - SUB2API_SYNC_DATABASE_USER=sub2api_sync
+      - SUB2API_SYNC_DATABASE_PASSWORD=${SUB2API_SYNC_DATABASE_PASSWORD:?SUB2API_SYNC_DATABASE_PASSWORD is required}
+      - SUB2API_SYNC_REDIS_HOST=redis-nonce
+      - SUB2API_SYNC_REDIS_PORT=6379
+      - SUB2API_SYNC_REDIS_USERNAME=sub2api_sync
+      - SUB2API_SYNC_REDIS_PASSWORD=${SUB2API_SYNC_REDIS_PASSWORD:?SUB2API_SYNC_REDIS_PASSWORD is required}
+      - SUB2API_SYNC_REDIS_DB=${REDIS_DB:-0}
+      - SUB2API_INTERNAL_LOGIN_URL=http://sub2api:8080/api/v1/auth/login
+      - SUB2API_SYNC_DEFAULT_GROUP=openai-default
+      - SUB2API_LOGIN_URL=${SUB2API_LOGIN_URL:?SUB2API_LOGIN_URL is required}
+      - SUB2API_PUBLIC_BASE_URL=${SUB2API_PUBLIC_BASE_URL:?SUB2API_PUBLIC_BASE_URL is required}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    cpus: 0.50
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-nonce:
+        condition: service_healthy
+      sub2api:
+        condition: service_healthy
+    networks:
+      - sub2api-network
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3021/healthz', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
   # ===========================================================================
   # PostgreSQL Database
   # ===========================================================================
   postgres:
-    image: postgres:18-alpine
+    image: postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
     container_name: sub2api-postgres
     restart: unless-stopped
+    user: "70:70"
+    read_only: true
+    command:
+      - postgres
+      - -c
+      - logging_collector=off
+      - -c
+      - log_destination=stderr
+      - -c
+      - log_directory=log
+      - -c
+      - log_statement=none
+      - -c
+      - log_min_error_statement=panic
+      - -c
+      - log_min_messages=panic
+      - -c
+      - log_error_verbosity=terse
+      - -c
+      - log_parameter_max_length=0
+      - -c
+      - log_parameter_max_length_on_error=0
+      - -c
+      - log_duration=off
+      - -c
+      - log_min_duration_statement=-1
+      - -c
+      - log_min_duration_sample=-1
+      - -c
+      - log_statement_sample_rate=0
+      - -c
+      - log_transaction_sample_rate=0
+      - -c
+      - log_connections=off
+      - -c
+      - log_disconnections=off
+      - -c
+      - log_replication_commands=off
+      - -c
+      - log_checkpoints=off
+      - -c
+      - log_lock_waits=off
+      - -c
+      - log_temp_files=-1
+      - -c
+      - log_autovacuum_min_duration=-1
+      - -c
+      - debug_print_parse=off
+      - -c
+      - debug_print_rewritten=off
+      - -c
+      - debug_print_plan=off
+      - -c
+      - log_parser_stats=off
+      - -c
+      - log_planner_stats=off
+      - -c
+      - log_executor_stats=off
+      - -c
+      - log_statement_stats=off
+    # PostgreSQL errors can include statement detail; do not persist container logs.
+    logging:
+      driver: "none"
     ulimits:
+      core:
+        soft: 0
+        hard: 0
       nofile:
         soft: 100000
         hard: 100000
     volumes:
-      # Local directory mapping for easy migration
-      - ./postgres_data:/var/lib/postgresql/data
+      # PostgreSQL 18's official image requires one mount at this parent and
+      # stores each major version in its own nested directory.
+      - type: bind
+        source: /mnt/data/sub2api-gate/postgres
+        target: /var/lib/postgresql
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /var/run/postgresql:rw,noexec,nosuid,nodev,size=8m,mode=0770,uid=70,gid=70
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=70,gid=70
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-sub2api}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       - POSTGRES_DB=${POSTGRES_DB:-sub2api}
-      - PGDATA=/var/lib/postgresql/data
+      - PGDATA=/var/lib/postgresql/18/docker
       - TZ=${TZ:-Asia/Shanghai}
     networks:
       - sub2api-network
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sub2api} -d ${POSTGRES_DB:-sub2api}"]
+      test:
+        - CMD-SHELL
+        - >-
+          postgres --version | grep -E ' 18\.' >/dev/null &&
+          pg_isready -U ${POSTGRES_USER:-sub2api} -d ${POSTGRES_DB:-sub2api}
       interval: 10s
       timeout: 5s
       retries: 5
@@ -207,36 +376,142 @@ services:
     # 如需调试，可临时添加：ports: ["127.0.0.1:5433:5432"]
 
   # ===========================================================================
-  # Redis Cache
+  # Sub2API Redis Cache
+  #
+  # Sub2API stores raw OAuth tokens, temporary TOTP state, scheduler account
+  # snapshots, and request-derived routing identifiers in Redis. Redis OSS
+  # cannot omit selected key prefixes from RDB/AOF, so its persistence directory
+  # is tmpfs-backed and all Redis persistence is disabled. It always starts
+  # empty; PostgreSQL is the system of record and no app Redis migration exists.
   # ===========================================================================
   redis:
-    image: redis:8-alpine
+    image: redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005
     container_name: sub2api-redis
     restart: unless-stopped
+    user: "999:1000"
+    read_only: true
+    mem_limit: 256m
+    logging:
+      driver: "none"
     ulimits:
+      core:
+        soft: 0
+        hard: 0
       nofile:
         soft: 100000
         hard: 100000
     volumes:
-      # Local directory mapping for easy migration
-      - ./redis_data:/data
-    command: >
-        sh -c '
-          redis-server
-          --save 60 1
-          --appendonly yes
-          --appendfsync everysec
-          ${REDIS_PASSWORD:+--requirepass "$REDIS_PASSWORD"}'
+      - type: bind
+        source: /mnt/data/sub2api-gate/redis/users.acl
+        target: /etc/redis/users.acl
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /data:rw,noexec,nosuid,nodev,size=128m,mode=0700,uid=999,gid=1000
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=999,gid=1000
+    command:
+      - redis-server
+      - --aclfile
+      - /etc/redis/users.acl
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - noeviction
+      - --rdbcompression
+      - "yes"
+      - --rdbchecksum
+      - "yes"
     environment:
       - TZ=${TZ:-Asia/Shanghai}
-      # REDISCLI_AUTH is used by redis-cli for authentication (safer than -a flag)
-      - REDISCLI_AUTH=${REDIS_PASSWORD:-}
+      - REDISCLI_AUTH=${REDIS_PASSWORD:?REDIS_PASSWORD is required}
     networks:
       - sub2api-network
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test:
+        - CMD-SHELL
+        - >-
+          redis-server --version | grep -F 'v=8.8.0' >/dev/null &&
+          redis-cli --user default ping | grep -qx PONG
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # Replay-protection Redis
+  # ---------------------------------------------------------------------------
+  # This instance accepts only HMAC nonce markers. AOF fsyncs every accepted
+  # SET before it is acknowledged so a crash cannot reopen the signed-request
+  # replay window. It never receives Sub2API cache, token, or scheduler keys.
+  redis-nonce:
+    image: redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005
+    container_name: sub2api-redis-nonce
+    restart: unless-stopped
+    user: "999:1000"
+    read_only: true
+    mem_limit: 128m
+    logging:
+      driver: "none"
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
+    volumes:
+      - type: bind
+        source: /mnt/data/sub2api-gate/redis/nonce
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /mnt/data/sub2api-gate/redis/nonce-users.acl
+        target: /etc/redis/users.acl
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=999,gid=1000
+    command:
+      - redis-server
+      - --aclfile
+      - /etc/redis/users.acl
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - "always"
+      - --save
+      - ""
+      - --maxmemory
+      - 32mb
+      - --maxmemory-policy
+      - noeviction
+      # Redis 8.8.0's bundled Search module refuses to start with an AOF when
+      # the RDB preamble is disabled. This remains a nonce-only AOF.
+      - --aof-use-rdb-preamble
+      - "yes"
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - REDISCLI_AUTH=${SUB2API_SYNC_REDIS_PASSWORD:?SUB2API_SYNC_REDIS_PASSWORD is required}
+    networks:
+      - sub2api-network
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          redis-server --version | grep -F 'v=8.8.0' >/dev/null &&
+          redis-cli --user sub2api_sync ping | grep -qx PONG
       interval: 10s
       timeout: 5s
       retries: 5
