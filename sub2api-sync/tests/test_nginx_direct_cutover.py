@@ -70,11 +70,13 @@ class NginxDirectCutoverTests(unittest.TestCase):
     def fixture(self, directory, *, fail_nginx=False, fail_reload=False, fail_canary=False):
         root = pathlib.Path(directory) / "nginx"
         (root / "conf.d").mkdir(parents=True)
+        (root / "snippets").mkdir()
         (root / "sites-available").mkdir()
         (root / "sites-enabled").mkdir()
         for managed_directory in (
             root,
             root / "conf.d",
+            root / "snippets",
             root / "sites-available",
             root / "sites-enabled",
         ):
@@ -166,7 +168,7 @@ class NginxDirectCutoverTests(unittest.TestCase):
         with self.assertRaisesRegex(self.module.CutoverError, "regex locations"):
             self.module.rewrite_direct_v1(regex, "gateway.example.test")
 
-    def test_rewrite_requires_the_switchable_named_upstream(self):
+    def test_rewrite_creates_or_validates_the_switchable_named_upstream(self):
         missing = OLD_CONFIG.replace(
             "upstream sub2api_backend {\n"
             "    include /etc/nginx/snippets/sub2api-upstream-active.conf;\n"
@@ -175,8 +177,12 @@ class NginxDirectCutoverTests(unittest.TestCase):
             "",
             1,
         )
-        with self.assertRaisesRegex(self.module.CutoverError, "one reviewed Sub2API upstream"):
-            self.module.rewrite_direct_v1(missing, "gateway.example.test")
+        rewritten = self.module.rewrite_direct_v1(missing, "gateway.example.test")
+        self.assertEqual(rewritten.count("upstream sub2api_backend {"), 1)
+        self.assertIn(
+            "include /etc/nginx/snippets/sub2api-upstream-active.conf;",
+            rewritten,
+        )
         unmanaged = OLD_CONFIG.replace(
             "include /etc/nginx/snippets/sub2api-upstream-active.conf;",
             "server 127.0.0.1:8080;",
@@ -240,6 +246,14 @@ class NginxDirectCutoverTests(unittest.TestCase):
             self.assertNotIn("3021/capture", rendered)
             self.assertIn("proxy_pass http://sub2api_backend;", rendered)
             self.assertTrue((pathlib.Path(directory) / "nginx/conf.d/00-connection-upgrade-map.conf").is_file())
+            self.assertEqual(
+                (pathlib.Path(directory) / "nginx/snippets/sub2api-upstream-active.conf").read_text(),
+                "server 127.0.0.1:8080;\n",
+            )
+            self.assertEqual(
+                (pathlib.Path(directory) / "nginx/snippets/sub2api-sync-location.conf").read_text(),
+                (ROOT / "nginx/sub2api-sync-location.conf").read_text(),
+            )
             self.assertEqual(nginx_calls.read_text().strip(), "1")
             self.assertEqual(reload_calls.read_text().strip(), "1")
             self.assertIn("--approved-hostname gateway.example.test", canary_calls.read_text())
@@ -480,6 +494,8 @@ class NginxDirectCutoverTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(target.read_text(), original)
                 self.assertFalse((pathlib.Path(directory) / "nginx/conf.d/00-connection-upgrade-map.conf").exists())
+                self.assertFalse((pathlib.Path(directory) / "nginx/snippets/sub2api-upstream-active.conf").exists())
+                self.assertFalse((pathlib.Path(directory) / "nginx/snippets/sub2api-sync-location.conf").exists())
                 self.assertEqual(nginx_calls.read_text().strip(), "2")
                 self.assertGreaterEqual(int(reload_calls.read_text().strip()), 1)
                 self.assertIn("restored and reloaded", result.stderr)

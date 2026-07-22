@@ -31,6 +31,13 @@ CAPTURE_MARKERS = (
     "/capture",
     "_capture",
 )
+UPSTREAM_BLOCK = """upstream sub2api_backend {
+    include /etc/nginx/snippets/sub2api-upstream-active.conf;
+    keepalive 64;
+}
+
+"""
+STABLE_UPSTREAM = b"server 127.0.0.1:8080;\n"
 DIRECT_LOCATION = """    location ^~ /v1/ {
         proxy_pass http://sub2api_backend;
         access_log off;
@@ -317,6 +324,15 @@ def rewrite_direct_v1(text, hostname):
     rewritten = text
     for start, end, replacement in sorted(replacements, reverse=True):
         rewritten = rewritten[:start] + replacement + rewritten[end:]
+
+    rewritten_blocks, _ = parse_config(rewritten)
+    existing_upstreams = [
+        block for block in rewritten_blocks
+        if block.parent is None
+        and tokenise(block.header) == ["upstream", "sub2api_backend"]
+    ]
+    if not existing_upstreams:
+        rewritten = UPSTREAM_BLOCK + rewritten
 
     verify_rewritten_config(rewritten, normalized_hostname)
     return rewritten
@@ -732,6 +748,52 @@ def run_locked_cutover(arguments, *, test_mode, nginx_root, state_root):
         )
         map_original = map_target.read_bytes()
 
+    snippets_dir = nginx_root / "snippets"
+    validate_managed_directory(
+        snippets_dir,
+        "Nginx snippets directory",
+        production=production,
+    )
+    source_stable = REPO_DIR / "nginx" / "snippets" / "sub2api-upstream-stable.conf"
+    expected_stable = source_stable.read_bytes()
+    if expected_stable != STABLE_UPSTREAM:
+        raise CutoverError("tracked stable Sub2API upstream is not the reviewed version")
+    stable_target = snippets_dir / "sub2api-upstream-active.conf"
+    stable_original = None
+    stable_stat = None
+    if stable_target.exists() or stable_target.is_symlink():
+        stable_stat = validate_managed_file(
+            stable_target,
+            "existing active Sub2API upstream",
+            production=production,
+        )
+        stable_original = stable_target.read_bytes()
+        if stable_original != expected_stable:
+            raise CutoverError("existing active Sub2API upstream is not stable 127.0.0.1:8080")
+
+    source_sync = REPO_DIR / "nginx" / "sub2api-sync-location.conf"
+    expected_sync = source_sync.read_bytes()
+    lowered_sync = expected_sync.lower()
+    if (
+        len(expected_sync) > MAX_CONFIG_BYTES
+        or expected_sync.count(b"/_sub2api-sync/provision") != 1
+        or b"capture" in lowered_sync
+        or b"mirror" in lowered_sync
+    ):
+        raise CutoverError("tracked sync location is not the reviewed capture-free version")
+    sync_target = snippets_dir / "sub2api-sync-location.conf"
+    sync_original = None
+    sync_stat = None
+    if sync_target.exists() or sync_target.is_symlink():
+        sync_stat = validate_managed_file(
+            sync_target,
+            "existing sync location",
+            production=production,
+        )
+        sync_original = sync_target.read_bytes()
+        if len(sync_original) > MAX_CONFIG_BYTES:
+            raise CutoverError("existing sync location is too large")
+
     backup_root = state_root / "backups"
     ensure_managed_directory(
         backup_root,
@@ -757,14 +819,38 @@ def run_locked_cutover(arguments, *, test_mode, nginx_root, state_root):
         atomic_write(backup_dir / "connection-map.conf", map_original, mode=0o600)
     else:
         atomic_write(backup_dir / "connection-map.absent", b"", mode=0o600)
+    if stable_original is not None:
+        atomic_write(backup_dir / "active-upstream.conf", stable_original, mode=0o600)
+    else:
+        atomic_write(backup_dir / "active-upstream.absent", b"", mode=0o600)
+    if sync_original is not None:
+        atomic_write(backup_dir / "sync-location.conf", sync_original, mode=0o600)
+    else:
+        atomic_write(backup_dir / "sync-location.absent", b"", mode=0o600)
 
     site_changed = False
     map_changed = False
+    stable_changed = False
+    sync_changed = False
     try:
         atomic_write(resolved_site, rewritten, file_stat=site_stat)
         site_changed = True
         atomic_write(map_target, expected_map, file_stat=map_stat, mode=0o644)
         map_changed = True
+        atomic_write(
+            stable_target,
+            expected_stable,
+            file_stat=stable_stat,
+            mode=0o644,
+        )
+        stable_changed = True
+        atomic_write(
+            sync_target,
+            expected_sync,
+            file_stat=sync_stat,
+            mode=0o644,
+        )
+        sync_changed = True
         verify_no_capture_config(nginx_root)
         if not command_ok([nginx_bin, "-t"]):
             raise CutoverError("new Nginx configuration failed syntax validation")
@@ -780,7 +866,7 @@ def run_locked_cutover(arguments, *, test_mode, nginx_root, state_root):
         if not command_ok(canary_command, visible=True):
             raise CutoverError("end-to-end /v1 canary failed")
     except BaseException:
-        if site_changed or map_changed:
+        if site_changed or map_changed or stable_changed or sync_changed:
             restore_failed = False
             try:
                 atomic_write(resolved_site, original, file_stat=site_stat)
@@ -791,6 +877,20 @@ def run_locked_cutover(arguments, *, test_mode, nginx_root, state_root):
                         pass
                 else:
                     atomic_write(map_target, map_original, file_stat=map_stat)
+                if stable_original is None:
+                    try:
+                        stable_target.unlink()
+                    except FileNotFoundError:
+                        pass
+                else:
+                    atomic_write(stable_target, stable_original, file_stat=stable_stat)
+                if sync_original is None:
+                    try:
+                        sync_target.unlink()
+                    except FileNotFoundError:
+                        pass
+                else:
+                    atomic_write(sync_target, sync_original, file_stat=sync_stat)
                 if not command_ok([nginx_bin, "-t"]):
                     restore_failed = True
                 elif not command_ok([systemctl_bin, "reload", "nginx"]):
