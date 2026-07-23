@@ -154,6 +154,15 @@ def _matching_registered_totp_counter(verifier, secret, code, now=None):
         return None
 
 
+def _registered_secret_matches(verifier, secret):
+    try:
+        salt, expected = _validated_registered_secret_verifier(verifier)
+        actual = _registered_secret_digest(secret, salt)
+        return hmac.compare_digest(actual, expected)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _require_private_parent(path, expected_uid):
     path = pathlib.Path(path)
     if not path.is_absolute():
@@ -187,6 +196,389 @@ def _fsync_directory(path):
     finally:
         os.close(descriptor)
 
+
+
+def _registered_secret_verifier_payload(verifier):
+    _validated_registered_secret_verifier(verifier)
+    payload = (
+        json.dumps(verifier, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("ascii")
+    if len(payload) > MAX_VERIFIER_BYTES:
+        raise TotpVerificationError("registered TOTP verifier is invalid")
+    return payload
+
+
+def _replay_state_payload(counter):
+    if type(counter) is not int or not 0 <= counter <= MAX_TOTP_COUNTER:
+        raise TotpVerificationError(
+            "privacy migration TOTP replay state is invalid"
+        )
+    return (
+        json.dumps(
+            {"version": REPLAY_STATE_VERSION, "last_counter": counter},
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+    ).encode("ascii")
+
+
+def _unlink_if_present(path):
+    try:
+        pathlib.Path(path).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _write_private_temporary_file(path, payload, *, expected_uid):
+    path = _require_private_parent(path, expected_uid)
+    if not isinstance(payload, bytes) or not payload:
+        raise TotpVerificationError("privacy migration TOTP rotation is invalid")
+    temporary = path.parent / f".{path.name}.rotation-tmp-{secrets.token_hex(16)}"
+    descriptor = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        os.fchmod(descriptor, 0o600)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != expected_uid
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+        ):
+            raise TotpVerificationError("privacy migration TOTP rotation is unsafe")
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("could not write private temporary file")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        return temporary
+    except TotpVerificationError:
+        raise
+    except OSError as error:
+        raise TotpVerificationError(
+            "privacy migration TOTP rotation could not stage replacement"
+        ) from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            finally:
+                _unlink_if_present(temporary)
+
+
+def _link_rotation_backup(path, *, expected_uid):
+    path = pathlib.Path(path)
+    temporary = path.parent / f".{path.name}.rotation-backup-{secrets.token_hex(16)}"
+    try:
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != expected_uid
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+        ):
+            raise TotpVerificationError("privacy migration TOTP rotation is unsafe")
+        os.link(path, temporary, follow_symlinks=False)
+        after = temporary.lstat()
+        if (
+            (before.st_dev, before.st_ino)
+            != (after.st_dev, after.st_ino)
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_uid != expected_uid
+            or stat.S_IMODE(after.st_mode) != 0o600
+            or after.st_nlink != 2
+        ):
+            raise TotpVerificationError("privacy migration TOTP rotation is unsafe")
+        return temporary
+    except TotpVerificationError:
+        _unlink_if_present(temporary)
+        raise
+    except OSError as error:
+        _unlink_if_present(temporary)
+        raise TotpVerificationError(
+            "privacy migration TOTP rotation could not preserve current state"
+        ) from error
+
+
+def _replace_rotation_path(source, destination):
+    os.replace(source, destination)
+
+
+def _restore_rotation_file(backup, destination, *, expected_uid):
+    backup = _require_private_parent(backup, expected_uid)
+    destination = _require_private_parent(destination, expected_uid)
+    if backup.parent != destination.parent:
+        raise TotpVerificationError("privacy migration TOTP rotation is unsafe")
+    temporary = destination.parent / (
+        f".{destination.name}.rotation-restore-{secrets.token_hex(16)}"
+    )
+    try:
+        backup_metadata = backup.lstat()
+        destination_metadata = destination.lstat()
+        if (
+            not stat.S_ISREG(backup_metadata.st_mode)
+            or backup_metadata.st_uid != expected_uid
+            or stat.S_IMODE(backup_metadata.st_mode) != 0o600
+            or backup_metadata.st_nlink not in (1, 2)
+            or not stat.S_ISREG(destination_metadata.st_mode)
+            or destination_metadata.st_uid != expected_uid
+            or stat.S_IMODE(destination_metadata.st_mode) != 0o600
+            or destination_metadata.st_nlink not in (1, 2)
+        ):
+            raise TotpVerificationError("privacy migration TOTP rotation is unsafe")
+        if (backup_metadata.st_dev, backup_metadata.st_ino) == (
+            destination_metadata.st_dev,
+            destination_metadata.st_ino,
+        ):
+            return
+        os.link(backup, temporary, follow_symlinks=False)
+        temporary_metadata = temporary.lstat()
+        if (
+            (backup_metadata.st_dev, backup_metadata.st_ino)
+            != (temporary_metadata.st_dev, temporary_metadata.st_ino)
+            or not stat.S_ISREG(temporary_metadata.st_mode)
+            or temporary_metadata.st_uid != expected_uid
+            or stat.S_IMODE(temporary_metadata.st_mode) != 0o600
+            or temporary_metadata.st_nlink != backup_metadata.st_nlink + 1
+        ):
+            raise TotpVerificationError("privacy migration TOTP rotation is unsafe")
+        os.replace(temporary, destination)
+        temporary = None
+    except TotpVerificationError:
+        raise
+    except OSError as error:
+        raise TotpVerificationError(
+            "privacy migration TOTP rotation could not be rolled back safely"
+        ) from error
+    finally:
+        if temporary is not None:
+            try:
+                _unlink_if_present(temporary)
+            except OSError as error:
+                raise TotpVerificationError(
+                    "privacy migration TOTP rotation could not be rolled back safely"
+                ) from error
+
+
+def _cleanup_rotation_backups(parent, *backups):
+    try:
+        for backup in backups:
+            if backup is not None:
+                _unlink_if_present(backup)
+        _fsync_directory(parent)
+    except OSError:
+        # A verified live state is safer than turning a successful commit or
+        # rollback into a failed operation solely because cleanup is delayed.
+        pass
+
+
+def _restore_rotation_material(
+    verifier_path,
+    verifier_backup,
+    state_path,
+    state_backup,
+    *,
+    expected_uid,
+):
+    # Restore the verifier first. If that fails, keeping the newer replay
+    # state is safer than making the new rotation code reusable. Preserve the
+    # backup links until the restored live paths are durable.
+    _restore_rotation_file(
+        verifier_backup,
+        verifier_path,
+        expected_uid=expected_uid,
+    )
+    try:
+        if state_backup is None:
+            _unlink_if_present(state_path)
+        else:
+            _restore_rotation_file(
+                state_backup,
+                state_path,
+                expected_uid=expected_uid,
+            )
+        _fsync_directory(pathlib.Path(verifier_path).parent)
+    except OSError as error:
+        raise TotpVerificationError(
+            "privacy migration TOTP rotation could not be rolled back safely"
+        ) from error
+
+
+def _replace_registered_totp_material(
+    verifier_path,
+    verifier,
+    state_path,
+    state_counter,
+    *,
+    previous_state_counter,
+    expected_uid,
+):
+    path = _require_private_parent(verifier_path, expected_uid)
+    verifier_temporary = None
+    state_temporary = None
+    verifier_backup = None
+    state_backup = None
+    commit_started = False
+    preserve_recovery_backups = False
+    try:
+        verifier_temporary = _write_private_temporary_file(
+            path,
+            _registered_secret_verifier_payload(verifier),
+            expected_uid=expected_uid,
+        )
+        state_temporary = _write_private_temporary_file(
+            state_path,
+            _replay_state_payload(state_counter),
+            expected_uid=expected_uid,
+        )
+        verifier_backup = _link_rotation_backup(path, expected_uid=expected_uid)
+        if previous_state_counter != -1:
+            state_backup = _link_rotation_backup(
+                state_path,
+                expected_uid=expected_uid,
+            )
+        _fsync_directory(path.parent)
+
+        # Publish replay state first. A crash before the verifier replacement can
+        # reject an old code, but cannot make the new code reusable.
+        commit_started = True
+        _replace_rotation_path(state_temporary, state_path)
+        state_temporary = None
+        # A new verifier must never become durable before its consumed counter.
+        # If this process dies before the next rename, the old verifier can only
+        # reject a counter, never make the new code reusable.
+        _fsync_directory(path.parent)
+        _replace_rotation_path(verifier_temporary, path)
+        verifier_temporary = None
+        _fsync_directory(path.parent)
+    except (OSError, TotpVerificationError) as error:
+        if commit_started and verifier_backup is not None:
+            try:
+                _restore_rotation_material(
+                    path,
+                    verifier_backup,
+                    state_path,
+                    state_backup,
+                    expected_uid=expected_uid,
+                )
+            except (OSError, TotpVerificationError) as rollback_error:
+                preserve_recovery_backups = True
+                raise TotpVerificationError(
+                    "privacy migration TOTP rotation could not be rolled back safely; recovery backups were preserved"
+                ) from rollback_error
+        raise TotpVerificationError(
+            "privacy migration TOTP rotation could not be applied"
+        ) from error
+    finally:
+        try:
+            for temporary in (
+                verifier_temporary,
+                state_temporary,
+            ):
+                if temporary is not None:
+                    _unlink_if_present(temporary)
+        except OSError as error:
+            preserve_recovery_backups = verifier_backup is not None
+            message = "privacy migration TOTP rotation could not be applied"
+            if preserve_recovery_backups:
+                message += "; recovery backups were preserved"
+            raise TotpVerificationError(message) from error
+        if not preserve_recovery_backups:
+            _cleanup_rotation_backups(
+                path.parent,
+                verifier_backup,
+                state_backup,
+            )
+
+
+def _validated_rotation_material(verifier_path, state_path, *, expected_uid):
+    verifier = read_registered_secret_verifier(
+        verifier_path,
+        expected_uid=expected_uid,
+    )
+    return verifier, _read_last_consumed_counter(
+        state_path,
+        expected_uid=expected_uid,
+    )
+
+
+def _rotate_registered_totp_locked(
+    verifier_path,
+    state_path,
+    secret,
+    code,
+    *,
+    existing_verifier,
+    previous_state_counter,
+    now,
+    expected_uid,
+):
+    matched_counter = _matching_totp_counter(secret, code, now=now)
+    if matched_counter is None:
+        raise TotpVerificationError("privacy migration TOTP verification failed")
+    if _registered_secret_matches(existing_verifier, secret):
+        raise TotpVerificationError(
+            "privacy migration TOTP rotation requires a new administrator seed"
+        )
+    try:
+        verifier = build_registered_secret_verifier(secret)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise TotpVerificationError(
+            "privacy migration TOTP verification failed"
+        ) from error
+    _replace_registered_totp_material(
+        verifier_path,
+        verifier,
+        state_path,
+        matched_counter,
+        previous_state_counter=previous_state_counter,
+        expected_uid=expected_uid,
+    )
+
+
+def rotate_registered_totp(
+    verifier_path,
+    secret,
+    code,
+    *,
+    now=None,
+    expected_uid=None,
+):
+    operator_uid = os.geteuid() if expected_uid is None else expected_uid
+    path = _require_private_parent(verifier_path, operator_uid)
+    lock_path, state_path = _replay_paths(path)
+    lock_descriptor = _open_replay_lock(lock_path, expected_uid=operator_uid)
+    try:
+        _acquire_replay_lock(lock_descriptor)
+        existing_verifier, previous_state_counter = _validated_rotation_material(
+            path,
+            state_path,
+            expected_uid=operator_uid,
+        )
+        _rotate_registered_totp_locked(
+            path,
+            state_path,
+            secret,
+            code,
+            existing_verifier=existing_verifier,
+            previous_state_counter=previous_state_counter,
+            now=now,
+            expected_uid=operator_uid,
+        )
+    finally:
+        os.close(lock_descriptor)
 
 def _strict_json_object(pairs):
     result = {}
@@ -653,6 +1045,44 @@ def verify_interactive(
         code = ""
 
 
+def rotate_interactive(
+    verifier_path=DEFAULT_VERIFIER_PATH,
+    *,
+    now=None,
+    expected_uid=None,
+):
+    _require_private_tty()
+    operator_uid = os.geteuid() if expected_uid is None else expected_uid
+    path = _require_private_parent(verifier_path, operator_uid)
+    lock_path, state_path = _replay_paths(path)
+    lock_descriptor = _open_replay_lock(lock_path, expected_uid=operator_uid)
+    secret = ""
+    code = ""
+    try:
+        _acquire_replay_lock(lock_descriptor)
+        existing_verifier, previous_state_counter = _validated_rotation_material(
+            path,
+            state_path,
+            expected_uid=operator_uid,
+        )
+        secret = getpass.getpass("Rotated admin TOTP secret: ")
+        code = getpass.getpass("Rotated admin TOTP code: ")
+        _rotate_registered_totp_locked(
+            path,
+            state_path,
+            secret,
+            code,
+            existing_verifier=existing_verifier,
+            previous_state_counter=previous_state_counter,
+            now=now,
+            expected_uid=operator_uid,
+        )
+    finally:
+        secret = ""
+        code = ""
+        os.close(lock_descriptor)
+
+
 def main(argv=None):
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments == ["enroll", "check"]:
@@ -663,8 +1093,24 @@ def main(argv=None):
             "rerun enroll --apply from the private server terminal to bind the registered admin TOTP credential"
         )
         return 0
+    if arguments == ["rotate", "check"]:
+        print(
+            "check only; no TOTP secret was read and no verifier or replay state was written"
+        )
+        print(
+            "rerun rotate --apply --worker-totp-verified from the private server terminal only after a fresh Worker login with the rotated administrator TOTP seed"
+        )
+        return 0
     if arguments == ["enroll", "--apply"]:
         action = "enroll"
+    elif arguments == ["rotate", "--apply", "--worker-totp-verified"]:
+        action = "rotate"
+    elif arguments == ["rotate", "--apply"]:
+        print(
+            "TOTP verifier rotation requires --worker-totp-verified",
+            file=sys.stderr,
+        )
+        return 2
     elif arguments in ([], ["verify"]):
         action = "verify"
     else:
@@ -674,6 +1120,9 @@ def main(argv=None):
         if action == "enroll":
             enroll_interactive()
             print("registered admin TOTP verifier created")
+        elif action == "rotate":
+            rotate_interactive()
+            print("registered admin TOTP verifier rotated")
         else:
             verify_interactive()
     except TotpVerificationError as error:

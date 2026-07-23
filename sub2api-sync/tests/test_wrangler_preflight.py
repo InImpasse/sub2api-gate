@@ -11,6 +11,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 PREFLIGHT = ROOT / "deploy" / "security-preflight.sh"
 WORKER_DEPLOY = ROOT / "deploy" / "deploy-worker.sh"
 SECRET_LIST_VERIFIER = ROOT / "deploy" / "verify-worker-secret-list.mjs"
+FINAL_TOTP_SOURCE_VERIFIER = ROOT / "deploy" / "verify-final-worker-totp-source.mjs"
 WRANGLER_VALIDATOR = ROOT / "deploy" / "validate-wrangler-config.mjs"
 SECRET_MANIFEST = ROOT / "worker-allow-ip" / "required-secrets.json"
 
@@ -34,14 +35,19 @@ class WranglerPreflightTests(unittest.TestCase):
         self.assertIn(secret_verifier_call, script)
         self.assertLess(script.index(secret_list_call), script.index("explicit --apply accepted"))
         self.assertLess(script.index(secret_verifier_call), script.index("explicit --apply accepted"))
+        self.assertIn("--forbid-totp-rotation-staging", script)
+        self.assertIn("--require-totp-rotation-staging", script)
+        self.assertIn("verify-final-worker-totp-source.mjs", script)
         self.assertIn("set -euo pipefail", script)
         mode_branch = script.index('if [ "$mode" != "--apply" ]')
+        final_source_gate = script.index("verify-final-worker-totp-source.mjs")
         node_gate = script.index("process.versions.node")
         wrangler_gate = script.index('wrangler_version="$(')
         self.assertLess(node_gate, mode_branch)
         self.assertLess(wrangler_gate, mode_branch)
         self.assertLess(node_gate, script.index(validator_call))
         self.assertLess(wrangler_gate, script.index(validator_call))
+        self.assertLess(final_source_gate, mode_branch)
 
     def test_remote_secret_name_verifier_accepts_only_a_complete_name_set(self):
         required = (
@@ -88,6 +94,122 @@ class WranglerPreflightTests(unittest.TestCase):
         self.assertNotEqual(malformed.returncode, 0)
         self.assertIn("invalid shape", malformed.stderr)
 
+    def test_remote_secret_name_verifier_enforces_rotation_stage_names(self):
+        required = (
+            "TURNSTILE_SECRET_KEY", "CLOUDFLARE_API_TOKEN",
+            "ADMIN_PASSWORD_PBKDF2", "ADMIN_TOTP_SECRET",
+            "CREDENTIAL_ENCRYPTION_KEY", "INVITE_ACCESS_HMAC_KEY",
+            "SUB2API_SYNC_SECRET",
+        )
+        staging = (
+            "ADMIN_TOTP_SECRET_NEXT",
+            "ADMIN_TOTP_ROTATION_PHASE",
+        )
+
+        def verify(names, *arguments):
+            return subprocess.run(
+                ["node", SECRET_LIST_VERIFIER, SECRET_MANIFEST, *arguments],
+                cwd=ROOT,
+                input=json.dumps([
+                    {"name": name, "type": "secret_text"} for name in names
+                ]),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        staged = verify(required + staging, "--require-totp-rotation-staging")
+        missing = verify(required, "--require-totp-rotation-staging")
+        forbidden = verify(required + staging)
+        partial = verify(required + staging[:1])
+        unsupported = verify(required, "--require-admin-totp-next")
+
+        self.assertEqual(staged.returncode, 0)
+        self.assertIn("secret names verified", staged.stdout)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("required Cloudflare Worker Secrets are missing", missing.stderr)
+        self.assertNotEqual(forbidden.returncode, 0)
+        self.assertIn("rotation staging Secrets must be absent", forbidden.stderr)
+        self.assertNotEqual(partial.returncode, 0)
+        self.assertIn("rotation staging Secrets must be absent", partial.stderr)
+        self.assertNotEqual(unsupported.returncode, 0)
+        self.assertIn("unsupported Worker Secret rotation requirement", unsupported.stderr)
+
+    def test_final_worker_source_gate_rejects_rotation_secret_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_dir = pathlib.Path(directory) / "src"
+            source_dir.mkdir()
+            source = source_dir / "worker-entry.js"
+            source.write_text("export default { fetch() { return new Response('ok'); } };\n")
+            clean = subprocess.run(
+                ["node", FINAL_TOTP_SOURCE_VERIFIER, source_dir],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            source.write_text("const phase = env.ADMIN_TOTP_ROTATION_PHASE;\n")
+            phase = subprocess.run(
+                ["node", FINAL_TOTP_SOURCE_VERIFIER, source_dir],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            source.write_text("const next = env.ADMIN_TOTP_SECRET_NEXT;\n")
+            next_secret = subprocess.run(
+                ["node", FINAL_TOTP_SOURCE_VERIFIER, source_dir],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            source.write_text("export default { fetch() { return new Response('ok'); } };\n")
+            nested = source_dir / "nested"
+            nested.mkdir()
+            nested_secret_source = nested / "rotation.ts"
+            nested_secret_source.write_text("const next = env.ADMIN_TOTP_SECRET_NEXT;\n")
+            nested_secret = subprocess.run(
+                ["node", FINAL_TOTP_SOURCE_VERIFIER, source_dir],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            nested_secret_source.write_text("export const safe = true;\n")
+            source.write_text('const property = env["unrelated"];\n')
+            dynamic_env = subprocess.run(
+                ["node", FINAL_TOTP_SOURCE_VERIFIER, source_dir],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            source.write_text("export default { fetch() { return new Response('ok'); } };\n")
+            (nested / "import.ts").write_text(
+                'import { escaped } from "../escape.js";\nexport { escaped };\n'
+            )
+            escaping_import = subprocess.run(
+                ["node", FINAL_TOTP_SOURCE_VERIFIER, source_dir],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(clean.returncode, 0)
+        self.assertNotEqual(phase.returncode, 0)
+        self.assertIn("still reads TOTP rotation Secrets", phase.stderr)
+        self.assertNotEqual(next_secret.returncode, 0)
+        self.assertIn("still reads TOTP rotation Secrets", next_secret.stderr)
+
+        self.assertNotEqual(nested_secret.returncode, 0)
+        self.assertIn("still reads TOTP rotation Secrets", nested_secret.stderr)
+        self.assertNotEqual(dynamic_env.returncode, 0)
+        self.assertIn("dynamic environment access", dynamic_env.stderr)
+        self.assertNotEqual(escaping_import.returncode, 0)
+        self.assertIn("unsupported module import", escaping_import.stderr)
+
     def test_validator_rejects_experimental_secret_declarations_and_secret_vars(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -111,6 +233,33 @@ class WranglerPreflightTests(unittest.TestCase):
         self.assertIn("unsupported secrets.required", unsupported.stderr)
         self.assertNotEqual(leaked.returncode, 0)
         self.assertIn("secret must not be stored in vars", leaked.stderr)
+
+    def test_validator_rejects_rotation_secret_vars_and_unsafe_overrides(self):
+        cases = (
+            ("next-seed-var", "vars", "ADMIN_TOTP_SECRET_NEXT", "not-a-secret", "secret must not be stored in vars"),
+            ("phase-var", "vars", "ADMIN_TOTP_ROTATION_PHASE", "stage", "secret must not be stored in vars"),
+            ("keep-vars", None, "keep_vars", True, "leave keep_vars disabled"),
+            ("unsafe", None, "unsafe", {}, "must not use unsafe bindings"),
+            ("alias", None, "alias", {"x": "./x.js"}, "must not use module aliases"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for name, section, key, value, expected_error in cases:
+                with self.subTest(name=name):
+                    config = self.make_config(
+                        root,
+                        invocation_logs=False,
+                        include_rate_limiter=True,
+                    )
+                    payload = json.loads(config.read_text())
+                    if section == "vars":
+                        payload[section][key] = value
+                    else:
+                        payload[key] = value
+                    config.write_text(json.dumps(payload))
+                    result = self.run_validator(config)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(expected_error, result.stderr)
 
     def make_env(
         self,

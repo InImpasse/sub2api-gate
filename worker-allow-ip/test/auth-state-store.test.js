@@ -140,16 +140,157 @@ test("legacy KV cleanup fails closed, retries, and never deletes records keys", 
   assert.equal(values.get(`records:${UUID}`), "required-records");
 });
 
+test("unbound AuthState admin sessions are rejected and deleted", async () => {
+  const sessionToken = "unbound-auth-state-session";
+  const sessionHash = await sha256Hex(sessionToken);
+  const authStateDeletes = [];
+  const kvDeletes = [];
+  const env = adminEnv({
+    getByName() {
+      return {
+        async status() {
+          return { migrated: true, legacyCleanupComplete: true };
+        },
+        async getAdminSession(hash) {
+          assert.equal(hash, sessionHash);
+          return { csrf: "unbound-auth-state-csrf", expiresAt: Date.now() + 60_000 };
+        },
+        async deleteSession(kind, hash) {
+          authStateDeletes.push([kind, hash]);
+          return { deleted: true };
+        },
+      };
+    },
+  });
+  env.INVITE_STORE.delete = async (key) => kvDeletes.push(key);
+
+  const response = await handleAdmin(new Request("https://api.example.test/allow-ip/admin", {
+    headers: { cookie: `sub2api_allow_admin=${sessionToken}` },
+  }), env);
+
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /Admin sign in/);
+  assert.deepEqual(authStateDeletes, [["admin", sessionHash]]);
+  assert.deepEqual(kvDeletes, [`session:${sessionHash}`]);
+});
+
+test("TOTP-bound AuthState sessions are rejected and deleted when the seed set changes", async () => {
+  const sessionToken = "mismatched-auth-state-session";
+  const sessionHash = await sha256Hex(sessionToken);
+  const authStateDeletes = [];
+  const kvDeletes = [];
+  const priorBinding = await adminTest.adminSessionTotpBinding(
+    "JBSWY3DPEHPK3PXP",
+    "",
+    "",
+    "h".repeat(32),
+  );
+  const env = adminEnv({
+    getByName() {
+      return {
+        async status() {
+          return { migrated: true, legacyCleanupComplete: true };
+        },
+        async getAdminSession(hash) {
+          assert.equal(hash, sessionHash);
+          return {
+            csrf: "mismatched-auth-state-csrf",
+            expiresAt: Date.now() + 60_000,
+            totpBinding: priorBinding,
+          };
+        },
+        async deleteSession(kind, hash) {
+          authStateDeletes.push([kind, hash]);
+          return { deleted: true };
+        },
+      };
+    },
+  });
+  env.ADMIN_TOTP_SECRET_NEXT = "KRUGS4ZANFZSAYJA";
+  env.ADMIN_TOTP_ROTATION_PHASE = "stage";
+  env.INVITE_STORE.delete = async (key) => kvDeletes.push(key);
+
+  const response = await handleAdmin(new Request("https://api.example.test/allow-ip/admin", {
+    headers: { cookie: `sub2api_allow_admin=${sessionToken}` },
+  }), env);
+
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /Admin sign in/);
+  assert.deepEqual(authStateDeletes, [["admin", sessionHash]]);
+  assert.deepEqual(kvDeletes, [`session:${sessionHash}`]);
+});
+
+test("unbound legacy KV fallback is rejected and deleted from both configured stores", async () => {
+  const sessionToken = "unbound-legacy-fallback-session";
+  const sessionHash = await sha256Hex(sessionToken);
+  const legacyKey = `session:${sessionHash}`;
+  const values = new Map([[
+    legacyKey,
+    JSON.stringify({ csrf: "unbound-legacy-csrf", expiresAt: Date.now() + 60_000 }),
+  ]]);
+  let persistedSession = null;
+  const authStateDeletes = [];
+  const kvDeletes = [];
+  const env = adminEnv({
+    getByName() {
+      return {
+        async status() {
+          return { migrated: true, legacyCleanupComplete: false };
+        },
+        async getAdminSession(hash) {
+          assert.equal(hash, sessionHash);
+          return persistedSession;
+        },
+        async putAdminSession(hash, payload) {
+          assert.equal(hash, sessionHash);
+          persistedSession = payload;
+          return { ok: true };
+        },
+        async deleteSession(kind, hash) {
+          authStateDeletes.push([kind, hash]);
+          persistedSession = null;
+          return { deleted: true };
+        },
+      };
+    },
+  });
+  env.INVITE_STORE = {
+    async get(key) { return values.get(key) ?? null; },
+    async put(key, value) { values.set(key, value); },
+    async delete(key) {
+      kvDeletes.push(key);
+      values.delete(key);
+    },
+  };
+
+  const response = await handleAdmin(new Request("https://api.example.test/allow-ip/admin", {
+    headers: { cookie: `sub2api_allow_admin=${sessionToken}` },
+  }), env);
+
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /Admin sign in/);
+  assert.equal(persistedSession, null);
+  assert.deepEqual(authStateDeletes, [["admin", sessionHash]]);
+  assert.deepEqual(kvDeletes, [legacyKey]);
+  assert.equal(values.has(legacyKey), false);
+});
+
 test("admin CAS conflicts return a safe HTTP 409 response", async () => {
   const sessionToken = "auth-state-conflict-session";
   const csrf = "auth-state-conflict-csrf";
+  const totpBinding = await adminTest.adminSessionTotpBinding(
+    "JBSWY3DPEHPK3PXP",
+    "",
+    "",
+    "h".repeat(32),
+  );
   let replaceCalls = 0;
   const stub = {
     async status() {
       return { migrated: true };
     },
     async getAdminSession() {
-      return { csrf, expiresAt: Date.now() + 60_000 };
+      return { csrf, expiresAt: Date.now() + 60_000, totpBinding };
     },
     async getInvites() {
       return {
@@ -236,4 +377,9 @@ function adminEnv(authStateBinding) {
     SUB2API_DEFAULT_BASE_URL: "https://api.example.test/v1",
     SUB2API_LOGIN_URL: "https://api.example.test/login",
   };
+}
+
+async function sha256Hex(value) {
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }

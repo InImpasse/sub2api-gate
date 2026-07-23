@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import { WORKER_TOTP_ROTATION_STAGING_SECRETS } from "./worker-totp-rotation-secrets.mjs";
 
 
 const EXPECTED_WORKER_NAME = "sub2api-allow-ip";
@@ -26,6 +27,15 @@ if (!isObject(config)) {
 }
 if (Object.hasOwn(config, "secrets")) {
   fail("Wrangler config must not use the unsupported secrets.required field");
+}
+if (Object.hasOwn(config, "keep_vars") && config.keep_vars !== false) {
+  fail("private Wrangler config must leave keep_vars disabled");
+}
+if (Object.hasOwn(config, "unsafe")) {
+  fail("private Wrangler config must not use unsafe bindings");
+}
+if (Object.hasOwn(config, "alias")) {
+  fail("private Wrangler config must not use module aliases");
 }
 if (config.name !== EXPECTED_WORKER_NAME) {
   fail(`Worker name must remain ${EXPECTED_WORKER_NAME}`);
@@ -198,6 +208,11 @@ if (!routeHostnames.includes(requiredRouteHostname)) {
 
 const requiredSecrets = readRequiredSecrets(secretManifestPath);
 for (const name of requiredSecrets) {
+  if (Object.hasOwn(config.vars || {}, name)) {
+    fail(`Wrangler secret must not be stored in vars: ${name}`);
+  }
+}
+for (const name of WORKER_TOTP_ROTATION_STAGING_SECRETS) {
   if (Object.hasOwn(config.vars || {}, name)) {
     fail(`Wrangler secret must not be stored in vars: ${name}`);
   }

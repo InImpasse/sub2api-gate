@@ -73,14 +73,14 @@ export default {
 
 async function handleSubmit(request, env, uuidSession) {
   const form = await parseBoundedFormData(request);
-  requireEnv(env, [
-    "ACCOUNT_ID",
-    "IP_LIST_ID",
-    "TURNSTILE_SITE_KEY",
-    "TURNSTILE_SECRET_KEY",
-    "CLOUDFLARE_API_TOKEN",
-    "INVITE_ACCESS_HMAC_KEY",
-  ]);
+  requireEnv({
+    ACCOUNT_ID: env.ACCOUNT_ID,
+    IP_LIST_ID: env.IP_LIST_ID,
+    TURNSTILE_SITE_KEY: env.TURNSTILE_SITE_KEY,
+    TURNSTILE_SECRET_KEY: env.TURNSTILE_SECRET_KEY,
+    CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN,
+    INVITE_ACCESS_HMAC_KEY: env.INVITE_ACCESS_HMAC_KEY,
+  });
 
   const action = String(form.get("action") || "");
   if (action === "logout_uuid") {
@@ -1031,8 +1031,10 @@ function text(body, status = 200, headers = {}) {
   });
 }
 
-function requireEnv(env, names) {
-  const missing = names.filter((name) => !env[name] || String(env[name]).startsWith("replace-with-"));
+function requireEnv(values) {
+  const missing = Object.entries(values)
+    .filter(([, value]) => !value || String(value).startsWith("replace-with-"))
+    .map(([name]) => name);
   if (missing.length > 0) {
     throw new Error(`Missing environment variables: ${missing.join(", ")}`);
   }

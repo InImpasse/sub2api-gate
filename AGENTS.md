@@ -54,3 +54,7 @@
 
 - On 2026-07-22, exact release `dae2818` was installed at root-owned `/opt/sub2api-gate-release`; the ignored Worker binding config is root-only there, the private environment is root-only at `/mnt/data/sub2api-gate/private/.env`, and the duplicate user-owned environment file was removed after a byte-for-byte comparison. The release guard, sync image attestation, and server security preflight passed without stopping current services.
 - The direct `/v1/*` cutover is already active and remains healthy on stable `127.0.0.1:8080`; no production database scrub, data migration, Worker publication, AOP association, or group migration has run. The remaining first production gate is TOTP verifier enrollment plus the source privacy migration from a private server TTY.
+- Local administrator TOTP rotation hardening passed 193 Worker tests, 35 local
+  migration-TOTP tests, 27 Wrangler preflight tests, and 41 deployment-config
+  tests (one skip). The Worker session binding is HMAC-keyed and phase-bound;
+  the final-source gate and the private-TTY runbook are hardened. This remains

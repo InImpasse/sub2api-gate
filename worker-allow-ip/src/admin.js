@@ -33,6 +33,17 @@ import {
 const ADMIN_PATH = "/allow-ip/admin";
 const COOKIE_NAME = "sub2api_allow_admin";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
+const ADMIN_SESSION_TOTP_BINDING_DOMAIN =
+  "sub2api-gate/admin-session-totp-binding/v3\0";
+const ADMIN_SESSION_TOTP_BINDING = /^[a-f0-9]{64}$/;
+const ADMIN_TOTP_ROTATION_PHASE_STAGE = "stage";
+const ADMIN_TOTP_ROTATION_PHASE_PROMOTED = "promoted";
+const ADMIN_TOTP_ROTATION_PHASE_SINGLE = "single";
+const ADMIN_TOTP_ROTATION_PHASE_IDS = Object.freeze({
+  [ADMIN_TOTP_ROTATION_PHASE_SINGLE]: 1,
+  [ADMIN_TOTP_ROTATION_PHASE_STAGE]: 2,
+  [ADMIN_TOTP_ROTATION_PHASE_PROMOTED]: 3,
+});
 const INVITES_KEY = "invites";
 const TRASH_KEY = "trash";
 const INVITES_REVISION = Symbol("invitesRevision");
@@ -626,7 +637,7 @@ async function handleAdminLogin(form, env, request) {
 
   const usernameOk = await timingSafeEqual(username, env.ADMIN_USERNAME);
   const passwordOk = await verifyPbkdf2Password(password, env.ADMIN_PASSWORD_PBKDF2);
-  const tokenOk = await verifyTotp(env.ADMIN_TOTP_SECRET, token);
+  const tokenOk = await verifyAdminTotp(env, token);
 
   if (!usernameOk || !passwordOk || !tokenOk) {
     return html(renderLogin("The username, password, or 2FA code is incorrect."), 403);
@@ -637,13 +648,18 @@ async function handleAdminLogin(form, env, request) {
   const sessionHash = await sha256Hex(sessionToken);
   const csrf = randomHex(24);
   const expiresAt = Date.now() + SESSION_TTL_SECONDS * 1000;
+  const totpBinding = await adminSessionTotpBindingForEnvironment(env);
 
   if (isAuthStateBindingConfigured(env)) {
-    await createAuthStateStore(env).createAdminSession(sessionHash, { csrf, expiresAt });
+    await createAuthStateStore(env).createAdminSession(sessionHash, {
+      csrf,
+      expiresAt,
+      totpBinding,
+    });
   } else {
     await env.INVITE_STORE.put(
       sessionKey(sessionHash),
-      JSON.stringify({ csrf, expiresAt }),
+      JSON.stringify({ csrf, expiresAt, totpBinding }),
       { expirationTtl: SESSION_TTL_SECONDS },
     );
   }
@@ -668,24 +684,24 @@ async function getAdminSession(request, env) {
   }
 
   const sessionHash = await sha256Hex(token);
+  let session;
   if (isAuthStateBindingConfigured(env)) {
-    const session = await createAuthStateStore(env).getAdminSession(sessionHash);
-    return session ? { ...session, sessionHash } : null;
+    session = await createAuthStateStore(env).getAdminSession(sessionHash);
+  } else {
+    const raw = await env.INVITE_STORE.get(sessionKey(sessionHash));
+    if (!raw) return null;
+    const parsed = parseJson(raw, null);
+    const expiresAt = Number(parsed?.expiresAt);
+    if (parsed && parsed.csrf && Number.isFinite(expiresAt) && expiresAt > Date.now()) {
+      session = { ...parsed, expiresAt };
+    }
   }
 
-  const raw = await env.INVITE_STORE.get(sessionKey(sessionHash));
-  if (!raw) {
+  if (!session || !(await sessionMatchesAdminTotpBinding(session, env))) {
+    await deleteAdminSession(env, sessionHash);
     return null;
   }
-
-  const session = parseJson(raw, null);
-  const expiresAt = Number(session?.expiresAt);
-  if (!session || !session.csrf || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
-    await env.INVITE_STORE.delete(sessionKey(sessionHash));
-    return null;
-  }
-
-  return { ...session, expiresAt, sessionHash };
+  return { ...session, sessionHash };
 }
 
 async function deleteSession(env, request) {
@@ -693,11 +709,16 @@ async function deleteSession(env, request) {
   const token = cookies[COOKIE_NAME];
   if (token) {
     const sessionHash = await sha256Hex(token);
-    if (isAuthStateBindingConfigured(env)) {
-      await createAuthStateStore(env).deleteAdminSession(sessionHash);
-    } else {
-      await env.INVITE_STORE.delete(sessionKey(sessionHash));
-    }
+    await deleteAdminSession(env, sessionHash);
+  }
+}
+
+async function deleteAdminSession(env, sessionHash) {
+  if (isAuthStateBindingConfigured(env)) {
+    // AuthState removes the legacy KV fallback before its durable session.
+    await createAuthStateStore(env).deleteAdminSession(sessionHash);
+  } else {
+    await env.INVITE_STORE.delete(sessionKey(sessionHash));
   }
 }
 
@@ -1233,7 +1254,7 @@ async function rotateInviteAccessKey(env, uuid) {
 
 async function requireStepUpTotp(form, env) {
   const token = String(form.get("step_up_token") || "").replace(/\s+/g, "");
-  if (!(await verifyTotp(env.ADMIN_TOTP_SECRET, token))) {
+  if (!(await verifyAdminTotp(env, token))) {
     throw new Error("A valid 2FA code is required");
   }
 }
@@ -2332,6 +2353,158 @@ function isExpired(expiresAt, now) {
 async function findCloudflareListItem(env, ip) {
   const items = await findCloudflareListItems(env);
   return items.find((item) => item.ip === ip) || null;
+}
+
+function configuredAdminTotpSecrets(env) {
+  return adminTotpRotationConfiguration(env).secrets;
+}
+
+function adminTotpRotationConfiguration(env) {
+  const canonicalSecret = String(env?.ADMIN_TOTP_SECRET || "");
+  const nextSecret = String(env?.ADMIN_TOTP_SECRET_NEXT || "");
+  const phase = String(env?.ADMIN_TOTP_ROTATION_PHASE || "");
+  const canonical = decodeConfiguredAdminTotpSecret(
+    canonicalSecret,
+    "ADMIN_TOTP_SECRET",
+  );
+
+  if (!nextSecret && !phase) {
+    return {
+      phase: ADMIN_TOTP_ROTATION_PHASE_SINGLE,
+      secrets: [canonicalSecret],
+      decodedSecrets: [canonical],
+    };
+  }
+  if (!nextSecret || !phase) {
+    throw new Error(
+      "ADMIN_TOTP_SECRET_NEXT and ADMIN_TOTP_ROTATION_PHASE must be configured together.",
+    );
+  }
+
+  const next = decodeConfiguredAdminTotpSecret(
+    nextSecret,
+    "ADMIN_TOTP_SECRET_NEXT",
+  );
+  if (phase === ADMIN_TOTP_ROTATION_PHASE_STAGE) {
+    if (totpSecretBytesEqual(canonical, next)) {
+      throw new Error(
+        "ADMIN_TOTP_ROTATION_PHASE=stage requires a distinct ADMIN_TOTP_SECRET_NEXT.",
+      );
+    }
+    return {
+      phase,
+      secrets: [canonicalSecret, nextSecret],
+      decodedSecrets: [canonical, next],
+    };
+  }
+  if (phase === ADMIN_TOTP_ROTATION_PHASE_PROMOTED) {
+    if (!totpSecretBytesEqual(canonical, next)) {
+      throw new Error(
+        "ADMIN_TOTP_ROTATION_PHASE=promoted requires ADMIN_TOTP_SECRET_NEXT to match ADMIN_TOTP_SECRET.",
+      );
+    }
+    return {
+      phase,
+      secrets: [canonicalSecret],
+      decodedSecrets: [canonical],
+    };
+  }
+  throw new Error(
+    "ADMIN_TOTP_ROTATION_PHASE must be exactly stage or promoted.",
+  );
+}
+
+function decodeConfiguredAdminTotpSecret(secret, name) {
+  try {
+    return base32Decode(secret);
+  } catch {
+    throw new Error(`${name} must be 16-128 Base32 characters.`);
+  }
+}
+
+function totpSecretBytesEqual(left, right) {
+  if (left.byteLength !== right.byteLength) return false;
+  let difference = 0;
+  for (let index = 0; index < left.byteLength; index += 1) {
+    difference |= left[index] ^ right[index];
+  }
+  return difference === 0;
+}
+
+async function verifyAdminTotp(env, token) {
+  try {
+    const matches = await Promise.all(
+      configuredAdminTotpSecrets(env).map(async (secret) => await verifyTotp(secret, token)),
+    );
+    return matches.some(Boolean);
+  } catch {
+    return false;
+  }
+}
+
+async function adminSessionTotpBinding(
+  canonicalSecret,
+  nextSecret = "",
+  phase = "",
+  bindingSecret = "",
+) {
+  return await adminSessionTotpBindingForConfiguration(
+    adminTotpRotationConfiguration({
+      ADMIN_TOTP_SECRET: canonicalSecret,
+      ADMIN_TOTP_SECRET_NEXT: nextSecret,
+      ADMIN_TOTP_ROTATION_PHASE: phase,
+    }),
+    bindingSecret,
+  );
+}
+
+async function adminSessionTotpBindingForConfiguration(configuration, bindingSecret) {
+  const bindingKey = String(bindingSecret || "");
+  if (bindingKey.length < 32) {
+    throw new Error("INVITE_ACCESS_HMAC_KEY must be at least 32 characters");
+  }
+  const phaseId = ADMIN_TOTP_ROTATION_PHASE_IDS[configuration.phase];
+  if (!phaseId) throw new Error("administrator TOTP rotation phase is invalid");
+  const secrets = configuration.decodedSecrets;
+  const domain = new TextEncoder().encode(ADMIN_SESSION_TOTP_BINDING_DOMAIN);
+  const size = domain.byteLength + 2 + secrets.reduce(
+    (total, secret) => total + 1 + secret.byteLength,
+    0,
+  );
+  const material = new Uint8Array(size);
+  let offset = 0;
+  material.set(domain, offset);
+  offset += domain.byteLength;
+  material[offset] = phaseId;
+  offset += 1;
+  material[offset] = secrets.length;
+  offset += 1;
+  for (const secret of secrets) {
+    material[offset] = secret.byteLength;
+    offset += 1;
+    material.set(secret, offset);
+    offset += secret.byteLength;
+  }
+  return await hmacSha256HexBytes(bindingKey, material);
+}
+
+async function adminSessionTotpBindingForEnvironment(env) {
+  return await adminSessionTotpBindingForConfiguration(
+    adminTotpRotationConfiguration(env),
+    env.INVITE_ACCESS_HMAC_KEY,
+  );
+}
+
+async function sessionMatchesAdminTotpBinding(session, env) {
+  if (!ADMIN_SESSION_TOTP_BINDING.test(String(session?.totpBinding || ""))) return false;
+  try {
+    return await timingSafeEqual(
+      session.totpBinding,
+      await adminSessionTotpBindingForEnvironment(env),
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function verifyTotp(secret, token) {
@@ -5034,21 +5207,18 @@ function isAuthStateConflict(error) {
 }
 
 function getAdminSetupError(env) {
-  const missing = [
-    "INVITE_STORE",
-    "AUTH_RATE_LIMITER",
-    "ADMIN_USERNAME",
-    "ADMIN_PASSWORD_PBKDF2",
-    "ADMIN_TOTP_SECRET",
-    "CREDENTIAL_ENCRYPTION_KEY",
-    "INVITE_ACCESS_HMAC_KEY",
-    "ALLOWED_HOSTNAMES",
-    "ACCOUNT_ID",
-    "IP_LIST_ID",
-    "CLOUDFLARE_API_TOKEN",
-  ].filter(
-    (name) => !env[name],
-  );
+  const missing = [];
+  if (!env.INVITE_STORE) missing.push("INVITE_STORE");
+  if (!env.AUTH_RATE_LIMITER) missing.push("AUTH_RATE_LIMITER");
+  if (!env.ADMIN_USERNAME) missing.push("ADMIN_USERNAME");
+  if (!env.ADMIN_PASSWORD_PBKDF2) missing.push("ADMIN_PASSWORD_PBKDF2");
+  if (!env.ADMIN_TOTP_SECRET) missing.push("ADMIN_TOTP_SECRET");
+  if (!env.CREDENTIAL_ENCRYPTION_KEY) missing.push("CREDENTIAL_ENCRYPTION_KEY");
+  if (!env.INVITE_ACCESS_HMAC_KEY) missing.push("INVITE_ACCESS_HMAC_KEY");
+  if (!env.ALLOWED_HOSTNAMES) missing.push("ALLOWED_HOSTNAMES");
+  if (!env.ACCOUNT_ID) missing.push("ACCOUNT_ID");
+  if (!env.IP_LIST_ID) missing.push("IP_LIST_ID");
+  if (!env.CLOUDFLARE_API_TOKEN) missing.push("CLOUDFLARE_API_TOKEN");
   if (!sub2apiSyncUrl(env)) {
     missing.push("SUB2API_SYNC_URL");
   }
@@ -5065,9 +5235,9 @@ function getAdminSetupError(env) {
     return "ADMIN_PASSWORD_PBKDF2 must be a valid PBKDF2-HMAC-SHA256 record.";
   }
   try {
-    base32Decode(env.ADMIN_TOTP_SECRET);
-  } catch {
-    return "ADMIN_TOTP_SECRET must be 16-128 Base32 characters.";
+    adminTotpRotationConfiguration(env);
+  } catch (error) {
+    return String(error?.message || "Administrator TOTP rotation configuration is invalid.");
   }
   try {
     if (base64UrlByteLength(env.CREDENTIAL_ENCRYPTION_KEY) !== 32) {
@@ -5189,21 +5359,27 @@ function parseJson(value, fallback) {
 }
 
 async function sha256Hex(value) {
-  const bytes = new TextEncoder().encode(value);
+  return await sha256HexBytes(new TextEncoder().encode(value));
+}
+
+async function sha256HexBytes(bytes) {
   const hash = await crypto.subtle.digest("SHA-256", bytes);
   return [...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 async function hmacSha256Hex(secret, value) {
-  const encoder = new TextEncoder();
+  return await hmacSha256HexBytes(secret, new TextEncoder().encode(value));
+}
+
+async function hmacSha256HexBytes(secret, value) {
   const key = await crypto.subtle.importKey(
     "raw",
-    encoder.encode(secret),
+    new TextEncoder().encode(secret),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
   );
-  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(value));
+  const signature = await crypto.subtle.sign("HMAC", key, value);
   return [...new Uint8Array(signature)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
@@ -5326,7 +5502,10 @@ export const __test = Object.freeze({
   shouldRefreshInvitesOnAdminGet,
   getAdminSetupError,
   handleAdminLogin,
+  configuredAdminTotpSecrets,
+  verifyAdminTotp,
   requireStepUpTotp,
+  adminSessionTotpBinding,
   stepUpAttemptKey,
   requiresStepUpAction,
   inviteCredentialStatus,

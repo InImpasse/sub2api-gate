@@ -1137,7 +1137,8 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_worker_deployment_defaults_to_dry_run(self):
         script = WORKER_DEPLOY.read_text()
         package = (ROOT / "worker-allow-ip" / "package.json").read_text()
-        self.assertIn('mode="${1:-check}"', script)
+        self.assertIn('mode="check"', script)
+        self.assertIn('rotation_stage="compatibility"', script)
         self.assertIn('if [ "$mode" != "--apply" ]', script)
         self.assertIn("deploy --dry-run", script)
         self.assertLess(script.index('if [ "$mode" != "--apply" ]'), script.index('echo "explicit --apply accepted'))

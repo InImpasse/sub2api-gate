@@ -2,11 +2,27 @@
 
 const MAX_LIST_BYTES = 64 * 1024;
 import fs from "node:fs";
+import { WORKER_TOTP_ROTATION_STAGING_SECRETS } from "./worker-totp-rotation-secrets.mjs";
 
 
 const manifestPath = process.argv[2]
   || new URL("../worker-allow-ip/required-secrets.json", import.meta.url);
-const REQUIRED_WORKER_SECRETS = readRequiredSecrets(manifestPath);
+const ROTATION_STAGING_SECRETS = WORKER_TOTP_ROTATION_STAGING_SECRETS;
+const optionalRequirement = process.argv.slice(3);
+let rotationStagingRequirement = "forbid";
+if (optionalRequirement.length === 1) {
+  if (optionalRequirement[0] === "--require-totp-rotation-staging") {
+    rotationStagingRequirement = "require";
+  } else if (optionalRequirement[0] !== "--forbid-totp-rotation-staging") {
+    fail("unsupported Worker Secret rotation requirement");
+  }
+} else if (optionalRequirement.length !== 0) {
+  fail("unsupported Worker Secret rotation requirement");
+}
+const REQUIRED_WORKER_SECRETS = [
+  ...readRequiredSecrets(manifestPath),
+  ...(rotationStagingRequirement === "require" ? ROTATION_STAGING_SECRETS : []),
+];
 
 let raw = "";
 try {
@@ -42,6 +58,10 @@ for (const entry of entries) {
 
 if (REQUIRED_WORKER_SECRETS.some((name) => !names.has(name))) {
   fail("One or more required Cloudflare Worker Secrets are missing");
+}
+if (rotationStagingRequirement === "forbid"
+    && ROTATION_STAGING_SECRETS.some((name) => names.has(name))) {
+  fail("Cloudflare Worker rotation staging Secrets must be absent");
 }
 
 console.log("Required Cloudflare Worker secret names verified");

@@ -1196,7 +1196,14 @@ function normalizeAdminSession(value, now) {
   }
   payload.expiresAt = Number(payload.expiresAt);
   requireFutureExpiry(payload.expiresAt, now);
-  return { csrf: payload.csrf, expiresAt: payload.expiresAt };
+  const normalized = { csrf: payload.csrf, expiresAt: payload.expiresAt };
+  if (Object.hasOwn(payload, "totpBinding")) {
+    if (typeof payload.totpBinding !== "string" || !/^[a-f0-9]{64}$/.test(payload.totpBinding)) {
+      fail("auth_state_admin_session_invalid");
+    }
+    normalized.totpBinding = payload.totpBinding;
+  }
+  return normalized;
 }
 
 function normalizePublicSession(value, now) {

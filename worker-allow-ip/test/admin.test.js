@@ -421,7 +421,9 @@ test("admin list HTTP response stays within 256 KiB and renders summaries only",
   }));
   let recordReads = 0;
   const values = new Map([
-    [`session:${sessionHash}`, JSON.stringify({ csrf: "csrf", expiresAt: Date.now() + 60_000 })],
+    [`session:${sessionHash}`, JSON.stringify(
+      await boundAdminSession("csrf", Date.now() + 60_000),
+    )],
     ["invites", JSON.stringify(invites)],
     ["trash", "[]"],
   ]);
@@ -475,11 +477,12 @@ test("admin detail HTTP response stays within 512 KiB and paginates 20 IP groups
   }));
   let recordReads = 0;
   let detailLookups = 0;
+  const session = await boundAdminSession("csrf", Date.now() + 60_000);
   const stub = {
     async status() { return { migrated: true }; },
     async getAdminSession(hash) {
       assert.equal(hash, sessionHash);
-      return { csrf: "csrf", expiresAt: Date.now() + 60_000 };
+      return session;
     },
     async getAdminPage(inviteOffset, inviteLimit, trashOffset, trashLimit) {
       assert.deepEqual([inviteOffset, inviteLimit, trashOffset, trashLimit], [25, 25, 50, 25]);
@@ -573,4 +576,17 @@ function adminEnv(store) {
 async function sha256Hex(value) {
   const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return [...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function boundAdminSession(csrf, expiresAt) {
+  return {
+    csrf,
+    expiresAt,
+    totpBinding: await __test.adminSessionTotpBinding(
+      "JBSWY3DPEHPK3PXP",
+      "",
+      "",
+      "h".repeat(32),
+    ),
+  };
 }

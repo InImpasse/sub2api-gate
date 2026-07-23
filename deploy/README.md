@@ -224,8 +224,8 @@ one bulk stdin request, and verifies names afterward. Before uploading a new
 `.local/worker-secret-state/invite-access-hmac-migration.key`; the operator-owned
 `0700` directory and single-link `0600` file contain only that 64-character HMAC
 key. A failed or ambiguous upload retains the file for a safe retry. The tool
-never replaces an existing AES, HMAC, or administrator password value. Those
-three values must not be set manually with `wrangler secret put`; rotation
+never replaces an existing AES, HMAC, administrator password, or `ADMIN_TOTP_SECRET`
+value. Those values must not be set manually with `wrangler secret put`; rotation
 requires a separate credential migration. Never put their values in tracked or
 private JSON.
 The ignored `worker-allow-ip/wrangler.private.jsonc` contains non-secret,
@@ -235,6 +235,157 @@ environment-specific binding IDs and provider hostname approvals only.
 production private config must contain at least one valid provider hostname.
 The preflight rejects an absent or empty list and any overlap; the Worker entry
 also returns 503 before business logic when either list is invalid.
+
+## Administrator TOTP rotation
+
+Use this procedure only when the registered migration verifier exists and the
+old administrator Base32 seed is unavailable. Do not delete the verifier, its
+replay-state file, or its lock file to make `enroll --apply` work. The supported
+replacement is `rotate --apply`; it first validates the existing private
+verifier, requires a different new seed, consumes the new code, and atomically
+replaces the verifier and replay state. A failed rollback preserves root-only
+recovery backups and stops. Do not retry or remove those backups manually.
+
+This is a phase-bound compatibility Worker procedure. It accepts the canonical
+`ADMIN_TOTP_SECRET` plus the optional pair `ADMIN_TOTP_SECRET_NEXT` and
+`ADMIN_TOTP_ROTATION_PHASE`. With neither temporary Secret it accepts only the
+canonical seed; phase `stage` requires two distinct decoded seeds; phase
+`promoted` requires that the two decoded seeds are identical and accepts the
+canonical seed only. Every other combination fails closed. New admin sessions
+bind the phase and effective seed set, so each transition invalidates old
+administrator cookies. The final single-seed release must remove all reads of
+both temporary Secret names after canonical promotion has been proven. Never put
+either seed, a code, password, Cookie, request body, or a secret-list response
+in a repository, shell history, environment file, terminal transcript, or audit record.
+
+Run every secret operation only from a private interactive terminal as the
+deployment operator that owns the locked Wrangler authentication. Define local
+paths without placing secret values in variables:
+
+```bash
+cd /opt/sub2api-gate-release
+worker_dir="$PWD/worker-allow-ip"
+wrangler_config="$worker_dir/wrangler.private.jsonc"
+wrangler_bin="$worker_dir/node_modules/.bin/wrangler"
+```
+
+1. Establish the baseline Worker Secret set before the compatibility deployment.
+   This initializes only missing managed Secrets and never overwrites
+   `ADMIN_TOTP_SECRET`; it must succeed before the rotation controller can
+   inspect or publish the Worker:
+
+   ```bash
+   SUB2API_WRANGLER_CONFIG="$wrangler_config" \
+     python3 deploy/generate-worker-secrets.py --apply
+   "$wrangler_bin" secret list --format json --config "$wrangler_config" \
+     | node deploy/verify-worker-secret-list.mjs \
+       "$worker_dir/required-secrets.json" --forbid-totp-rotation-staging
+   ```
+
+   Run this only in the private terminal. The name verifier emits only the
+   validation result; do not record the secret-list response. Stop if either
+   command fails or if either temporary rotation Secret already exists.
+
+2. Publish the clean reviewed compatibility Worker while both
+   `ADMIN_TOTP_SECRET_NEXT` and `ADMIN_TOTP_ROTATION_PHASE` are absent. The
+   compatibility apply gate verifies their absence and publishes only after the
+   release and security gates pass:
+
+   ```bash
+   SUB2API_WRANGLER_CONFIG="$wrangler_config" bash deploy/deploy-worker.sh --apply --totp-rotation-stage compatibility
+   ```
+
+   In a private browser, confirm any existing administrator cookie is sent back
+   to the sign-in page, then make one fresh administrator login with the current
+   canonical seed. Do not test an intentionally wrong code; failed login
+   attempts are rate limited.
+
+3. Stage the new Base32 seed and `stage` phase through Wrangler's private
+   prompts. Never redirect the input or supply a value on the command line:
+
+   ```bash
+   "$wrangler_bin" secret put ADMIN_TOTP_SECRET_NEXT --config "$wrangler_config"
+   "$wrangler_bin" secret put ADMIN_TOTP_ROTATION_PHASE --config "$wrangler_config"
+   "$wrangler_bin" secret list --format json --config "$wrangler_config" \
+     | node deploy/verify-worker-secret-list.mjs \
+       "$worker_dir/required-secrets.json" --require-totp-rotation-staging
+   ```
+
+   The two Secret writes are not atomic; a transient mismatch intentionally
+   fails closed. The `stage` phase requires the new seed to decode differently
+   from the canonical seed, so an alternate Base32 spelling is not a rotation.
+   The list verifier reports only whether the required names are present; it
+   cannot prove a Secret value. After propagation, make fresh new-seed
+   administrator logins in two distinct 30-second periods. Each must reach the
+   administrator page. Immediately sign out after each proof. The old seed may
+   remain valid only during this compatibility stage; do not spend rate-limit
+   budget testing it when the operator no longer has that seed.
+
+4. Promote the already-proven new seed by entering phase `promoted` and then
+   setting the canonical Secret through the same private prompts:
+
+   ```bash
+   "$wrangler_bin" secret put ADMIN_TOTP_ROTATION_PHASE --config "$wrangler_config"
+   "$wrangler_bin" secret put ADMIN_TOTP_SECRET --config "$wrangler_config"
+   "$wrangler_bin" secret list --format json --config "$wrangler_config" \
+     | node deploy/verify-worker-secret-list.mjs \
+       "$worker_dir/required-secrets.json" --require-totp-rotation-staging
+   ```
+
+   The `promoted` phase requires both Secrets to decode to the same new seed and
+   authenticates the canonical seed once. If the canonical update does not
+   complete, restore phase `stage` before retrying. Existing sessions are
+   invalidated because their phase-bound binding changes. Wait for propagation
+   and prove a fresh new-seed login again. This is the forward-only point: do
+   not continue unless that login succeeds.
+
+5. Create a separate clean, reviewed final Worker release that removes all
+   reads of both temporary Secret names, their phase validation, and their
+   session-binding inputs. Run the full Worker tests, then publish it with:
+
+   ```bash
+   SUB2API_WRANGLER_CONFIG="$wrangler_config" bash deploy/deploy-worker.sh --apply --totp-rotation-stage final-source
+   ```
+
+   The final-source gate requires both temporary names still exist, scans all
+   JS/TS source, and proves no temporary read remains. It rejects dynamic
+   `env[...]` access, dynamic/CommonJS imports, and imports escaping the source
+   root. Prove another fresh new-seed login.
+
+6. Delete both staging Secrets and prove their names are gone without printing
+   the returned list. The final Worker must still accept the new seed:
+
+   ```bash
+   "$wrangler_bin" secret delete ADMIN_TOTP_SECRET_NEXT --config "$wrangler_config"
+   "$wrangler_bin" secret delete ADMIN_TOTP_ROTATION_PHASE --config "$wrangler_config"
+   "$wrangler_bin" secret list --format json --config "$wrangler_config" \
+     | node deploy/verify-worker-secret-list.mjs \
+       "$worker_dir/required-secrets.json" --forbid-totp-rotation-staging
+   ```
+
+   Make one fresh new-seed login after propagation before proceeding.
+
+   Record only UTC time, operator, release commit, Wrangler version, Secret
+   name-check result, and each successful fresh-login result. A Secret-name
+   check is evidence of presence or removal only; the private browser login is
+   the evidence that the Worker loaded the new seed.
+
+7. Only after the final Worker proof, rotate the local migration verifier from
+   a private root TTY. The acknowledgement flag records the external Worker
+   proof; it is not a substitute for it:
+
+   ```bash
+   sudo python3 deploy/verify-migration-totp.py rotate check
+   sudo python3 deploy/verify-migration-totp.py rotate --apply --worker-totp-verified
+   ```
+
+   The rotation consumes its supplied current code. Wait for a strictly newer
+   30-second TOTP period, then run `privacy --apply` directly. That command
+   performs and consumes its own migration TOTP verification. If a standalone
+   `verify` is run after rotation, wait one additional period before privacy.
+   Recollect the full legacy container IDs immediately before the privacy
+   command; never reuse an earlier ID. Stop on any failed Worker proof, secret
+   name check, local rotation error, or retained recovery backup.
 
 Per-hostname Authenticated Origin Pull setup is also check-only by default:
 
@@ -765,10 +916,14 @@ the first failed checkpoint; never skip ahead.
    include initially points to `127.0.0.1:8080`; remove mirror/capture,
    run `nginx -t`, reload, and verify that rollback restores the prior config.
 3. Confirm Sub2API file logging is off and its Docker log driver is `none`.
-   Enroll the existing administrator TOTP once from the private server TTY with
-   `sudo python3 deploy/verify-migration-totp.py enroll --apply`, after the
-   out-of-band existing-seed confirmation described above,
-   then run `run-database-migration.sh privacy --apply --env-file
+   When no verifier exists, enroll the existing administrator TOTP once from
+   the private server TTY with `sudo python3
+   deploy/verify-migration-totp.py enroll --apply`, after the out-of-band
+   existing-seed confirmation described above. When a verifier exists but its
+   old seed is unavailable, complete the independently audited
+   [Administrator TOTP rotation](#administrator-totp-rotation) first; never
+   delete local verifier/replay files to re-enroll. After enrollment or a
+   proven rotation, run `run-database-migration.sh privacy --apply --env-file
    /absolute/path/to/private.env`: the short guard transaction
    commits before batched history cleanup. If cleanup fails, keep the guards
    installed and resolve the schema conflict before continuing. Run
