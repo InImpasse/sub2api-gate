@@ -3,6 +3,7 @@ import json
 import os
 import pathlib
 import stat
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -239,6 +240,41 @@ class WorkerRuntimeAttestationTests(unittest.TestCase):
                 ):
                     self.fail("a second exclusive lock must not be acquired")
         self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
+
+    def test_npm_user_configuration_is_distinct_empty_and_sealed(self):
+        user_config = TOOL.prepare_empty_npm_user_config(
+            self.state_directory,
+            expected_uid=self.uid,
+            expected_gid=self.gid,
+        )
+        metadata = user_config.stat()
+        self.assertTrue(stat.S_ISREG(metadata.st_mode))
+        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+        self.assertEqual(metadata.st_size, 0)
+
+        environment = TOOL.minimal_environment(npm_userconfig=user_config)
+        self.assertEqual(environment["NPM_CONFIG_USERCONFIG"], str(user_config))
+        self.assertEqual(environment["NPM_CONFIG_GLOBALCONFIG"], "/dev/null")
+        self.assertNotEqual(
+            environment["NPM_CONFIG_USERCONFIG"],
+            environment["NPM_CONFIG_GLOBALCONFIG"],
+        )
+        result = subprocess.run(
+            [TOOL.NPM_BINARY, "config", "list", "--json"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        user_config.write_text("unexpected\n", encoding="ascii")
+        with self.assertRaisesRegex(TOOL.WorkerRuntimeError, "unsafe"):
+            TOOL.prepare_empty_npm_user_config(
+                self.state_directory,
+                expected_uid=self.uid,
+                expected_gid=self.gid,
+            )
 
     def test_controllers_are_interpreter_only_and_use_attested_direct_entry(self):
         for path in (TOOL_PATH, DEPLOY_WORKER, SECRET_INITIALIZER):

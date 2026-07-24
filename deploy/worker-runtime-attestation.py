@@ -27,6 +27,8 @@ WRANGLER_ENTRY_WITHIN_WORKER = pathlib.Path(
 STATE_DIRECTORY = pathlib.Path("/run/sub2api-gate")
 STATE_PATH = STATE_DIRECTORY / "worker-runtime.json"
 LOCK_PATH = STATE_DIRECTORY / "worker-runtime.lock"
+NPM_USER_CONFIG_NAME = "npm-userconfig"
+NPM_USER_CONFIG_PATH = STATE_DIRECTORY / NPM_USER_CONFIG_NAME
 NODE_BINARY = pathlib.Path("/usr/bin/node")
 NPM_BINARY = pathlib.Path("/usr/bin/npm")
 GIT_BINARY = pathlib.Path("/usr/bin/git")
@@ -348,7 +350,7 @@ def runtime_tree_sha256(node_modules, *, expected_uid, expected_gid):
     return digest.hexdigest()
 
 
-def minimal_environment():
+def minimal_environment(*, npm_userconfig=NPM_USER_CONFIG_PATH):
     return {
         "PATH": SAFE_PATH,
         "HOME": "/root",
@@ -356,7 +358,7 @@ def minimal_environment():
         "LC_ALL": "C.UTF-8",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",
-        "NPM_CONFIG_USERCONFIG": "/dev/null",
+        "NPM_CONFIG_USERCONFIG": str(npm_userconfig),
         "NPM_CONFIG_GLOBALCONFIG": "/dev/null",
         "NPM_CONFIG_IGNORE_SCRIPTS": "true",
         "NPM_CONFIG_AUDIT": "false",
@@ -461,6 +463,53 @@ def open_state_directory(path, *, expected_uid, expected_gid, create=False):
         raise WorkerRuntimeError(
             "Worker runtime state directory could not be opened"
         ) from error
+
+
+def prepare_empty_npm_user_config(state_directory, *, expected_uid, expected_gid):
+    state_directory = pathlib.Path(state_directory)
+    directory_fd = open_state_directory(
+        state_directory,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    descriptor = None
+    created = False
+    try:
+        create_flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        try:
+            descriptor = os.open(
+                NPM_USER_CONFIG_NAME, create_flags, 0o600, dir_fd=directory_fd
+            )
+            created = True
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        except FileExistsError:
+            descriptor = os.open(
+                NPM_USER_CONFIG_NAME,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != expected_uid
+            or metadata.st_gid != expected_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size != 0
+        ):
+            raise WorkerRuntimeError("Worker npm user configuration is unsafe")
+        if created:
+            os.fsync(directory_fd)
+        return state_directory / NPM_USER_CONFIG_NAME
+    except OSError as error:
+        raise WorkerRuntimeError("Worker npm user configuration is unavailable") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory_fd)
 
 
 @contextlib.contextmanager
@@ -693,7 +742,12 @@ def prepare_runtime(repo_dir):
     repo = pathlib.Path(repo_dir)
     worker = repo / WORKER_RELATIVE_PATH
     run_release_guard(repo)
-    environment = minimal_environment()
+    npm_userconfig = prepare_empty_npm_user_config(
+        STATE_DIRECTORY,
+        expected_uid=0,
+        expected_gid=0,
+    )
+    environment = minimal_environment(npm_userconfig=npm_userconfig)
     environment["NPM_CONFIG_CACHE"] = str(STATE_DIRECTORY / "npm-cache")
     try:
         subprocess.run(
