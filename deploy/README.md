@@ -240,6 +240,32 @@ also returns 503 before business logic when either list is invalid.
 
 ## Administrator TOTP rotation
 
+### Local OAuth Worker publishing
+
+When Cloudflare authentication is intentionally retained on the operator's
+workstation rather than cc, publish reviewed Worker code through
+`deploy/local-worker-publish.py`. It creates and removes an isolated worktree
+at the fixed reviewed source commit, copies only the local mode-`0600` private
+binding config, and verifies Node, locked dependencies, Worker tests, Wrangler
+config, the TOTP Secret *names*, and a dry-run before an explicit publish. It
+uses the local Wrangler OAuth home and never accepts, creates, reads, or logs a
+Secret value.
+
+The default is check-only. For a compatibility publish, invoke it from the
+local repository with the exact locally installed Node 22-or-newer executable:
+
+```bash
+python3 -I deploy/local-worker-publish.py --apply \
+  --totp-rotation-stage compatibility \
+  --node /absolute/path/to/node
+```
+
+This controller cannot initialize, stage, promote, or delete Worker Secrets.
+Those remain private interactive operations and require their own successful
+browser-login proof. Do not replace this controller with a bare `wrangler
+deploy`, and do not use it for final-source until the documented promoted-seed
+proof has completed.
+
 Use this procedure only when the registered migration verifier exists and the
 old administrator Base32 seed is unavailable. Do not delete the verifier, its
 replay-state file, or its lock file to make `enroll --apply` work. The supported
