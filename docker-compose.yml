@@ -183,7 +183,8 @@ services:
       redis:
         condition: service_healthy
     networks:
-      - sub2api-network
+      - sub2api-data
+      - sub2api-egress
     cap_drop:
       - ALL
     security_opt:
@@ -254,7 +255,7 @@ services:
       sub2api:
         condition: service_healthy
     networks:
-      - sub2api-network
+      - sub2api-data
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3021/healthz', timeout=4)"]
       interval: 30s
@@ -357,7 +358,7 @@ services:
       - PGDATA=/var/lib/postgresql/18/docker
       - TZ=${TZ:-Asia/Shanghai}
     networks:
-      - sub2api-network
+      - sub2api-data
     cap_drop:
       - ALL
     security_opt:
@@ -430,7 +431,7 @@ services:
       - TZ=${TZ:-Asia/Shanghai}
       - REDISCLI_AUTH=${REDIS_PASSWORD:?REDIS_PASSWORD is required}
     networks:
-      - sub2api-network
+      - sub2api-data
     cap_drop:
       - ALL
     security_opt:
@@ -501,7 +502,7 @@ services:
       - TZ=${TZ:-Asia/Shanghai}
       - REDISCLI_AUTH=${SUB2API_SYNC_REDIS_PASSWORD:?SUB2API_SYNC_REDIS_PASSWORD is required}
     networks:
-      - sub2api-network
+      - sub2api-data
     cap_drop:
       - ALL
     security_opt:
@@ -521,5 +522,6 @@ services:
 # Networks
 # =============================================================================
 networks:
-  sub2api-network:
-    driver: bridge
+  sub2api-data:
+    internal: true
+  sub2api-egress: {}

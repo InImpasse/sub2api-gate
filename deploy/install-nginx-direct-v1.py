@@ -16,6 +16,23 @@ import tempfile
 
 REPO_DIR = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_NGINX_ROOT = pathlib.Path("/etc/nginx")
+TRUSTED_RELEASE_ROOT = pathlib.Path("/opt/sub2api-gate-release")
+CUTOVER_SOURCE_RELATIVE_PATH = pathlib.Path("deploy/install-nginx-direct-v1.py")
+RELEASE_GUARD_RELATIVE_PATH = pathlib.Path("deploy/require-clean-worktree.sh")
+CANARY_RUNNER_RELATIVE_PATH = pathlib.Path("deploy/run-v1-responses-canary.py")
+TRUSTED_RELEASE_DIRECTORIES = (
+    pathlib.Path("deploy"),
+    pathlib.Path("nginx"),
+    pathlib.Path("nginx/snippets"),
+)
+TRUSTED_RELEASE_FILES = (
+    (CUTOVER_SOURCE_RELATIVE_PATH, False),
+    (RELEASE_GUARD_RELATIVE_PATH, True),
+    (CANARY_RUNNER_RELATIVE_PATH, True),
+    (pathlib.Path("nginx/00-connection-upgrade-map.conf"), False),
+    (pathlib.Path("nginx/snippets/sub2api-upstream-stable.conf"), False),
+    (pathlib.Path("nginx/sub2api-sync-location.conf"), False),
+)
 NGINX_OPERATION_LOCK_NAME = "nginx-operation.lock"
 MAX_CONFIG_BYTES = 2 * 1024 * 1024
 HOSTNAME_PATTERN = re.compile(
@@ -32,6 +49,23 @@ CAPTURE_MARKERS = (
     "/capture",
     "_capture",
 )
+CAPTURE_DIRECTIVE_NAMES = frozenset(
+    {
+        "mirror",
+        "mirror_request_body",
+        "body_filter_by_lua",
+        "body_filter_by_lua_block",
+        "log_by_lua",
+        "log_by_lua_block",
+    }
+)
+CLOUDFLARE_ONLY_INCLUDE = (
+    "include",
+    "/etc/nginx/snippets/cloudflare-only.conf",
+)
+PRODUCTION_COMMAND_ENV = {
+    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+}
 UPSTREAM_BLOCK = """upstream sub2api_backend {
     include /etc/nginx/snippets/sub2api-upstream-active.conf;
     keepalive 64;
@@ -40,6 +74,7 @@ UPSTREAM_BLOCK = """upstream sub2api_backend {
 """
 STABLE_UPSTREAM = b"server 127.0.0.1:8080;\n"
 DIRECT_LOCATION = """    location ^~ /v1/ {
+        include /etc/nginx/snippets/cloudflare-only.conf;
         proxy_pass http://sub2api_backend;
         access_log off;
         error_log /dev/null crit;
@@ -54,6 +89,7 @@ DIRECT_LOCATION = """    location ^~ /v1/ {
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_cache off;
+        proxy_intercept_errors off;
         proxy_connect_timeout 5s;
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
@@ -67,6 +103,83 @@ class CutoverError(RuntimeError):
 
 class CutoverUsageError(CutoverError):
     pass
+
+
+def _require_trusted_release_path(
+    path, *, expects_directory, expects_executable, expected_uid
+):
+    path = pathlib.Path(path)
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise CutoverError("trusted production release tree is unavailable") from error
+    if (
+        not path.is_absolute()
+        or stat.S_ISLNK(metadata.st_mode)
+        or (expects_directory and not stat.S_ISDIR(metadata.st_mode))
+        or (not expects_directory and not stat.S_ISREG(metadata.st_mode))
+        or metadata.st_uid != expected_uid
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or (expects_executable and not metadata.st_mode & stat.S_IXUSR)
+    ):
+        raise CutoverError("trusted production release tree has an unsafe identity")
+
+
+def require_trusted_release_tree(
+    *, repo_dir=None, source_path=None, trusted_root=None, expected_uid=0
+):
+    repo_dir = pathlib.Path(REPO_DIR if repo_dir is None else repo_dir)
+    trusted_root = pathlib.Path(
+        TRUSTED_RELEASE_ROOT if trusted_root is None else trusted_root
+    )
+    if not trusted_root.is_absolute() or repo_dir != trusted_root:
+        raise CutoverError("--apply must run from the trusted production release tree")
+    try:
+        source_path = (
+            pathlib.Path(__file__).resolve(strict=True)
+            if source_path is None
+            else pathlib.Path(source_path).resolve(strict=True)
+        )
+    except OSError as error:
+        raise CutoverError("trusted production release tree is unavailable") from error
+    expected_source = trusted_root / CUTOVER_SOURCE_RELATIVE_PATH
+    if source_path != expected_source:
+        raise CutoverError("Nginx cutover controller is outside the trusted production release tree")
+
+    trusted_entries = (
+        (pathlib.Path("/"), True, False),
+        (trusted_root.parent, True, False),
+        (trusted_root, True, False),
+        *(
+            (trusted_root / relative_path, True, False)
+            for relative_path in TRUSTED_RELEASE_DIRECTORIES
+        ),
+        *(
+            (trusted_root / relative_path, False, expects_executable)
+            for relative_path, expects_executable in TRUSTED_RELEASE_FILES
+        ),
+    )
+    for path, expects_directory, expects_executable in trusted_entries:
+        _require_trusted_release_path(
+            path,
+            expects_directory=expects_directory,
+            expects_executable=expects_executable,
+            expected_uid=expected_uid,
+        )
+
+
+def require_production_apply_context(*, repo_dir=None, streams=None):
+    if os.geteuid() != 0:
+        raise CutoverError("--apply must run as root")
+    if streams is None:
+        streams = (sys.stdin, sys.stdout, sys.stderr)
+    try:
+        private_tty = all(stream.isatty() for stream in streams)
+    except (AttributeError, OSError, ValueError):
+        private_tty = False
+    if not private_tty:
+        raise CutoverError("--apply requires a private interactive terminal")
+    require_trusted_release_tree(repo_dir=repo_dir)
 
 
 class RedactedArgumentParser(argparse.ArgumentParser):
@@ -126,6 +239,15 @@ def tokenise(value):
         return shlex.split(strip_comments(value), comments=False, posix=True)
     except ValueError as error:
         raise CutoverError("Nginx configuration contains an invalid quoted directive") from error
+
+
+def is_capture_directive(tokens):
+    if not tokens:
+        return False
+    name = tokens[0].lower()
+    return name in CAPTURE_DIRECTIVE_NAMES or name.endswith(
+        ("_by_lua", "_by_lua_block", "_by_lua_file")
+    )
 
 
 def code_start(raw):
@@ -276,6 +398,81 @@ def location_path(block):
     return "", tokens[1]
 
 
+def direct_directives(block, directives):
+    return [
+        tokenise(directive.text)
+        for directive in directives
+        if directive.parent is block
+    ]
+
+
+def is_proxying_location(block, directives):
+    _, path = location_path(block)
+    return path is not None and any(
+        tokens and tokens[0] == "proxy_pass"
+        for tokens in direct_directives(block, directives)
+    )
+
+
+def has_explicit_cloudflare_gate(block, directives):
+    return direct_directives(block, directives).count(
+        list(CLOUDFLARE_ONLY_INCLUDE)
+    ) == 1
+
+
+def add_missing_cloudflare_location_gates(text, server, blocks, directives):
+    insertions = []
+    for block in blocks:
+        if (
+            block.parent is server
+            and is_proxying_location(block, directives)
+            and not has_explicit_cloudflare_gate(block, directives)
+        ):
+            line_start = text.rfind("\n", 0, block.open_index) + 1
+            indentation = re.match(
+                r"[ \t]*", text[line_start:block.open_index]
+            ).group(0)
+            trailing_newline = (
+                "" if text[block.open_index + 1:block.open_index + 2] == "\n"
+                else "\n"
+            )
+            insertions.append(
+                (
+                    block.open_index + 1,
+                    "\n"
+                    f"{indentation}    include "
+                    "/etc/nginx/snippets/cloudflare-only.conf;"
+                    f"{trailing_newline}",
+                )
+            )
+    for index, insertion in sorted(insertions, reverse=True):
+        text = text[:index] + insertion + text[index:]
+    return text
+
+
+def verify_sync_location_config(text):
+    blocks, directives = parse_config(text)
+    sync_locations = []
+    for block in blocks:
+        modifier, path = location_path(block)
+        if (
+            block.parent is None
+            and modifier == "="
+            and path == "/_sub2api-sync/provision"
+        ):
+            sync_locations.append(block)
+    if len(sync_locations) != 1:
+        raise CutoverError("sync location must contain one reviewed provision endpoint")
+    sync_location = sync_locations[0]
+    sync_directives = direct_directives(sync_location, directives)
+    if ["proxy_pass", "http://127.0.0.1:3021/provision"] not in sync_directives:
+        raise CutoverError("sync location is not the reviewed provisioning proxy")
+    if not has_explicit_cloudflare_gate(sync_location, directives):
+        raise CutoverError(
+            "sync proxy location must explicitly include the Cloudflare-only gate"
+        )
+
+
 def block_end_with_newline(text, block):
     end = int(block.close_index) + 1
     while end < len(text) and text[end] in " \t\r":
@@ -324,8 +521,14 @@ def rewrite_direct_v1(text, hostname):
         if directive.parent is not server:
             continue
         tokens = tokenise(directive.text)
-        if tokens and tokens[0] in {"mirror", "mirror_request_body", "body_filter_by_lua", "log_by_lua"}:
+        if is_capture_directive(tokens):
             raise CutoverError("server-wide request capture must be removed manually before cutover")
+
+    if any(
+        block.parent is server and is_capture_directive(tokenise(block.header))
+        for block in blocks
+    ):
+        raise CutoverError("server-wide request capture must be removed manually before cutover")
 
     insertion = int(server.close_index)
     replacements = [(start, end, "") for start, end in removals]
@@ -344,6 +547,21 @@ def rewrite_direct_v1(text, hostname):
     if not existing_upstreams:
         rewritten = UPSTREAM_BLOCK + rewritten
 
+    rewritten_blocks, rewritten_directives = parse_config(rewritten)
+    rewritten_servers = [
+        block for block in rewritten_blocks
+        if is_server_block(block)
+        and is_tls_server(block, rewritten_directives)
+        and normalized_hostname in server_names(block, rewritten_directives)
+    ]
+    if len(rewritten_servers) != 1:
+        raise CutoverError("rewritten Nginx configuration lost the approved server")
+    rewritten = add_missing_cloudflare_location_gates(
+        rewritten,
+        rewritten_servers[0],
+        rewritten_blocks,
+        rewritten_directives,
+    )
     verify_rewritten_config(rewritten, normalized_hostname)
     return rewritten
 
@@ -395,12 +613,23 @@ def verify_rewritten_config(text, hostname):
         "error_log /dev/null crit;",
         "proxy_request_buffering off;",
         "proxy_set_header Connection $connection_upgrade;",
+        "proxy_intercept_errors off;",
     )
     if any(value not in body for value in required):
         raise CutoverError("rewritten /v1 location is not the reviewed direct proxy")
     lowered = body.lower()
     if "mirror" in lowered or "3021" in lowered or any(marker in lowered for marker in CAPTURE_MARKERS):
         raise CutoverError("rewritten /v1 location still contains a capture or sync hop")
+
+    for block in blocks:
+        if (
+            block.parent is server
+            and is_proxying_location(block, directives)
+            and not has_explicit_cloudflare_gate(block, directives)
+        ):
+            raise CutoverError(
+                "every proxy location must explicitly include the Cloudflare-only gate"
+            )
 
     for block in blocks:
         if block.parent is not server or block is v1_locations[0]:
@@ -417,6 +646,8 @@ def verify_rewritten_config(text, hostname):
             continue
         lowered_directive = strip_comments(directive.text).lower()
         tokens = tokenise(directive.text)
+        if is_capture_directive(tokens):
+            raise CutoverError("rewritten server still contains a capture directive")
         if tokens and tokens[0] == "include" and any(
             marker in lowered_directive for marker in CAPTURE_MARKERS
         ):
@@ -428,6 +659,15 @@ def validate_hostname(value):
     if not HOSTNAME_PATTERN.fullmatch(hostname):
         raise CutoverError("approved hostname is invalid")
     return hostname
+
+
+def is_production_nginx_root(path):
+    try:
+        return pathlib.Path(path).resolve(strict=False) == DEFAULT_NGINX_ROOT.resolve(
+            strict=False
+        )
+    except (OSError, RuntimeError) as error:
+        raise CutoverError("Nginx root is unsafe") from error
 
 
 def read_regular_file(path, nginx_root, *, production):
@@ -598,18 +838,46 @@ def atomic_write(path, payload, file_stat=None, mode=0o644):
             pass
 
 
-def command_ok(command, *, visible=False):
+def command_ok(command, *, visible=False, production=False):
     result = subprocess.run(
         command,
         stdin=None if visible else subprocess.DEVNULL,
         stdout=None if visible else subprocess.DEVNULL,
         stderr=None if visible else subprocess.DEVNULL,
+        env=PRODUCTION_COMMAND_ENV if production else None,
         check=False,
     )
     return result.returncode == 0
 
 
-def verify_no_capture_config(nginx_root):
+def validate_active_config_file(path, nginx_root, *, production):
+    try:
+        resolved = path.resolve(strict=True)
+        root_resolved = nginx_root.resolve(strict=True)
+        file_stat = resolved.stat(follow_symlinks=False)
+    except OSError as error:
+        raise CutoverError("Nginx configuration tree could not be inspected") from error
+    if root_resolved not in resolved.parents or not stat.S_ISREG(file_stat.st_mode):
+        raise CutoverError("Nginx configuration tree contains an unsafe entry")
+    expected_uid = 0 if production else os.geteuid()
+    if file_stat.st_uid != expected_uid or stat.S_IMODE(file_stat.st_mode) & 0o022:
+        raise CutoverError("Nginx configuration tree has unsafe permissions")
+    directory = resolved.parent
+    while True:
+        validate_managed_directory(
+            directory,
+            "Nginx configuration directory",
+            production=production,
+        )
+        if directory == root_resolved:
+            break
+        directory = directory.parent
+    return resolved, file_stat
+
+
+def verify_no_capture_config(nginx_root, *, production=False):
+    nginx_root = pathlib.Path(nginx_root)
+    validate_managed_directory(nginx_root, "Nginx root", production=production)
     total = 0
     try:
         root_resolved = nginx_root.resolve(strict=True)
@@ -634,10 +902,7 @@ def verify_no_capture_config(nginx_root):
     while pending:
         path = pathlib.Path(pending.pop())
         try:
-            resolved = path.resolve(strict=True)
-            file_stat = resolved.stat(follow_symlinks=False)
-            if root_resolved not in resolved.parents or not stat.S_ISREG(file_stat.st_mode):
-                raise CutoverError("Nginx configuration tree contains an unsafe entry")
+            resolved, file_stat = validate_active_config_file(path, nginx_root, production=production)
             identity = (file_stat.st_dev, file_stat.st_ino)
             if identity in inspected:
                 continue
@@ -653,14 +918,14 @@ def verify_no_capture_config(nginx_root):
             cleaned = strip_comments(source).lower()
         except UnicodeDecodeError as error:
             raise CutoverError("Nginx configuration files must be UTF-8") from error
-        unsafe_directive = re.search(
-            r"(?m)^\s*(?:mirror|mirror_request_body|body_filter_by_lua|log_by_lua)\b",
-            cleaned,
-        )
-        if unsafe_directive or any(marker in cleaned for marker in CAPTURE_MARKERS):
+        if any(marker in cleaned for marker in CAPTURE_MARKERS):
             raise CutoverError("Nginx configuration tree still contains mirror or capture directives")
 
-        _, directives = parse_config(source)
+        blocks, directives = parse_config(source)
+        if any(is_capture_directive(tokenise(block.header)) for block in blocks) or any(
+            is_capture_directive(tokenise(directive.text)) for directive in directives
+        ):
+            raise CutoverError("Nginx configuration tree still contains mirror or capture directives")
         for directive in directives:
             tokens = tokenise(directive.text)
             if not tokens or tokens[0] != "include":
@@ -694,8 +959,14 @@ def verify_live_direct_v1(nginx_root, site_path, hostname, *, production):
         pathlib.Path(nginx_root),
         production=production,
     )
-    verify_no_capture_config(pathlib.Path(nginx_root))
+    verify_no_capture_config(pathlib.Path(nginx_root), production=production)
     verify_rewritten_config(text, validate_hostname(hostname))
+    _, _, sync_text = read_regular_file(
+        pathlib.Path(nginx_root) / "snippets" / "sub2api-sync-location.conf",
+        pathlib.Path(nginx_root),
+        production=production,
+    )
+    verify_sync_location_config(sync_text)
 
 
 def local_healthcheck():
@@ -815,6 +1086,12 @@ def run_locked_cutover(arguments, *, test_mode, nginx_root, state_root):
         or b"mirror" in lowered_sync
     ):
         raise CutoverError("tracked sync location is not the reviewed capture-free version")
+    try:
+        verify_sync_location_config(expected_sync.decode("utf-8"))
+    except (UnicodeDecodeError, CutoverError) as error:
+        raise CutoverError(
+            "tracked sync location is not the reviewed Cloudflare-only proxy"
+        ) from error
     sync_target = snippets_dir / "sub2api-sync-location.conf"
     sync_original = None
     sync_stat = None
@@ -885,10 +1162,10 @@ def run_locked_cutover(arguments, *, test_mode, nginx_root, state_root):
             mode=0o644,
         )
         sync_changed = True
-        verify_no_capture_config(nginx_root)
-        if not command_ok([nginx_bin, "-t"]):
+        verify_no_capture_config(nginx_root, production=production)
+        if not command_ok([nginx_bin, "-t"], production=production):
             raise CutoverError("new Nginx configuration failed syntax validation")
-        if not command_ok([systemctl_bin, "reload", "nginx"]):
+        if not command_ok([systemctl_bin, "reload", "nginx"], production=production):
             raise CutoverError("Nginx reload failed after direct /v1 cutover")
         canary_command = [
             canary_runner,
@@ -897,7 +1174,7 @@ def run_locked_cutover(arguments, *, test_mode, nginx_root, state_root):
             "--model", arguments.model,
             "--approved-hostname", hostname,
         ]
-        if not command_ok(canary_command, visible=True):
+        if not command_ok(canary_command, visible=True, production=production):
             raise CutoverError("end-to-end /v1 canary failed")
     except BaseException:
         if site_changed or map_changed or stable_changed or sync_changed:
@@ -925,9 +1202,9 @@ def run_locked_cutover(arguments, *, test_mode, nginx_root, state_root):
                         pass
                 else:
                     atomic_write(sync_target, sync_original, file_stat=sync_stat)
-                if not command_ok([nginx_bin, "-t"]):
+                if not command_ok([nginx_bin, "-t"], production=production):
                     restore_failed = True
-                elif not command_ok([systemctl_bin, "reload", "nginx"]):
+                elif not command_ok([systemctl_bin, "reload", "nginx"], production=production):
                     restore_failed = True
             except Exception:
                 restore_failed = True
@@ -945,14 +1222,17 @@ def install_cutover(arguments):
     nginx_root = pathlib.Path(os.environ.get("SUB2API_NGINX_ROOT", DEFAULT_NGINX_ROOT))
     if not nginx_root.is_absolute() or nginx_root == pathlib.Path("/"):
         raise CutoverError("Nginx root is unsafe")
-    if test_mode and nginx_root == DEFAULT_NGINX_ROOT:
-        raise CutoverError("test mode may not target the production Nginx root")
+    if test_mode:
+        # Test mode selects helper executables from the environment, so it is
+        # deliberately unavailable to root even for a temporary Nginx tree.
+        if os.geteuid() == 0:
+            raise CutoverError("test mode may not run as root")
+        if is_production_nginx_root(nginx_root):
+            raise CutoverError("test mode may not target the production Nginx root")
+    else:
+        require_production_apply_context()
     if not test_mode and nginx_root != DEFAULT_NGINX_ROOT:
         raise CutoverError("Nginx root overrides are allowed only in test mode")
-    if not test_mode and os.geteuid() != 0:
-        raise CutoverError("--apply must run as root")
-    if not test_mode and (not sys.stdin.isatty() or not sys.stderr.isatty()):
-        raise CutoverError("--apply requires a private interactive terminal")
 
     production = not test_mode
     nginx_parent = pathlib.Path("/etc") if production else nginx_root.parent

@@ -1,6 +1,10 @@
 import json
+import os
 import pathlib
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 
@@ -26,6 +30,42 @@ DEPLOY_README = (ROOT / "deploy" / "README.md").read_text()
 
 
 class ReleaseSafetyTests(unittest.TestCase):
+    def test_stable_compose_isolates_data_services_from_egress(self):
+        expected_networks = {
+            "sub2api": ["sub2api-data", "sub2api-egress"],
+            "sub2api-sync": ["sub2api-data"],
+            "postgres": ["sub2api-data"],
+            "redis": ["sub2api-data"],
+            "redis-nonce": ["sub2api-data"],
+        }
+        for service, expected in expected_networks.items():
+            service_block = re.search(
+                rf"^  {re.escape(service)}:\n(?P<body>.*?)(?=^  [a-z0-9-]+:|^networks:)",
+                COMPOSE,
+                re.MULTILINE | re.DOTALL,
+            )
+            self.assertIsNotNone(service_block, service)
+            network_block = re.search(
+                r"^    networks:\n(?P<networks>(?:      - [a-z0-9-]+\n)+)",
+                service_block.group("body"),
+                re.MULTILINE,
+            )
+            self.assertIsNotNone(network_block, service)
+            self.assertEqual(
+                re.findall(
+                    r"^      - ([a-z0-9-]+)$",
+                    network_block.group("networks"),
+                    re.MULTILINE,
+                ),
+                expected,
+                service,
+            )
+
+        self.assertEqual(
+            COMPOSE.split("\nnetworks:\n", 1)[1].strip(),
+            "sub2api-data:\n    internal: true\n  sub2api-egress: {}",
+        )
+
     def test_fixed_runtime_boundary_is_not_exposed_as_env_configuration(self):
         for key in ("BIND_HOST", "SERVER_PORT", "SERVER_MODE", "RUN_MODE"):
             self.assertNotRegex(ENV_EXAMPLE, rf"(?m)^{key}=")
@@ -293,7 +333,8 @@ class ReleaseSafetyTests(unittest.TestCase):
         self.assertEqual(WORKER_PACKAGE["overrides"]["sharp"], "0.35.3")
         worker_deploy = (ROOT / "deploy" / "deploy-worker.sh").read_text()
         audit_command = (
-            'npm --prefix "$worker_dir" audit --audit-level=high '
+            'run_publish_command "$npm_bin" --prefix "$worker_dir" '
+            'audit --audit-level=high '
             "--package-lock-only --ignore-scripts"
         )
         self.assertIn(audit_command, worker_deploy)
@@ -339,7 +380,7 @@ class ReleaseSafetyTests(unittest.TestCase):
         self.assertIn("source_postgres_database_name_hex", safe_export)
         self.assertIn("git_head", safe_export)
         self.assertIn("deploy/locked-postgres-stream.py", safe_export)
-        self.assertIn('"$(id -u)" -eq 0', safe_export)
+        self.assertIn('if [ "$EUID" -ne 0 ]; then', safe_export)
         self.assertIn("sha256sum", safe_export)
         self.assertIn("verify-postgres-portability.sql", safe_export)
         self.assertIn("verify_no_conversation_content.sql", safe_export)
@@ -385,6 +426,7 @@ class ReleaseSafetyTests(unittest.TestCase):
             "deploy/configure-redis-migration-acl.py",
             "deploy/deploy-worker.sh",
             "deploy/generate-worker-secrets.py",
+            "deploy/worker-runtime-attestation.py",
             "deploy/configure-cloudflare-aop.py",
             "deploy/traffic-canary.py",
             "deploy/retire-legacy-data.py",
@@ -402,15 +444,87 @@ class ReleaseSafetyTests(unittest.TestCase):
 
         self.assertTrue(guard.startswith("#!/bin/bash\n"))
         self.assertIn('trusted_production_root="/opt/sub2api-gate-release"', guard)
-        self.assertIn('if [ "$(id -u)" -eq 0 ]; then', guard)
+        self.assertIn('if [ "$("$id_binary" -u)" -eq 0 ]; then', guard)
+        self.assertIn('release actions require an in-tree Git metadata directory', guard)
+        self.assertIn('rev-parse --absolute-git-dir', guard)
+        self.assertIn('-c core.fsmonitor=false', guard)
+        self.assertIn('-c core.hooksPath=/dev/null', guard)
+        self.assertIn('ls-files -v -z', guard)
+        self.assertIn('Git index has nonstandard trust flags', guard)
         self.assertIn('[ "$repo_dir" != "$trusted_production_root" ]', guard)
         self.assertIn('! -user root', guard)
         self.assertIn('-perm /022', guard)
         self.assertIn('/proc/self/mountinfo', guard)
         self.assertLess(
-            guard.index('if [ "$(id -u)" -eq 0 ]; then'),
+            guard.index('if [ "$("$id_binary" -u)" -eq 0 ]; then'),
             guard.index('git -C "$repo_dir" rev-parse'),
         )
+
+    def test_clean_worktree_guard_rejects_external_gitdirs_and_hidden_index_changes(self):
+        guard_source = ROOT / "deploy" / "require-clean-worktree.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "release"
+            (repo / "deploy").mkdir(parents=True)
+            shutil.copy2(guard_source, repo / "deploy" / "require-clean-worktree.sh")
+            tracked = repo / "tracked.txt"
+            tracked.write_text("trusted\n", encoding="utf-8")
+            environment = os.environ.copy()
+            environment.update({
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+            })
+            for command in (
+                ["git", "init", "--quiet"],
+                ["git", "add", "deploy/require-clean-worktree.sh", "tracked.txt"],
+                [
+                    "git",
+                    "-c",
+                    "user.name=release-test",
+                    "-c",
+                    "user.email=release-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "initial",
+                ],
+            ):
+                subprocess.run(command, cwd=repo, env=environment, check=True)
+
+            subprocess.run(
+                ["git", "update-index", "--assume-unchanged", "tracked.txt"],
+                cwd=repo,
+                env=environment,
+                check=True,
+            )
+            tracked.write_text("tampered\n", encoding="utf-8")
+            hidden_change = subprocess.run(
+                ["bash", "deploy/require-clean-worktree.sh"],
+                cwd=repo,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(hidden_change.returncode, 0)
+            self.assertIn("nonstandard trust flags", hidden_change.stderr)
+
+            git_directory = repo / ".git"
+            external_git_directory = root / "external-git"
+            git_directory.rename(external_git_directory)
+            git_directory.write_text(
+                f"gitdir: {external_git_directory}\n", encoding="utf-8"
+            )
+            external_gitdir = subprocess.run(
+                ["bash", "deploy/require-clean-worktree.sh"],
+                cwd=repo,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(external_gitdir.returncode, 0)
+            self.assertIn("in-tree Git metadata directory", external_gitdir.stderr)
 
     def test_nginx_has_custom_aop_stages_and_an_unknown_host_sink(self):
         nginx = (ROOT / "nginx" / "sub2api.conf").read_text()

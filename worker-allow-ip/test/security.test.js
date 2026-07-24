@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import { renderInviteSummary } from "../src/invite-summary.js";
@@ -14,6 +15,7 @@ const TEST_ADMIN_TOTP_SECRET_ALIAS = "JBSWY3DPEHPK3PXPA";
 const TEST_NEXT_TOTP_SECRET = "KRUGS4ZANFZSAYJA";
 const TEST_REPLACEMENT_TOTP_SECRET = "GEZDGNBVGY3TQOJQ";
 const TEST_ADMIN_SESSION_BINDING_KEY = "h".repeat(32);
+const ADMIN_SOURCE = readFileSync(new URL("../src/admin.js", import.meta.url), "utf8");
 
 
 test("invite summary never serializes API keys", () => {
@@ -992,21 +994,56 @@ test("orphan cleanup deletes only stale managed comments without active referenc
   assert.deepEqual(deletedIds, ["stale-managed"]);
 });
 
-test("sensitive admin actions require TOTP step-up", () => {
+test("every access-changing admin action requires TOTP step-up", () => {
   for (const action of [
+    "create",
     "migrate_invite_credentials",
     "finalize_legacy_auth_state_cleanup",
     "rotate_access_key",
     "restore_uuid",
     "reset_sub2api_password",
     "update_invite",
+    "delete",
     "purge_uuid",
+    "delete_ip_group",
+    "restore_ip_group",
     "purge_ip_group",
+    "update_ip_group_expiration",
+    "add_ip_group",
   ]) {
     assert.equal(adminTest.requiresStepUpAction(action), true, action);
   }
-  for (const action of ["create", "delete"]) {
+  for (const action of ["login", "logout", "refresh_sub2api_status"]) {
     assert.equal(adminTest.requiresStepUpAction(action), false, action);
+  }
+});
+
+test("admin UI renders a TOTP field for every access-changing action", () => {
+  for (const action of [
+    "create",
+    "migrate_invite_credentials",
+    "finalize_legacy_auth_state_cleanup",
+    "rotate_access_key",
+    "restore_uuid",
+    "reset_sub2api_password",
+    "update_invite",
+    "delete",
+    "purge_uuid",
+    "delete_ip_group",
+    "restore_ip_group",
+    "purge_ip_group",
+    "update_ip_group_expiration",
+    "add_ip_group",
+  ]) {
+    const marker = `name="action" value="${action}"`;
+    const actionOffset = ADMIN_SOURCE.indexOf(marker);
+    assert.notEqual(actionOffset, -1, action);
+    const formEnd = ADMIN_SOURCE.indexOf("</form>", actionOffset);
+    assert.notEqual(formEnd, -1, action);
+    assert.ok(
+      ADMIN_SOURCE.slice(actionOffset, formEnd).includes('name="step_up_token"'),
+      action,
+    );
   }
 });
 
@@ -1244,6 +1281,64 @@ test("invite updates reject missing TOTP before credential or KV writes", async 
   assert.equal(response.status, 400);
   assert.match(await response.text(), /valid 2FA code/);
   assert.equal(writes, 0);
+});
+
+test("adding an IP group checks CSRF before TOTP and blocks mutations without step-up", async () => {
+  const token = "manual-ip-step-up-session";
+  const csrf = "manual-ip-step-up-csrf";
+  const uuid = "7c484f74-6d93-43d1-9441-00c7d8d4ab11";
+  const values = new Map([
+    [`session:${await sha256Hex(token)}`, JSON.stringify(
+      await boundAdminSession(csrf, Date.now() + 60_000),
+    )],
+  ]);
+  let writes = 0;
+  const store = {
+    async get(key) { return values.get(key) ?? null; },
+    async put() { writes += 1; },
+    async delete() { writes += 1; },
+  };
+  const env = validAdminEnv(store);
+  const originalFetch = globalThis.fetch;
+  let externalCalls = 0;
+  globalThis.fetch = async () => {
+    externalCalls += 1;
+    throw new Error("step-up rejection must precede the Cloudflare mutation");
+  };
+  const submit = async (submittedCsrf, stepUpToken) => await worker.fetch(
+    new Request("https://api.example.test/allow-ip/admin", {
+      method: "POST",
+      headers: {
+        Cookie: `sub2api_allow_admin=${token}`,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        action: "add_ip_group",
+        csrf: submittedCsrf,
+        step_up_token: stepUpToken,
+        uuid,
+        ip_value: "198.51.100.8",
+        expires_in_days: "7",
+        expiration_mode: "days",
+      }),
+    }),
+    env,
+  );
+
+  try {
+    const csrfRejected = await submit("wrong-csrf", "000000");
+    assert.equal(csrfRejected.status, 403);
+    assert.equal(externalCalls, 0);
+    assert.equal(writes, 0);
+
+    const totpRejected = await submit(csrf, "");
+    assert.equal(totpRejected.status, 400);
+    assert.match(await totpRejected.text(), /valid 2FA code/);
+    assert.equal(externalCalls, 0);
+    assert.equal(writes, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("Sub2API login reset is routed through TOTP and stores only encrypted credentials", async () => {

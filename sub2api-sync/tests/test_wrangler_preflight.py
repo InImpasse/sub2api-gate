@@ -20,16 +20,17 @@ class WranglerPreflightTests(unittest.TestCase):
     def test_worker_deploy_wrapper_cannot_bypass_local_security_validation(self):
         script = WORKER_DEPLOY.read_text()
         validator_call = (
-            'node "$repo_dir/deploy/validate-wrangler-config.mjs" '
+            '"$node_bin" "$repo_dir/deploy/validate-wrangler-config.mjs" '
             '"$wrangler_config" "$secret_manifest"'
         )
-        preflight_call = '"$repo_dir/deploy/security-preflight.sh" check --wrangler-config "$wrangler_config"'
+        preflight_call = 'run_publish_command bash "$repo_dir/deploy/security-preflight.sh" check'
         self.assertIn(validator_call, script)
         self.assertIn(preflight_call, script)
+        self.assertIn('--env-file "/mnt/data/sub2api-gate/private/.env"', script)
         self.assertLess(script.index(validator_call), script.index("deploy --dry-run"))
         self.assertLess(script.index(preflight_call), script.index("explicit --apply accepted"))
-        secret_list_call = '"$wrangler_bin" secret list --format json --config "$wrangler_config"'
-        secret_verifier_call = 'node "$repo_dir/deploy/verify-worker-secret-list.mjs"'
+        secret_list_call = '"$wrangler_entry" secret list --format json --config "$wrangler_config"'
+        secret_verifier_call = '"$node_bin" "$repo_dir/deploy/verify-worker-secret-list.mjs"'
         self.assertIn("Remote Worker Secrets were not verified in check mode", script)
         self.assertIn(secret_list_call, script)
         self.assertIn(secret_verifier_call, script)
@@ -48,6 +49,31 @@ class WranglerPreflightTests(unittest.TestCase):
         self.assertLess(node_gate, script.index(validator_call))
         self.assertLess(wrangler_gate, script.index(validator_call))
         self.assertLess(final_source_gate, mode_branch)
+
+    def test_worker_publish_is_root_tty_only_and_uses_fixed_private_inputs(self):
+        script = WORKER_DEPLOY.read_text()
+        self.assertIn('"/opt/sub2api-gate-release"', script)
+        self.assertIn('if [ "$mode" = "--apply" ]; then', script)
+        self.assertIn('Worker production publishing requires root from the trusted production release tree', script)
+        self.assertIn('if [ ! -t 0 ] || [ ! -t 1 ] || [ ! -t 2 ]; then', script)
+        self.assertIn('Worker production publishing requires a private interactive TTY', script)
+        self.assertIn('Worker production publishing does not accept a Wrangler config override', script)
+        self.assertIn('trusted private Wrangler config must be a root-owned single-link mode-0600 regular file', script)
+        self.assertIn('0:0:600:1', script)
+        self.assertIn('require_trusted_release_tree', script)
+        self.assertIn('require_trusted_private_wrangler_config', script)
+        self.assertIn('"$TRUSTED_RELEASE_GUARD" check', script)
+        self.assertNotIn('dirname --', script)
+        self.assertLess(
+            script.index('require_trusted_release_tree'),
+            script.index('"$TRUSTED_RELEASE_GUARD" check'),
+        )
+        self.assertIn('"$ENV_BINARY" -i \\', script)
+        self.assertIn('NPM_CONFIG_REGISTRY', script)
+        self.assertIn('CLOUDFLARE_API_TOKEN', script)
+        self.assertGreaterEqual(script.count('CLOUDFLARE_INCLUDE_PROCESS_ENV=false'), 2)
+        self.assertGreaterEqual(script.count('CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV=false'), 2)
+        self.assertIn('--env-file "/mnt/data/sub2api-gate/private/.env"', script)
 
     def test_remote_secret_name_verifier_accepts_only_a_complete_name_set(self):
         required = (
@@ -376,7 +402,9 @@ class WranglerPreflightTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         root = pathlib.Path(temporary.name)
         (root / "deploy").mkdir()
-        (root / "worker-allow-ip" / "node_modules" / ".bin").mkdir(parents=True)
+        (root / "worker-allow-ip" / "node_modules" / "wrangler" / "bin").mkdir(
+            parents=True
+        )
         (root / "fake-bin").mkdir()
         shutil.copy2(WORKER_DEPLOY, root / "deploy" / "deploy-worker.sh")
         (root / "worker-allow-ip" / "wrangler.private.jsonc").write_text("{}\n")
@@ -389,6 +417,15 @@ class WranglerPreflightTests(unittest.TestCase):
             "  [ \"${FAKE_NODE_MAJOR-0}\" -ge 22 ]\n"
             "  exit $?\n"
             "fi\n"
+            "case \"${1-}\" in\n"
+            "  */node_modules/wrangler/bin/wrangler.js)\n"
+            "    shift\n"
+            "    printf '%s\\n' \"$*\" >> \"$FAKE_WRANGLER_LOG\"\n"
+            "    if [ \"${1-}\" = \"--version\" ]; then\n"
+            "      printf '%s\\n' \"${FAKE_WRANGLER_VERSION-}\"\n"
+            "    fi\n"
+            "    ;;\n"
+            "esac\n"
             "exit 0\n"
         )
         fake_node.chmod(0o700)
@@ -401,17 +438,15 @@ class WranglerPreflightTests(unittest.TestCase):
         )
         fake_npm.chmod(0o700)
 
-        fake_wrangler = root / "worker-allow-ip" / "node_modules" / ".bin" / "wrangler"
-        fake_wrangler.write_text(
-            "#!/bin/sh\n"
-            "printf '%s\\n' \"$*\" >> \"$FAKE_WRANGLER_LOG\"\n"
-            "if [ \"${1-}\" = \"--version\" ]; then\n"
-            "  printf '%s\\n' \"${FAKE_WRANGLER_VERSION-}\"\n"
-            "  exit 0\n"
-            "fi\n"
-            "exit 0\n"
+        fake_wrangler = (
+            root
+            / "worker-allow-ip"
+            / "node_modules"
+            / "wrangler"
+            / "bin"
+            / "wrangler.js"
         )
-        fake_wrangler.chmod(0o700)
+        fake_wrangler.write_text("// test-only fake Wrangler entry\n")
         log_path = root / "wrangler.log"
         npm_log_path = root / "npm.log"
         environment = os.environ.copy()
@@ -422,6 +457,8 @@ class WranglerPreflightTests(unittest.TestCase):
             "FAKE_WRANGLER_LOG": str(log_path),
             "FAKE_NPM_AUDIT_EXIT": str(npm_audit_exit),
             "FAKE_NPM_LOG": str(npm_log_path),
+            "SUB2API_NODE_BINARY": str(fake_node),
+            "SUB2API_NPM_BINARY": str(fake_npm),
         })
         result = subprocess.run(
             ["bash", root / "deploy" / "deploy-worker.sh", "check"],

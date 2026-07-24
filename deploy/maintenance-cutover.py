@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """Bounded, fail-closed orchestration for the sanitized data cutover.
 
 The default mode is an offline contract check. The apply path is intentionally
@@ -32,6 +32,11 @@ from dataclasses import dataclass
 
 
 REPO_DIR = pathlib.Path(__file__).resolve().parents[1]
+TRUSTED_FILESYSTEM_ROOT = pathlib.Path("/")
+TRUSTED_RELEASE_ROOT = pathlib.Path("/opt/sub2api-gate-release")
+MAINTENANCE_SOURCE_RELATIVE_PATH = pathlib.Path("deploy/maintenance-cutover.py")
+PYTHON_BINARY = pathlib.Path("/usr/bin/python3")
+PYTHON_COMMAND = (str(PYTHON_BINARY), "-I")
 DEPLOY_DIR = REPO_DIR / "deploy"
 COMPOSE_FILE = REPO_DIR / "docker-compose.traffic-canary.yml"
 POSTGRES_MIGRATION_COMPOSE_FILE = REPO_DIR / "docker-compose.postgres-migration.yml"
@@ -98,6 +103,41 @@ SAFE_EXPORT_POLICY_FILES = (
     "migrations/verify_conversation_guards.sql",
     "migrations/verify_no_conversation_content.sql",
 )
+CUTOVER_TRUSTED_RELEASE_DIRECTORIES = (
+    pathlib.Path("deploy"),
+    pathlib.Path("migrations"),
+    pathlib.Path("nginx"),
+    pathlib.Path("nginx/snippets"),
+    pathlib.Path("sub2api-sync"),
+)
+CUTOVER_TRUSTED_RELEASE_FILES = (
+    MAINTENANCE_SOURCE_RELATIVE_PATH,
+    pathlib.Path("deploy/private_env.py"),
+    pathlib.Path("deploy/require-clean-worktree.sh"),
+    pathlib.Path("deploy/verify-migration-totp.py"),
+    pathlib.Path("deploy/security-preflight.sh"),
+    pathlib.Path("deploy/export-safe-metadata.sh"),
+    pathlib.Path("deploy/install-nginx-direct-v1.py"),
+    pathlib.Path("deploy/locked-postgres-stream.py"),
+    pathlib.Path("deploy/migrate-sanitized-postgres.sh"),
+    pathlib.Path("deploy/migrate-app-metadata.py"),
+    pathlib.Path("deploy/migrate-redis-allowlist.py"),
+    pathlib.Path("deploy/configure-redis-migration-acl.py"),
+    pathlib.Path("deploy/prepare-app-role.sh"),
+    pathlib.Path("deploy/prepare-sync-role.sh"),
+    pathlib.Path("deploy/run-database-migration.sh"),
+    pathlib.Path("deploy/pg-env-exec.py"),
+    pathlib.Path("deploy/source-postgres-exec.py"),
+    pathlib.Path("deploy/traffic-canary.py"),
+    pathlib.Path("deploy/run-v1-responses-canary.py"),
+    pathlib.Path("deploy/retire-legacy-data.py"),
+    pathlib.Path("docker-compose.traffic-canary.yml"),
+    pathlib.Path("docker-compose.postgres-migration.yml"),
+    pathlib.Path("docker-compose.sync-canary.yml"),
+    pathlib.Path("docker-compose.redis-migration.yml"),
+    pathlib.Path("nginx/snippets/sub2api-upstream-stable.conf"),
+    pathlib.Path("nginx/snippets/sub2api-upstream-canary.conf"),
+)
 SAFE_EXPORT_ENTRIES = frozenset(
     (*SAFE_EXPORT_ARTIFACTS, "SHA256SUMS", "manifest.json", "COMPLETE")
 )
@@ -151,6 +191,71 @@ class CommandError(CutoverError):
 
 class TerminationRequested(CutoverError):
     pass
+
+def _require_trusted_release_path(path, *, expects_directory):
+    path = pathlib.Path(path)
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise CutoverError("trusted maintenance release path is unavailable") from error
+    if (
+        not path.is_absolute()
+        or stat.S_ISLNK(metadata.st_mode)
+        or (expects_directory and not stat.S_ISDIR(metadata.st_mode))
+        or (not expects_directory and not stat.S_ISREG(metadata.st_mode))
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise CutoverError("trusted maintenance release path is unsafe")
+
+
+def require_trusted_release_tree(repo_dir, *, source_path=None):
+    repo_dir = pathlib.Path(repo_dir)
+    trusted_root = pathlib.Path(TRUSTED_RELEASE_ROOT)
+    if repo_dir != trusted_root or not trusted_root.is_absolute():
+        raise CutoverError(
+            "maintenance apply/recovery must run from the trusted production release tree"
+        )
+    try:
+        resolved_source = (
+            pathlib.Path(__file__).resolve(strict=True)
+            if source_path is None
+            else pathlib.Path(source_path).resolve(strict=True)
+        )
+    except OSError as error:
+        raise CutoverError("trusted maintenance controller source is unavailable") from error
+    expected_source = trusted_root / MAINTENANCE_SOURCE_RELATIVE_PATH
+    if resolved_source != expected_source:
+        raise CutoverError("maintenance controller source is outside the trusted release tree")
+    for path, expects_directory in (
+        (TRUSTED_FILESYSTEM_ROOT, True),
+        (trusted_root.parent, True),
+        (trusted_root, True),
+        *((trusted_root / value, True) for value in CUTOVER_TRUSTED_RELEASE_DIRECTORIES),
+        *((trusted_root / value, False) for value in CUTOVER_TRUSTED_RELEASE_FILES),
+    ):
+        _require_trusted_release_path(path, expects_directory=expects_directory)
+
+
+def require_production_apply_context(*, streams=None):
+    if os.geteuid() != 0 or pathlib.Path(REPO_DIR) != TRUSTED_RELEASE_ROOT:
+        raise CutoverError(
+            "maintenance apply/recovery requires root from the trusted production release tree"
+        )
+    if streams is None:
+        streams = (sys.stdin, sys.stdout, sys.stderr)
+    try:
+        stdin, stdout, stderr = streams
+        private_tty = stdin.isatty() and stdout.isatty() and stderr.isatty()
+    except (AttributeError, OSError, ValueError):
+        private_tty = False
+    if not private_tty:
+        raise CutoverError(
+            "maintenance apply/recovery requires a private interactive terminal"
+        )
+    require_trusted_release_tree(REPO_DIR)
+
 
 
 @dataclass(frozen=True)
@@ -394,23 +499,18 @@ def _filesystem_identity(file_stat):
 
 
 def private_environment_identity(path, *, expected_uid, expected_gid):
-    descriptor, parent_stat = _open_stable_absolute_file(path)
+    private_env = load_module(
+        DEPLOY_DIR / "private_env.py",
+        "maintenance_private_environment_identity",
+    )
     try:
-        file_stat = os.fstat(descriptor)
-        if (
-            not stat.S_ISDIR(parent_stat.st_mode)
-            or parent_stat.st_uid != expected_uid
-            or stat.S_IMODE(parent_stat.st_mode) & 0o022
-            or not stat.S_ISREG(file_stat.st_mode)
-            or file_stat.st_nlink != 1
-            or (file_stat.st_uid, file_stat.st_gid) != (expected_uid, expected_gid)
-            or stat.S_IMODE(file_stat.st_mode) != 0o600
-            or file_stat.st_size > MAX_PRIVATE_ENV_BYTES
-        ):
-            raise CutoverError("private environment filesystem identity is unsafe")
-        return _filesystem_identity(file_stat)
-    finally:
-        os.close(descriptor)
+        return private_env.private_environment_identity(
+            path,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
+    except private_env.PrivateEnvironmentError as error:
+        raise CutoverError("private environment filesystem identity is unsafe") from error
 
 
 def stable_unit_sha256(path, *, expected_uid):
@@ -1001,15 +1101,24 @@ def nonce_compose_command(env_file, *, migration, arguments):
 
 
 def minimal_environment():
-    environment = {
+    return {
         "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
-        "LANG": os.environ.get("LANG", "C.UTF-8"),
-        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+        "HOME": "/root",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "TZ": "UTC",
+        "PYTHONNOUSERSITE": "1",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_CONFIG_COUNT": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "DOCKER_HOST": "unix:///var/run/docker.sock",
     }
-    if "TZ" in os.environ:
-        environment["TZ"] = os.environ["TZ"]
-    environment["DOCKER_HOST"] = "unix:///var/run/docker.sock"
-    return environment
+
+
+def privileged_python_command(script, *arguments):
+    return [*PYTHON_COMMAND, str(script), *(str(value) for value in arguments)]
 
 
 def probe_http(port, path, *, timeout=5):
@@ -1805,9 +1914,8 @@ class MaintenanceController:
             return system_identifier, database_oid, database_name_hex
 
         source_result = self.run(
-            [
-                "python3",
-                str(DEPLOY_DIR / "source-postgres-exec.py"),
+            privileged_python_command(
+                DEPLOY_DIR / "source-postgres-exec.py",
                 "--env-file",
                 str(self.options.env_file),
                 "--source-app-container",
@@ -1821,7 +1929,7 @@ class MaintenanceController:
                 "--source-app-state",
                 "running",
                 "identity",
-            ],
+            ),
             timeout=30,
         )
         identities = {
@@ -1869,9 +1977,8 @@ class MaintenanceController:
                 "target PostgreSQL URL is not the exact migration port binding"
             )
         target_result = self.run(
-            [
-                "python3",
-                str(helper),
+            privileged_python_command(
+                helper,
                 environment_name,
                 "psql",
                 "--no-psqlrc",
@@ -1880,7 +1987,7 @@ class MaintenanceController:
                 "ON_ERROR_STOP=1",
                 "--command",
                 POSTGRES_DATABASE_IDENTITY_SQL,
-            ],
+            ),
             timeout=15,
             private_keys=(environment_name,),
         )
@@ -2014,9 +2121,8 @@ class MaintenanceController:
         if any(not path.is_absolute() for path in retirement_paths):
             raise CutoverError("legacy retirement paths must be explicit absolute paths")
         self.run(
-            [
-                "python3",
-                str(DEPLOY_DIR / "retire-legacy-data.py"),
+            privileged_python_command(
+                DEPLOY_DIR / "retire-legacy-data.py",
                 "verify-record",
                 "--legacy-app-path",
                 str(self.options.legacy_app_path),
@@ -2032,7 +2138,7 @@ class MaintenanceController:
                 self.services.postgres.name,
                 "--legacy-redis-container",
                 self.services.redis.name,
-            ],
+            ),
             timeout=30,
         )
         for service in self.services.containers():
@@ -2092,13 +2198,12 @@ class MaintenanceController:
                 "nonce migration target must be the fixed redis://127.0.0.1:16379 endpoint"
             )
         self.run(
-            [
-                "python3",
-                str(DEPLOY_DIR / "configure-redis-migration-acl.py"),
+            privileged_python_command(
+                DEPLOY_DIR / "configure-redis-migration-acl.py",
                 "--apply",
                 "--env-file",
                 str(self.options.env_file),
-            ],
+            ),
             timeout=30,
         )
         self.nonce_target_started = True
@@ -2162,7 +2267,10 @@ class MaintenanceController:
                 (),
             ),
             (
-                ["python3", str(DEPLOY_DIR / "migrate-redis-allowlist.py"), "--apply"],
+                privileged_python_command(
+                    DEPLOY_DIR / "migrate-redis-allowlist.py",
+                    "--apply",
+                ),
                 "Redis nonce",
                 (
                     "SUB2API_DATA_ROOT",
@@ -2174,7 +2282,10 @@ class MaintenanceController:
                 ),
             ),
             (
-                ["python3", str(DEPLOY_DIR / "migrate-app-metadata.py"), "--apply"],
+                privileged_python_command(
+                    DEPLOY_DIR / "migrate-app-metadata.py",
+                    "--apply",
+                ),
                 "app metadata",
                 tuple(
                     key
@@ -2290,11 +2401,10 @@ class MaintenanceController:
             timeout=30,
         )
         self.run(
-            [
-                "python3",
-                str(DEPLOY_DIR / "configure-redis-migration-acl.py"),
+            privileged_python_command(
+                DEPLOY_DIR / "configure-redis-migration-acl.py",
                 "--remove",
-            ],
+            ),
             timeout=15,
         )
         self.run(
@@ -2331,9 +2441,8 @@ class MaintenanceController:
         )
         self.wait_target_healthy(TARGET_APP)
         self.require_all_targets(healthy=True)
-        command = [
-            "python3",
-            str(DEPLOY_DIR / "traffic-canary.py"),
+        command = privileged_python_command(
+            DEPLOY_DIR / "traffic-canary.py",
             "verify-stopped",
             "--legacy-sub2api-container",
             self.services.app.name,
@@ -2347,7 +2456,7 @@ class MaintenanceController:
             self.services.postgres.identity,
             "--legacy-redis-id",
             self.services.redis.identity,
-        ]
+        )
         self.run(command, timeout=45)
         self.probe_health(8081, "/health")
         self.log("checkpoint: sanitized traffic target and stopped-legacy identities verified")
@@ -2372,9 +2481,8 @@ class MaintenanceController:
         self.require_all_targets(healthy=True)
         self.probe_health(8081, "/health")
         self.writer_stop_remaining()
-        command = [
-            "python3",
-            str(DEPLOY_DIR / "run-v1-responses-canary.py"),
+        command = privileged_python_command(
+            DEPLOY_DIR / "run-v1-responses-canary.py",
             "--apply",
             "--url",
             self.options.verify_url,
@@ -2382,7 +2490,7 @@ class MaintenanceController:
             self.options.model,
             "--approved-hostname",
             self.options.approved_hostname,
-        ]
+        )
         self.run(command, interactive=True)
         self.require_all_targets(healthy=True)
         self.writer_stop_remaining()
@@ -2570,11 +2678,10 @@ class MaintenanceController:
                 if self.target_exists(TARGET_NONCE_REDIS):
                     raise CutoverError("nonce Redis target still exists after rollback")
                 self.runner(
-                    [
-                        "python3",
-                        str(DEPLOY_DIR / "configure-redis-migration-acl.py"),
+                    privileged_python_command(
+                        DEPLOY_DIR / "configure-redis-migration-acl.py",
                         "--remove",
-                    ],
+                    ),
                     timeout=15,
                     environment=self.environment,
                 )
@@ -2735,7 +2842,7 @@ def parse_arguments(argv):
 
 def authenticate_private_operator():
     result = subprocess.run(
-        [sys.executable, str(DEPLOY_DIR / "verify-migration-totp.py")],
+        privileged_python_command(DEPLOY_DIR / "verify-migration-totp.py"),
         env=minimal_environment(),
         check=False,
     )
@@ -2785,6 +2892,11 @@ def main(
     stdout = sys.stdout if stdout is None else stdout
     runner = CommandRunner() if runner is None else runner
     try:
+        requested_mode = (
+            argv[0] if argv and argv[0] in {"--apply", "--recover"} else "check"
+        )
+        if requested_mode != "check":
+            require_production_apply_context(streams=(stdin, stdout, stderr))
         mode, options, services = parse_arguments(argv)
         validate_contract()
         if mode == "check":
@@ -2794,11 +2906,6 @@ def main(
                 file=stdout,
             )
             return 0
-        if os.geteuid() != 0:
-            raise CutoverError("maintenance apply/recovery must run as root")
-        if not stdin.isatty() or not stderr.isatty():
-            raise CutoverError("maintenance apply/recovery requires a private interactive terminal")
-
         runner(
             [str(DEPLOY_DIR / "require-clean-worktree.sh"), "check"],
             timeout=15,
@@ -2806,24 +2913,13 @@ def main(
         )
         authenticate()
         private_env = load_module(DEPLOY_DIR / "private_env.py", "maintenance_private_env")
-        expected_uid = os.geteuid()
-        expected_gid = 0 if expected_uid == 0 else os.getegid()
         private_values = {}
         env_file_identity = None
         private_environment_unavailable = False
         try:
-            env_file_identity = private_environment_identity(
-                options.env_file,
-                expected_uid=expected_uid,
-                expected_gid=expected_gid,
+            private_values, env_file_identity = (
+                private_env.read_private_environment_with_identity(options.env_file)
             )
-            private_values = private_env.read_private_environment(options.env_file)
-            if private_environment_identity(
-                options.env_file,
-                expected_uid=expected_uid,
-                expected_gid=expected_gid,
-            ) != env_file_identity:
-                raise CutoverError("private environment changed while being loaded")
             validate_private_migration_values(private_values)
         except (CutoverError, private_env.PrivateEnvironmentError) as error:
             if mode == "--apply":

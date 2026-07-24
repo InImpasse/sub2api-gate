@@ -6,6 +6,11 @@ case "$test_mode" in
   0|1) ;;
   *) echo "SUB2API_AOP_TEST_MODE must be 0 or 1" >&2; exit 1 ;;
 esac
+if [ "$test_mode" = "1" ] && [ "$EUID" -eq 0 ]; then
+  echo "test mode may not run as root" >&2
+  exit 1
+fi
+
 if [ "$test_mode" = "0" ]; then
   PATH="/usr/sbin:/usr/bin:/sbin:/bin"
   export PATH
@@ -72,9 +77,19 @@ if [ "$stage" != "probe" ]; then
 fi
 
 nginx_root="${SUB2API_NGINX_ROOT:-/etc/nginx}"
-if [ "$test_mode" = "1" ] && [ "$nginx_root" = "/etc/nginx" ]; then
-  echo "test mode may not target the production Nginx root" >&2
-  exit 1
+if [ "$test_mode" = "1" ]; then
+  canonical_nginx_root="$(/usr/bin/realpath -m -- "$nginx_root")" || {
+    echo "could not resolve the Nginx root" >&2
+    exit 1
+  }
+  production_nginx_root="$(/usr/bin/realpath -m -- /etc/nginx)" || {
+    echo "could not resolve the production Nginx root" >&2
+    exit 1
+  }
+  if [ "$canonical_nginx_root" = "$production_nginx_root" ]; then
+    echo "test mode may not target the production Nginx root" >&2
+    exit 1
+  fi
 fi
 if [ "$nginx_root" != "/etc/nginx" ] && [ "$test_mode" != "1" ]; then
   echo "SUB2API_NGINX_ROOT override is allowed only in explicit test mode" >&2

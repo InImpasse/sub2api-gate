@@ -6,10 +6,12 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 CUTOVER = ROOT / "deploy" / "install-nginx-direct-v1.py"
+PREFLIGHT = ROOT / "deploy" / "security-preflight.sh"
 
 
 def load_cutover():
@@ -81,6 +83,9 @@ class NginxDirectCutoverTests(unittest.TestCase):
             root / "sites-enabled",
         ):
             managed_directory.chmod(0o755)
+        cloudflare_only = root / "snippets" / "cloudflare-only.conf"
+        cloudflare_only.write_text("allow all;\n", encoding="utf-8")
+        cloudflare_only.chmod(0o640)
         site_target = root / "sites-available" / "gateway.conf"
         site_target.write_text(OLD_CONFIG, encoding="utf-8")
         site_target.chmod(0o640)
@@ -153,6 +158,13 @@ class NginxDirectCutoverTests(unittest.TestCase):
         self.assertEqual(target.count("location ^~ /v1/"), 1)
         self.assertIn("proxy_pass http://sub2api_backend;", target)
         self.assertIn("proxy_set_header Connection $connection_upgrade;", target)
+        self.assertIn("proxy_intercept_errors off;", target)
+        self.assertEqual(
+            target.count(
+                "include /etc/nginx/snippets/cloudflare-only.conf;"
+            ),
+            2,
+        )
         self.assertIn("server_name other.example.test;", rewritten)
         self.assertIn("127.0.0.1:9090", rewritten)
         self.assertIn("listen 80;", rewritten)
@@ -167,6 +179,20 @@ class NginxDirectCutoverTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(self.module.CutoverError, "regex locations"):
             self.module.rewrite_direct_v1(regex, "gateway.example.test")
+
+        lua_block = OLD_CONFIG.replace(
+            "    location = /v1/responses {",
+            "    log_by_lua_block { }\n    location = /v1/responses {",
+        )
+        with self.assertRaisesRegex(self.module.CutoverError, "server-wide request capture"):
+            self.module.rewrite_direct_v1(lua_block, "gateway.example.test")
+
+        lua_file = OLD_CONFIG.replace(
+            "    location = /v1/responses {",
+            "    access_by_lua_file /etc/nginx/request-hook.lua;\n    location = /v1/responses {",
+        )
+        with self.assertRaisesRegex(self.module.CutoverError, "server-wide request capture"):
+            self.module.rewrite_direct_v1(lua_file, "gateway.example.test")
 
     def test_rewrite_creates_or_validates_the_switchable_named_upstream(self):
         missing = OLD_CONFIG.replace(
@@ -190,6 +216,48 @@ class NginxDirectCutoverTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(self.module.CutoverError, "reviewed active include"):
             self.module.rewrite_direct_v1(unmanaged, "gateway.example.test")
+
+    def test_rewrite_repairs_and_verifier_requires_location_level_cloudflare_gate(self):
+        rewritten = self.module.rewrite_direct_v1(
+            OLD_CONFIG,
+            "gateway.example.test",
+        )
+        target = rewritten.split("server_name gateway.example.test;", 1)[1]
+        self.assertEqual(
+            target.count(
+                "include /etc/nginx/snippets/cloudflare-only.conf;"
+            ),
+            2,
+        )
+
+        tampered = rewritten.replace(
+            "    location ^~ /v1/ {\n"
+            "        include /etc/nginx/snippets/cloudflare-only.conf;\n",
+            "    location ^~ /v1/ {\n",
+            1,
+        )
+        with self.assertRaisesRegex(
+            self.module.CutoverError,
+            "every proxy location must explicitly include",
+        ):
+            self.module.verify_rewritten_config(
+                tampered,
+                "gateway.example.test",
+            )
+
+    def test_sync_location_requires_its_own_cloudflare_gate(self):
+        sync = (ROOT / "nginx/sub2api-sync-location.conf").read_text()
+        self.module.verify_sync_location_config(sync)
+        inherited_only = sync.replace(
+            "        include /etc/nginx/snippets/cloudflare-only.conf;\n",
+            "",
+            1,
+        )
+        with self.assertRaisesRegex(
+            self.module.CutoverError,
+            "sync proxy location must explicitly include",
+        ):
+            self.module.verify_sync_location_config(inherited_only)
 
     def test_check_mode_is_offline_and_needs_no_live_config(self):
         result = subprocess.run(
@@ -216,6 +284,258 @@ class NginxDirectCutoverTests(unittest.TestCase):
         self.assertNotIn(sentinel, result.stderr)
         self.assertIn("command validation failed", result.stderr)
 
+    def test_test_mode_rejects_root_before_running_environment_selected_executables(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env, site, _, nginx_calls, reload_calls, canary_calls = self.fixture(directory)
+            arguments = self.module.parse_arguments(self.apply_args(site))
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+                self.module.os, "geteuid", return_value=0
+            ):
+                with self.assertRaisesRegex(
+                    self.module.CutoverError, "test mode may not run as root"
+                ):
+                    self.module.install_cutover(arguments)
+
+            self.assertFalse((pathlib.Path(directory) / "nginx/sub2api-gate").exists())
+            for calls in (nginx_calls, reload_calls, canary_calls):
+                self.assertFalse(calls.exists())
+
+    def test_test_mode_rejects_a_canonical_alias_of_the_production_nginx_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            production_root = root / "production-nginx"
+            production_root.mkdir()
+            alias = root / "nginx-alias"
+            alias.symlink_to(production_root, target_is_directory=True)
+            env = {
+                "SUB2API_NGINX_CUTOVER_TEST_MODE": "1",
+                "SUB2API_NGINX_ROOT": str(alias),
+            }
+
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+                self.module, "DEFAULT_NGINX_ROOT", production_root
+            ), mock.patch.object(self.module.os, "geteuid", return_value=1000):
+                with self.assertRaisesRegex(
+                    self.module.CutoverError,
+                    "test mode may not target the production Nginx root",
+                ):
+                    self.module.install_cutover(self.module.argparse.Namespace())
+
+    def test_production_apply_rejects_an_untrusted_controller_before_nginx_access(self):
+        class PrivateTty:
+            @staticmethod
+            def isatty():
+                return True
+
+        arguments = self.module.parse_arguments(
+            self.apply_args(pathlib.Path("/etc/nginx/conf.d/sub2api.conf"))
+        )
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.module.os, "geteuid", return_value=0
+        ), mock.patch.object(self.module.sys, "stdin", PrivateTty()), mock.patch.object(
+            self.module.sys, "stdout", PrivateTty()
+        ), mock.patch.object(self.module.sys, "stderr", PrivateTty()), mock.patch.object(
+            self.module,
+            "validate_managed_directory",
+            side_effect=AssertionError("Nginx validation ran before the release gate"),
+        ) as nginx_directory, mock.patch.object(
+            self.module,
+            "ensure_managed_directory",
+            side_effect=AssertionError("Nginx state creation ran before the release gate"),
+        ) as nginx_state, mock.patch.object(
+            self.module,
+            "command_ok",
+            side_effect=AssertionError("a child command ran before the release gate"),
+        ) as command:
+            with self.assertRaisesRegex(
+                self.module.CutoverError,
+                "trusted production release tree",
+            ):
+                self.module.install_cutover(arguments)
+
+        nginx_directory.assert_not_called()
+        nginx_state.assert_not_called()
+        command.assert_not_called()
+
+    def test_trusted_release_gate_checks_controller_and_transitive_sources(self):
+        trusted_root = ROOT
+        controller = trusted_root / self.module.CUTOVER_SOURCE_RELATIVE_PATH
+        with mock.patch.object(self.module, "_require_trusted_release_path") as path_gate:
+            self.module.require_trusted_release_tree(
+                repo_dir=trusted_root,
+                source_path=controller,
+                trusted_root=trusted_root,
+                expected_uid=os.geteuid(),
+            )
+
+        expected_entries = (
+            (pathlib.Path("/"), True, False),
+            (trusted_root.parent, True, False),
+            (trusted_root, True, False),
+            *(
+                (trusted_root / relative_path, True, False)
+                for relative_path in self.module.TRUSTED_RELEASE_DIRECTORIES
+            ),
+            *(
+                (trusted_root / relative_path, False, expects_executable)
+                for relative_path, expects_executable in self.module.TRUSTED_RELEASE_FILES
+            ),
+        )
+        self.assertEqual(
+            path_gate.call_args_list,
+            [
+                mock.call(
+                    path,
+                    expects_directory=expects_directory,
+                    expects_executable=expects_executable,
+                    expected_uid=os.geteuid(),
+                )
+                for path, expects_directory, expects_executable in expected_entries
+            ],
+        )
+
+        with self.assertRaisesRegex(self.module.CutoverError, "controller is outside"):
+            self.module.require_trusted_release_tree(
+                repo_dir=trusted_root,
+                source_path=trusted_root / self.module.CANARY_RUNNER_RELATIVE_PATH,
+                trusted_root=trusted_root,
+                expected_uid=os.geteuid(),
+            )
+
+
+    def test_live_gate_rejects_inline_http_mirror_without_capture_marker(self):
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "nginx"
+            conf_dir = root / "conf.d"
+            conf_dir.mkdir(parents=True)
+            root.chmod(0o755)
+            conf_dir.chmod(0o755)
+            root.joinpath("nginx.conf").write_text(
+                "events {}\n"
+                "http {\n"
+                "    include /etc/nginx/conf.d/*.conf;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            root.joinpath("nginx.conf").chmod(0o644)
+            # Nginx permits multiple directives on one line. The mirror target
+            # deliberately avoids capture-related text, so only parser-level
+            # directive inspection can identify this request-body mirror.
+            conf_dir.joinpath("00-inline-policy.conf").write_text(
+                "map $host $ignored { default 0; } mirror /_sink;\n",
+                encoding="utf-8",
+            )
+            conf_dir.joinpath("00-inline-policy.conf").chmod(0o644)
+
+            with self.assertRaisesRegex(self.module.CutoverError, "mirror or capture"):
+                self.module.verify_no_capture_config(root)
+
+    def test_live_gate_rejects_a_writable_included_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "nginx"
+            conf_dir = root / "conf.d"
+            conf_dir.mkdir(parents=True)
+            root.chmod(0o755)
+            conf_dir.chmod(0o755)
+            root.joinpath("nginx.conf").write_text(
+                "events {}\n"
+                "http {\n"
+                "    include /etc/nginx/conf.d/*.conf;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            root.joinpath("nginx.conf").chmod(0o644)
+            included = conf_dir / "10-site.conf"
+            included.write_text("server { listen 8080; }\n", encoding="utf-8")
+            included.chmod(0o664)
+
+            with self.assertRaisesRegex(self.module.CutoverError, "unsafe permissions"):
+                self.module.verify_no_capture_config(root)
+
+    def test_production_child_commands_use_a_minimal_environment(self):
+        completed = subprocess.CompletedProcess([], 0)
+        with mock.patch.object(
+            self.module.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            self.assertTrue(self.module.command_ok(["/usr/bin/true"], production=True))
+
+        self.assertEqual(
+            run.call_args.kwargs["env"],
+            self.module.PRODUCTION_COMMAND_ENV,
+        )
+        self.assertNotIn("PYTHONPATH", run.call_args.kwargs["env"])
+        self.assertNotIn("HTTP_PROXY", run.call_args.kwargs["env"])
+
+    def test_security_preflight_resets_path_before_running_repo_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            malicious_bin = root / "bin"
+            malicious_bin.mkdir()
+            invoked = root / "malicious-dirname-ran"
+            fake_dirname = malicious_bin / "dirname"
+            fake_dirname.write_text(
+                "#!/bin/sh\n"
+                f": > {invoked}\n"
+                "exit 99\n",
+                encoding="ascii",
+            )
+            fake_dirname.chmod(0o755)
+            result = subprocess.run(
+                ["/bin/bash", PREFLIGHT, "--invalid-option"],
+                cwd=ROOT,
+                env={"PATH": str(malicious_bin)},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("usage:", result.stderr)
+            self.assertFalse(invoked.exists())
+
+    def test_security_preflight_isolates_python_from_caller_module_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            module_dir = root / "modules"
+            module_dir.mkdir()
+            invoked = root / "malicious-python-module-ran"
+            module_dir.joinpath("argparse.py").write_text(
+                "from pathlib import Path\n"
+                f"Path({str(invoked)!r}).touch()\n"
+                "raise RuntimeError('unexpected module import')\n",
+                encoding="ascii",
+            )
+            private_env = root / "private.env"
+            private_env.write_text("VALUE=literal\n", encoding="ascii")
+            private_env.chmod(0o600)
+            private_config = root / "wrangler.private.jsonc"
+            private_config.write_text("{}\n", encoding="ascii")
+            private_config.chmod(0o600)
+
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(module_dir)
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    PREFLIGHT,
+                    "--env-file",
+                    private_env,
+                    "--wrangler-config",
+                    private_config,
+                ],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(invoked.exists())
+
     def test_live_gate_scans_active_config_without_a_conf_suffix(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory) / "nginx"
@@ -231,6 +551,9 @@ class NginxDirectCutoverTests(unittest.TestCase):
             active_upstream = snippets / "sub2api-upstream-active.conf"
             active_upstream.write_text("server 127.0.0.1:8080;\n", encoding="utf-8")
             active_upstream.chmod(0o640)
+            cloudflare_only = snippets / "cloudflare-only.conf"
+            cloudflare_only.write_text("allow all;\n", encoding="utf-8")
+            cloudflare_only.chmod(0o640)
             site = sites / "gateway"
             site.write_text(
                 self.module.rewrite_direct_v1(OLD_CONFIG, "gateway.example.test")
@@ -283,6 +606,12 @@ class NginxDirectCutoverTests(unittest.TestCase):
             self.assertNotIn("mirror", rendered)
             self.assertNotIn("3021/capture", rendered)
             self.assertIn("proxy_pass http://sub2api_backend;", rendered)
+            self.assertEqual(
+                rendered.split("server_name gateway.example.test;", 1)[1].count(
+                    "include /etc/nginx/snippets/cloudflare-only.conf;"
+                ),
+                2,
+            )
             self.assertTrue((pathlib.Path(directory) / "nginx/conf.d/00-connection-upgrade-map.conf").is_file())
             self.assertEqual(
                 (pathlib.Path(directory) / "nginx/snippets/sub2api-upstream-active.conf").read_text(),

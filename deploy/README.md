@@ -216,8 +216,10 @@ before normal traffic is declared stable.
 
 Review Worker credential generation with
 `python3 deploy/generate-worker-secrets.py check`, then run
-`python3 deploy/generate-worker-secrets.py --apply` in a private terminal as the
-same deployment operator that owns the Wrangler authentication.
+`python3 deploy/generate-worker-secrets.py --apply` only as root from the root-owned
+`/opt/sub2api-gate-release` release tree in a private terminal. Its child commands
+use a fixed minimal environment and fixed private Wrangler config; do not set a
+config override or supply a Cloudflare token through the shell environment.
 The tool lists remote Secret names, initializes only missing managed values in
 one bulk stdin request, and verifies names afterward. Before uploading a new
 `INVITE_ACCESS_HMAC_KEY`, it atomically creates the ignored
@@ -258,15 +260,19 @@ both temporary Secret names after canonical promotion has been proven. Never put
 either seed, a code, password, Cookie, request body, or a secret-list response
 in a repository, shell history, environment file, terminal transcript, or audit record.
 
-Run every secret operation only from a private interactive terminal as the
-deployment operator that owns the locked Wrangler authentication. Define local
+Run every secret operation only as root from the root-owned
+`/opt/sub2api-gate-release` worktree in a private interactive terminal. The
+deployment environment is deliberately sanitized, so Wrangler authentication
+must be available under root's protected home directory; do not supply an API
+token, config override, or secret through the shell environment. Define local
 paths without placing secret values in variables:
 
 ```bash
 cd /opt/sub2api-gate-release
 worker_dir="$PWD/worker-allow-ip"
 wrangler_config="$worker_dir/wrangler.private.jsonc"
-wrangler_bin="$worker_dir/node_modules/.bin/wrangler"
+node_bin=/usr/bin/node
+wrangler_cmd=("$node_bin" "$worker_dir/node_modules/wrangler/bin/wrangler.js")
 ```
 
 1. Establish the baseline Worker Secret set before the compatibility deployment.
@@ -275,10 +281,9 @@ wrangler_bin="$worker_dir/node_modules/.bin/wrangler"
    inspect or publish the Worker:
 
    ```bash
-   SUB2API_WRANGLER_CONFIG="$wrangler_config" \
-     python3 deploy/generate-worker-secrets.py --apply
-   "$wrangler_bin" secret list --format json --config "$wrangler_config" \
-     | node deploy/verify-worker-secret-list.mjs \
+   /usr/bin/python3 -I deploy/generate-worker-secrets.py --apply
+   "${wrangler_cmd[@]}" secret list --format json --config "$wrangler_config" \
+     | "$node_bin" deploy/verify-worker-secret-list.mjs \
        "$worker_dir/required-secrets.json" --forbid-totp-rotation-staging
    ```
 
@@ -292,7 +297,7 @@ wrangler_bin="$worker_dir/node_modules/.bin/wrangler"
    release and security gates pass:
 
    ```bash
-   SUB2API_WRANGLER_CONFIG="$wrangler_config" bash deploy/deploy-worker.sh --apply --totp-rotation-stage compatibility
+   /bin/bash deploy/deploy-worker.sh --apply --totp-rotation-stage compatibility
    ```
 
    In a private browser, confirm any existing administrator cookie is sent back
@@ -304,10 +309,10 @@ wrangler_bin="$worker_dir/node_modules/.bin/wrangler"
    prompts. Never redirect the input or supply a value on the command line:
 
    ```bash
-   "$wrangler_bin" secret put ADMIN_TOTP_SECRET_NEXT --config "$wrangler_config"
-   "$wrangler_bin" secret put ADMIN_TOTP_ROTATION_PHASE --config "$wrangler_config"
-   "$wrangler_bin" secret list --format json --config "$wrangler_config" \
-     | node deploy/verify-worker-secret-list.mjs \
+   "${wrangler_cmd[@]}" secret put ADMIN_TOTP_SECRET_NEXT --config "$wrangler_config"
+   "${wrangler_cmd[@]}" secret put ADMIN_TOTP_ROTATION_PHASE --config "$wrangler_config"
+   "${wrangler_cmd[@]}" secret list --format json --config "$wrangler_config" \
+     | "$node_bin" deploy/verify-worker-secret-list.mjs \
        "$worker_dir/required-secrets.json" --require-totp-rotation-staging
    ```
 
@@ -325,10 +330,10 @@ wrangler_bin="$worker_dir/node_modules/.bin/wrangler"
    setting the canonical Secret through the same private prompts:
 
    ```bash
-   "$wrangler_bin" secret put ADMIN_TOTP_ROTATION_PHASE --config "$wrangler_config"
-   "$wrangler_bin" secret put ADMIN_TOTP_SECRET --config "$wrangler_config"
-   "$wrangler_bin" secret list --format json --config "$wrangler_config" \
-     | node deploy/verify-worker-secret-list.mjs \
+   "${wrangler_cmd[@]}" secret put ADMIN_TOTP_ROTATION_PHASE --config "$wrangler_config"
+   "${wrangler_cmd[@]}" secret put ADMIN_TOTP_SECRET --config "$wrangler_config"
+   "${wrangler_cmd[@]}" secret list --format json --config "$wrangler_config" \
+     | "$node_bin" deploy/verify-worker-secret-list.mjs \
        "$worker_dir/required-secrets.json" --require-totp-rotation-staging
    ```
 
@@ -344,7 +349,7 @@ wrangler_bin="$worker_dir/node_modules/.bin/wrangler"
    session-binding inputs. Run the full Worker tests, then publish it with:
 
    ```bash
-   SUB2API_WRANGLER_CONFIG="$wrangler_config" bash deploy/deploy-worker.sh --apply --totp-rotation-stage final-source
+   /bin/bash deploy/deploy-worker.sh --apply --totp-rotation-stage final-source
    ```
 
    The final-source gate requires both temporary names still exist, scans all
@@ -356,10 +361,10 @@ wrangler_bin="$worker_dir/node_modules/.bin/wrangler"
    the returned list. The final Worker must still accept the new seed:
 
    ```bash
-   "$wrangler_bin" secret delete ADMIN_TOTP_SECRET_NEXT --config "$wrangler_config"
-   "$wrangler_bin" secret delete ADMIN_TOTP_ROTATION_PHASE --config "$wrangler_config"
-   "$wrangler_bin" secret list --format json --config "$wrangler_config" \
-     | node deploy/verify-worker-secret-list.mjs \
+   "${wrangler_cmd[@]}" secret delete ADMIN_TOTP_SECRET_NEXT --config "$wrangler_config"
+   "${wrangler_cmd[@]}" secret delete ADMIN_TOTP_ROTATION_PHASE --config "$wrangler_config"
+   "${wrangler_cmd[@]}" secret list --format json --config "$wrangler_config" \
+     | "$node_bin" deploy/verify-worker-secret-list.mjs \
        "$worker_dir/required-secrets.json" --forbid-totp-rotation-staging
    ```
 
@@ -375,8 +380,8 @@ wrangler_bin="$worker_dir/node_modules/.bin/wrangler"
    proof; it is not a substitute for it:
 
    ```bash
-   sudo python3 deploy/verify-migration-totp.py rotate check
-   sudo python3 deploy/verify-migration-totp.py rotate --apply --worker-totp-verified
+   /usr/bin/python3 -I deploy/verify-migration-totp.py rotate check
+   /usr/bin/python3 -I deploy/verify-migration-totp.py rotate --apply --worker-totp-verified
    ```
 
    The rotation consumes its supplied current code. Wait for a strictly newer
@@ -507,6 +512,63 @@ force after the visitor address is restored. The restored `$remote_addr` is the
 key for sync rate limiting and the only client address forwarded upstream.
 Access and error logs are disabled for the complete API vhost, not only
 `/v1/*`.
+
+## Legacy Redis hardening
+
+Before the privacy migration, the live legacy Redis cache can be hardened in
+place without migrating its old `redis_data` contents. This is a separate,
+source-only operation: it rotates the legacy Redis password, replaces the
+password-bearing shell command with a SHA-256 ACL verifier, disables RDB/AOF,
+uses a tmpfs `/data`, removes container logs, and adds a read-only root
+filesystem, dropped capabilities, and `no-new-privileges`.
+
+The controller is intentionally fixed to the current source project
+`/home/ubuntu/sub2api-deploy` and the `sub2api`/`sub2api-redis` containers. It
+accepts only their full, freshly collected IDs, pins Docker to the local Unix
+socket, and creates root-only recovery files before modifying the legacy
+Compose file or environment. It never imports, copies, or deletes the old
+`redis_data` directory; that directory is retained as root-only residue for
+the later, separately approved retirement stage.
+
+Check the controller offline first. The check reads no private file or Docker
+metadata:
+
+```bash
+sudo python3 deploy/harden-legacy-redis.py check
+```
+
+Run the apply operation only from a private root TTY in the trusted
+`/opt/sub2api-gate-release` tree, after collecting the current full IDs from
+the local Docker daemon. All three standard streams must be TTYs, so do not
+redirect output or run it through a pipe. `--apply` rejects any other source
+path; `/opt`, the release root, `deploy/`, the controller, and the exact
+`deploy/require-clean-worktree.sh` guard must be root-owned and not
+group/world-writable, and the guard must be executable. The source directory,
+its Compose file, and `.env` must already be root-owned; the Compose file and
+`.env` must use mode `0600`. Every directory from `/` through the pinned legacy
+source path must be root-owned, non-symlinked, and not group/world-writable.
+This deliberately blocks the current `/home/ubuntu/sub2api-deploy` layout
+until a separately approved relocation or parent-directory hardening is
+complete; this controller never changes `/home/ubuntu` ownership or relocates
+the source tree. The clean-worktree guard must pass, and `/usr/bin/docker` must
+be a root-owned non-group/world-writable regular executable. Docker is forced
+to the local Unix socket and an empty root-only config. It prompts for the old
+and new Redis passwords without placing either in command arguments or the
+environment:
+
+```bash
+sudo python3 deploy/harden-legacy-redis.py --apply \
+  --source-app-container sub2api \
+  --source-app-id <fresh-64-hex-app-id> \
+  --source-redis-container sub2api-redis \
+  --source-redis-id <fresh-64-hex-redis-id>
+```
+
+Do not run it concurrently with Worker publication, sync canary, traffic
+canary, or `maintenance-cutover.py`. A failed apply restores the original
+Compose and environment, starts the legacy services again, verifies health,
+removes the generated ACL, and preserves root-only recovery state only if a
+rollback itself cannot be proven complete.
 
 ## Migrated-target traffic canary
 

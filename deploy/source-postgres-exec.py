@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """Execute reviewed PostgreSQL clients against the exact legacy container."""
 
 from __future__ import annotations
@@ -18,9 +18,15 @@ from typing import NamedTuple
 
 
 REPO_DIR = pathlib.Path(__file__).resolve().parents[1]
+TRUSTED_FILESYSTEM_ROOT = pathlib.Path("/")
+TRUSTED_RELEASE_PARENT = pathlib.Path("/opt")
+TRUSTED_RELEASE_ROOT = TRUSTED_RELEASE_PARENT / "sub2api-gate-release"
+TRUSTED_CONTROLLER = TRUSTED_RELEASE_ROOT / "deploy" / "source-postgres-exec.py"
 PRIVATE_ENV_TOOL = REPO_DIR / "deploy" / "private_env.py"
 PG_ENV_TOOL = REPO_DIR / "deploy" / "pg-env-exec.py"
+DOCKER_BINARY = pathlib.Path("/usr/bin/docker")
 DOCKER_SOCKET = pathlib.Path("/var/run/docker.sock")
+SAFE_COMMAND_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 CONTAINER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}\Z")
 PG_SYSTEM_ID_RE = re.compile(
@@ -85,6 +91,44 @@ PG_DUMP_FIXED_OPTIONS = frozenset({"--encoding=UTF8", "--format=plain"})
 class SourcePostgresError(RuntimeError):
     pass
 
+def require_trusted_release_path(path, *, expects_directory):
+    target = pathlib.Path(path)
+    try:
+        metadata = target.lstat()
+    except OSError as error:
+        raise SourcePostgresError('trusted PostgreSQL release path is unavailable') from error
+    if (
+        not target.is_absolute()
+        or stat.S_ISLNK(metadata.st_mode)
+        or (expects_directory and not stat.S_ISDIR(metadata.st_mode))
+        or (not expects_directory and not stat.S_ISREG(metadata.st_mode))
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise SourcePostgresError('trusted PostgreSQL release path is unsafe')
+
+
+def require_production_context():
+    if os.geteuid() != 0:
+        return
+    try:
+        source_path = pathlib.Path(__file__).resolve(strict=True)
+    except OSError as error:
+        raise SourcePostgresError('trusted PostgreSQL controller source is unavailable') from error
+    if REPO_DIR != TRUSTED_RELEASE_ROOT or source_path != TRUSTED_CONTROLLER:
+        raise SourcePostgresError('PostgreSQL helper must run from the trusted production release tree')
+    for path, expects_directory in (
+        (TRUSTED_FILESYSTEM_ROOT, True),
+        (TRUSTED_RELEASE_PARENT, True),
+        (TRUSTED_RELEASE_ROOT, True),
+        (TRUSTED_RELEASE_ROOT / 'deploy', True),
+        (TRUSTED_RELEASE_ROOT / "deploy" / "private_env.py", False),
+        (TRUSTED_RELEASE_ROOT / "deploy" / "pg-env-exec.py", False),
+        (TRUSTED_CONTROLLER, False),
+    ):
+        require_trusted_release_path(path, expects_directory=expects_directory)
+
 
 class RedactedArgumentParser(argparse.ArgumentParser):
     def error(self, _message):
@@ -124,16 +168,14 @@ def load_pg_env_tool():
     return load_module(PG_ENV_TOOL, "source_postgres_target_env")
 
 
-def docker_environment(environment=None):
-    source = os.environ if environment is None else environment
-    result = {
-        name: source[name]
-        for name in ("PATH", "LANG", "LC_ALL", "TZ")
-        if source.get(name)
+def docker_environment(_environment=None):
+    return {
+        "PATH": SAFE_COMMAND_PATH,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+        "DOCKER_HOST": "unix:///var/run/docker.sock",
     }
-    result.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-    result["DOCKER_HOST"] = "unix:///var/run/docker.sock"
-    return result
 
 
 def run_command(argv, *, timeout=10, environment=None):
@@ -249,7 +291,7 @@ def parse_filtered_environment(raw, required, optional=()):
 def inspect_container(name, expected_id, expected_running, *, runner):
     raw = decoded_stdout(
         runner(
-            ["docker", "inspect", "--format", NETWORK_INSPECT_TEMPLATE, name],
+            [str(DOCKER_BINARY), "inspect", "--format", NETWORK_INSPECT_TEMPLATE, name],
             timeout=10,
             environment=docker_environment(),
         )
@@ -271,7 +313,7 @@ def inspect_container(name, expected_id, expected_running, *, runner):
 
 def inspect_environment(name, template, required, optional, *, runner):
     result = runner(
-        ["docker", "inspect", "--format", template, name],
+        [str(DOCKER_BINARY), "inspect", "--format", template, name],
         timeout=10,
         environment=docker_environment(),
     )
@@ -298,7 +340,7 @@ def network_addresses(networks):
 def read_pg_control_identifier(postgres_id, *, runner):
     result = runner(
         [
-            "docker",
+            str(DOCKER_BINARY),
             "exec",
             "--user",
             "postgres",
@@ -385,7 +427,7 @@ def docker_client_command(binding, client, arguments, pgoptions):
         character in pgoptions for character in ("\x00", "\r", "\n")
     ):
         raise SourcePostgresError("source PostgreSQL options are invalid")
-    command = ["docker", "exec", "--interactive", "--user", "postgres"]
+    command = [str(DOCKER_BINARY), "exec", "--interactive", "--user", "postgres"]
     if pgoptions:
         command.extend(("--env", f"PGOPTIONS={pgoptions}"))
     command.extend(
@@ -557,6 +599,7 @@ def sanitized_exec_environment():
 def main(argv=None):
     options = parse_arguments(sys.argv[1:] if argv is None else argv)
     try:
+        require_production_context()
         pin_docker_socket()
         binding = verify_source_binding(options)
         client = options.command[0]
@@ -577,7 +620,7 @@ def main(argv=None):
             tuple(options.command[1:]),
             os.environ.get("SUB2API_PGOPTIONS", ""),
         )
-        os.execvpe(command[0], command, sanitized_exec_environment())
+        os.execve(str(DOCKER_BINARY), command, sanitized_exec_environment())
     except (OSError, SourcePostgresError, subprocess.SubprocessError):
         print("source PostgreSQL binding verification failed", file=sys.stderr)
         return 1

@@ -72,7 +72,7 @@ class SourcePostgresExecTests(unittest.TestCase):
 
         def runner(argv, **_kwargs):
             calls.append(list(argv))
-            if argv[:3] == ["docker", "inspect", "--format"]:
+            if argv[:3] == [str(tool.DOCKER_BINARY), "inspect", "--format"]:
                 template = argv[3]
                 container = argv[4]
                 if "NetworkSettings.Networks" in template:
@@ -99,7 +99,7 @@ class SourcePostgresExecTests(unittest.TestCase):
                         else values["app_environment"]
                     ),
                 )
-            if argv[:2] == ["docker", "exec"] and "pg_controldata" in argv[-1]:
+            if argv[:2] == [str(tool.DOCKER_BINARY), "exec"] and "pg_controldata" in argv[-1]:
                 return types.SimpleNamespace(
                     returncode=0,
                     stdout=(
@@ -108,7 +108,7 @@ class SourcePostgresExecTests(unittest.TestCase):
                         + "\n"
                     ),
                 )
-            if argv[:2] == ["docker", "exec"]:
+            if argv[:2] == [str(tool.DOCKER_BINARY), "exec"]:
                 return types.SimpleNamespace(
                     returncode=0, stdout=values["database_identity"] + "\n"
                 )
@@ -165,7 +165,7 @@ class SourcePostgresExecTests(unittest.TestCase):
 
         def runner(argv, **_kwargs):
             calls.append(list(argv))
-            if argv[:3] == ["docker", "inspect", "--format"]:
+            if argv[:3] == [str(tool.DOCKER_BINARY), "inspect", "--format"]:
                 template = argv[3]
                 container = argv[4]
                 if "NetworkSettings.Networks" in template:
@@ -215,12 +215,12 @@ class SourcePostgresExecTests(unittest.TestCase):
                         "DATABASE_DBNAME=sub2api\n"
                     ),
                 )
-            if argv[:2] == ["docker", "exec"] and "pg_controldata" in argv[-1]:
+            if argv[:2] == [str(tool.DOCKER_BINARY), "exec"] and "pg_controldata" in argv[-1]:
                 return types.SimpleNamespace(
                     returncode=0,
                     stdout="Database system identifier: 1234567890123456789\n",
                 )
-            if argv[:2] == ["docker", "exec"]:
+            if argv[:2] == [str(tool.DOCKER_BINARY), "exec"]:
                 return types.SimpleNamespace(
                     returncode=0,
                     stdout="1234567890123456789|16384|73756232617069\n",
@@ -388,7 +388,7 @@ class SourcePostgresExecTests(unittest.TestCase):
         environment_inspects = [
             call
             for call in calls
-            if call[:3] == ["docker", "inspect", "--format"]
+            if call[:3] == [str(tool.DOCKER_BINARY), "inspect", "--format"]
             and "NetworkSettings.Networks" not in call[3]
         ]
         self.assertEqual(

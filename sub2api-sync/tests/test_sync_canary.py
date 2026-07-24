@@ -18,6 +18,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 COMPOSE_PATH = ROOT / "docker-compose.sync-canary.yml"
 MAIN_COMPOSE_PATH = ROOT / "docker-compose.yml"
 DOCKERFILE_PATH = ROOT / "sub2api-sync" / "Dockerfile"
+DOCKERIGNORE_PATH = ROOT / "sub2api-sync" / ".dockerignore"
 TOOL_PATH = ROOT / "deploy" / "sync-canary.py"
 ROLE_GATE_PATH = ROOT / "migrations" / "verify_sync_role_least_privilege.sql"
 
@@ -31,8 +32,12 @@ def load_tool():
 
 
 class TtyBuffer(io.StringIO):
+    def __init__(self, is_tty=True):
+        super().__init__()
+        self._is_tty = is_tty
+
     def isatty(self):
-        return True
+        return self._is_tty
 
 
 class SyncCanaryComposeTests(unittest.TestCase):
@@ -97,6 +102,23 @@ class SyncCanaryComposeTests(unittest.TestCase):
         )
         self.assertIn('psql (PostgreSQL) 18.4', dockerfile)
         self.assertNotRegex(dockerfile, r"\b(?:apk\s+add|apt-get|dnf\s|yum\s)")
+
+    def test_sync_build_context_is_an_explicit_source_allowlist(self):
+        entries = [
+            line
+            for line in DOCKERIGNORE_PATH.read_text(encoding="utf-8").splitlines()
+            if line and not line.startswith("#")
+        ]
+        self.assertEqual(
+            entries,
+            [
+                "*",
+                "!Dockerfile",
+                "!psql-wrapper.sh",
+                "!sub2api_sync.py",
+                "!usage_metadata.py",
+            ],
+        )
 
     def test_canary_targets_migrated_services_and_uses_persistent_nonce_only(self):
         self.assertIn("SUB2API_SYNC_DATABASE_HOST: traffic-canary-postgres", self.compose)
@@ -202,6 +224,139 @@ class SyncCanaryToolTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(calls, [])
 
+    def test_apply_rejects_noncanonical_release_before_private_access_or_commands(self):
+        calls = []
+
+        def forbidden(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("untrusted apply ran a command")
+
+        secret_reader = mock.Mock()
+        stderr = TtyBuffer()
+        with mock.patch.object(self.tool.os, "geteuid", return_value=0), \
+             mock.patch.object(self.tool, "load_private_env_parser") as parser_loader:
+            result = self.tool.main(
+                ["start", "--apply", "--env-file", "/private/env"],
+                runner=forbidden,
+                stdin=TtyBuffer(),
+                stdout=TtyBuffer(),
+                stderr=stderr,
+                secret_reader=secret_reader,
+            )
+        self.assertEqual(result, 1)
+        self.assertEqual(calls, [])
+        parser_loader.assert_not_called()
+        secret_reader.assert_not_called()
+        self.assertIn("trusted production release tree", stderr.getvalue())
+
+    def test_apply_context_requires_all_private_ttys(self):
+        with mock.patch.object(
+            self.tool, "TRUSTED_RELEASE_ROOT", self.tool.ROOT
+        ), mock.patch.object(
+            self.tool.os, "geteuid", return_value=0
+        ), mock.patch.object(
+            self.tool, "require_trusted_release_tree"
+        ) as trusted_tree:
+            for stream_name, streams in (
+                ("stdin", (TtyBuffer(False), TtyBuffer(), TtyBuffer())),
+                ("stdout", (TtyBuffer(), TtyBuffer(False), TtyBuffer())),
+                ("stderr", (TtyBuffer(), TtyBuffer(), TtyBuffer(False))),
+            ):
+                with self.subTest(stream=stream_name), self.assertRaisesRegex(
+                    self.tool.CanaryError, "private interactive TTY"
+                ):
+                    self.tool.require_production_apply_context(
+                        self.tool.ROOT, streams=streams
+                    )
+                trusted_tree.assert_not_called()
+
+            self.tool.require_production_apply_context(
+                self.tool.ROOT,
+                streams=(TtyBuffer(), TtyBuffer(), TtyBuffer()),
+            )
+        trusted_tree.assert_called_once_with(self.tool.ROOT)
+
+    def test_trusted_release_tree_validates_fixed_sources_and_controllers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trusted_root = pathlib.Path(directory) / "sub2api-gate-release"
+            trusted_root.mkdir()
+            trusted_root.chmod(0o755)
+            for relative_path in self.tool.TRUSTED_RELEASE_DIRECTORIES:
+                path = trusted_root / relative_path
+                path.mkdir(parents=True, exist_ok=True)
+                path.chmod(0o755)
+            for relative_path, executable in self.tool.TRUSTED_RELEASE_FILES:
+                path = trusted_root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("trusted fixture\n", encoding="ascii")
+                path.chmod(0o755 if executable else 0o644)
+
+            source = trusted_root / self.tool.SYNC_CANARY_SOURCE_RELATIVE_PATH
+            release_guard = trusted_root / self.tool.RELEASE_GUARD_RELATIVE_PATH
+            traffic_controller = (
+                trusted_root / self.tool.TRAFFIC_CONTROLLER_RELATIVE_PATH
+            )
+            private_env = trusted_root / self.tool.PRIVATE_ENV_RELATIVE_PATH
+            replacement = trusted_root / "deploy" / "replacement.py"
+            replacement.write_text("pass\n", encoding="ascii")
+            replacement.chmod(0o644)
+
+            with mock.patch.object(
+                self.tool, "TRUSTED_RELEASE_ROOT", trusted_root
+            ):
+                self.tool.require_trusted_release_tree(
+                    trusted_root,
+                    source_path=source,
+                    clean_worktree=release_guard,
+                    traffic_controller=traffic_controller,
+                    private_env=private_env,
+                    expected_uid=os.getuid(),
+                )
+                with self.assertRaisesRegex(
+                    self.tool.CanaryError, "outside the trusted release tree"
+                ):
+                    self.tool.require_trusted_release_tree(
+                        trusted_root,
+                        source_path=replacement,
+                        clean_worktree=release_guard,
+                        traffic_controller=traffic_controller,
+                        private_env=private_env,
+                        expected_uid=os.getuid(),
+                    )
+                with self.assertRaisesRegex(
+                    self.tool.CanaryError, "release guard"
+                ):
+                    self.tool.require_trusted_release_tree(
+                        trusted_root,
+                        source_path=source,
+                        clean_worktree=replacement,
+                        traffic_controller=traffic_controller,
+                        private_env=private_env,
+                        expected_uid=os.getuid(),
+                    )
+                with self.assertRaisesRegex(
+                    self.tool.CanaryError, "traffic controller"
+                ):
+                    self.tool.require_trusted_release_tree(
+                        trusted_root,
+                        source_path=source,
+                        clean_worktree=release_guard,
+                        traffic_controller=replacement,
+                        private_env=private_env,
+                        expected_uid=os.getuid(),
+                    )
+                release_guard.chmod(0o775)
+                with self.assertRaisesRegex(
+                    self.tool.CanaryError, "unsafe identity"
+                ):
+                    self.tool.require_trusted_release_tree(
+                        trusted_root,
+                        source_path=source,
+                        clean_worktree=release_guard,
+                        traffic_controller=traffic_controller,
+                        private_env=private_env,
+                        expected_uid=os.getuid(),
+                    )
     def test_private_env_rejects_quotes_comments_escapes_and_duplicates(self):
         bad_lines = (
             'SUB2API_SYNC_SECRET="quoted"',
@@ -256,9 +411,182 @@ class SyncCanaryToolTests(unittest.TestCase):
             clear=True,
         ):
             environment = self.tool.compose_environment({"POSTGRES_DB": "private"})
-        self.assertEqual(environment["DOCKER_HOST"], "unix:///var/run/docker.sock")
+        expected = self.tool.safe_system_environment()
+        expected["DOCKER_HOST"] = self.tool.LOCAL_DOCKER_HOST
+        self.assertEqual(environment, expected)
         self.assertNotIn("POSTGRES_DB", environment)
         self.assertNotIn("COMPOSE_PROJECT_NAME", environment)
+
+    def test_direct_docker_commands_and_prepare_image_pin_the_local_endpoint(self):
+        image_id = "sha256:" + "a" * 64
+        git_head = "b" * 40
+        calls = []
+        socket_metadata = mock.Mock(
+            st_mode=stat.S_IFSOCK | 0o660,
+            st_uid=0,
+        )
+        socket_path = mock.Mock()
+        socket_path.lstat.return_value = socket_metadata
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+        with mock.patch.object(self.tool, "DOCKER_SOCKET", socket_path), \
+             mock.patch.object(self.tool, "require_trusted_docker_binary") as trusted_binary, \
+             mock.patch.object(self.tool.subprocess, "run", side_effect=run), \
+             mock.patch.object(self.tool, "current_git_head", return_value=git_head), \
+             mock.patch.object(
+                 self.tool,
+                 "inspect_local_sync_image",
+                 side_effect=[image_id, image_id],
+             ), \
+             mock.patch.object(self.tool, "write_image_state"), \
+             mock.patch.dict(
+                 os.environ,
+                 {
+                     "PATH": "/usr/bin",
+                     "DOCKER_HOST": "tcp://untrusted.example.test:2375",
+                     "DOCKER_CONTEXT": "untrusted",
+                     "DOCKER_CONFIG": "/tmp/untrusted-docker-config",
+                     "BUILDKIT_HOST": "tcp://untrusted.example.test:1234",
+                     "BUILDX_BUILDER": "untrusted",
+                     "UNRELATED": "retained",
+                 },
+                 clear=True,
+             ):
+            self.tool.run_command(["docker", "image", "inspect", "test-image"])
+            self.assertEqual(self.tool.prepare_sync_image(), image_id)
+
+        self.assertEqual(
+            [command[0:2] for command, _kwargs in calls],
+            [
+                [self.tool.DOCKER_BINARY, "image"],
+                [self.tool.DOCKER_BINARY, "build"],
+                [self.tool.DOCKER_BINARY, "image"],
+            ],
+        )
+        self.assertEqual(trusted_binary.call_count, 3)
+        expected = self.tool.safe_system_environment()
+        expected["DOCKER_HOST"] = self.tool.LOCAL_DOCKER_HOST
+        for _command, kwargs in calls:
+            self.assertEqual(kwargs["env"], expected)
+            self.assertNotIn("UNRELATED", kwargs["env"])
+
+    def test_all_child_processes_use_a_minimal_environment(self):
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+        hostile_environment = {
+            "PATH": "/attacker/bin",
+            "GIT_DIR": "/attacker/repository",
+            "GIT_WORK_TREE": "/attacker/worktree",
+            "GIT_CONFIG_GLOBAL": "/attacker/gitconfig",
+            "SYSTEMD_PAGER": "/attacker/pager",
+            "SYSTEMD_LESS": "FRX",
+            "LD_PRELOAD": "/attacker/library.so",
+            "BASH_ENV": "/attacker/bashrc",
+            "PYTHONPATH": "/attacker/python",
+        }
+        with mock.patch.object(
+            self.tool, "require_trusted_system_binary"
+        ) as trusted_binary, mock.patch.object(
+            self.tool.subprocess, "run", side_effect=run
+        ), mock.patch.dict(os.environ, hostile_environment, clear=True):
+            self.tool.run_command([str(self.tool.CLEAN_WORKTREE)])
+            self.tool.run_command(
+                [sys.executable, str(self.tool.TRAFFIC_CONTROLLER), "status"]
+            )
+            self.tool.run_command(["git", "rev-parse", "--verify", "HEAD^{commit}"])
+            self.tool.run_command(
+                ["systemctl", "is-active", "--quiet", self.tool.LEGACY_UNIT]
+            )
+
+        self.assertEqual(
+            [command[0] for command, _kwargs in calls],
+            [
+                str(self.tool.CLEAN_WORKTREE),
+                sys.executable,
+                self.tool.GIT_BINARY,
+                self.tool.SYSTEMCTL_BINARY,
+            ],
+        )
+        self.assertEqual(
+            trusted_binary.call_args_list,
+            [
+                mock.call(self.tool.GIT_BINARY),
+                mock.call(self.tool.SYSTEMCTL_BINARY),
+            ],
+        )
+        for _command, kwargs in calls:
+            self.assertEqual(kwargs["env"], self.tool.safe_system_environment())
+            self.assertNotIn("GIT_DIR", kwargs["env"])
+            self.assertNotIn("SYSTEMD_PAGER", kwargs["env"])
+            self.assertNotIn("LD_PRELOAD", kwargs["env"])
+            self.assertNotIn("BASH_ENV", kwargs["env"])
+            self.assertNotIn("PYTHONPATH", kwargs["env"])
+
+    def test_trusted_system_binary_rejects_unsafe_metadata(self):
+        cases = (
+            ("relative", stat.S_IFREG | 0o755, 0, 0, False),
+            ("symlink", stat.S_IFLNK | 0o777, 0, 0, True),
+            ("not-regular", stat.S_IFDIR | 0o755, 0, 0, True),
+            ("not-root-owned", stat.S_IFREG | 0o755, 1000, 0, True),
+            ("not-root-group", stat.S_IFREG | 0o755, 0, 1000, True),
+            ("group-writable", stat.S_IFREG | 0o775, 0, 0, True),
+        )
+        for label, mode, uid, gid, absolute in cases:
+            with self.subTest(label=label):
+                binary_path = mock.Mock()
+                binary_path.is_absolute.return_value = absolute
+                binary_path.lstat.return_value = mock.Mock(
+                    st_mode=mode,
+                    st_uid=uid,
+                    st_gid=gid,
+                )
+                with mock.patch.object(
+                    self.tool.pathlib, "Path", return_value=binary_path
+                ), self.assertRaisesRegex(self.tool.CanaryError, "unsafe"):
+                    self.tool.require_trusted_system_binary("/safe/command")
+
+    def test_trusted_docker_binary_rejects_unsafe_metadata(self):
+        cases = (
+            ("not-regular", stat.S_IFDIR | 0o755, 0, 0),
+            ("not-root-owned", stat.S_IFREG | 0o755, 1000, 0),
+            ("not-root-group", stat.S_IFREG | 0o755, 0, 1000),
+            ("group-writable", stat.S_IFREG | 0o775, 0, 0),
+        )
+        for label, mode, uid, gid in cases:
+            with self.subTest(label=label):
+                binary_path = mock.Mock()
+                binary_path.lstat.return_value = mock.Mock(
+                    st_mode=mode,
+                    st_uid=uid,
+                    st_gid=gid,
+                )
+                with mock.patch.object(self.tool.pathlib, "Path", return_value=binary_path):
+                    with self.assertRaisesRegex(self.tool.CanaryError, "unsafe"):
+                        self.tool.require_trusted_docker_binary()
+
+    def test_local_docker_socket_rejects_unsafe_metadata(self):
+        cases = (
+            ("not-a-socket", stat.S_IFREG | 0o660, 0),
+            ("not-root-owned", stat.S_IFSOCK | 0o660, 1000),
+            ("world-writable", stat.S_IFSOCK | 0o666, 0),
+        )
+        for label, mode, uid in cases:
+            with self.subTest(label=label):
+                socket_path = mock.Mock()
+                socket_path.lstat.return_value = mock.Mock(
+                    st_mode=mode,
+                    st_uid=uid,
+                )
+                with mock.patch.object(self.tool, "DOCKER_SOCKET", socket_path):
+                    with self.assertRaisesRegex(self.tool.CanaryError, "unsafe"):
+                        self.tool.require_local_docker_socket()
 
     def test_signed_status_uses_canonical_hmac_and_replay_headers(self):
         secret = "s" * 32

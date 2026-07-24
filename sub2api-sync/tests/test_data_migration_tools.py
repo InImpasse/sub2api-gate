@@ -1180,7 +1180,7 @@ class DataMigrationToolTests(unittest.TestCase):
         self.assertIn("safe_export_deadline_seconds=600", script)
         self.assertIn("safe_export_min_free_bytes=10737418240", script)
         self.assertIn("safe_export_max_output_bytes=4294967296", script)
-        self.assertIn("timeout --foreground -s TERM -k 5", script)
+        self.assertIn('"$TIMEOUT" --foreground -s TERM -k 5', script)
         self.assertIn("prlimit --fsize=", script)
         self.assertIn("df --output=avail --block-size=1", script)
         self.assertIn("du --apparent-size --summarize --block-size=1", script)

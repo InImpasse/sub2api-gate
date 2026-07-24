@@ -163,6 +163,16 @@ class PrivateEnvironmentTests(unittest.TestCase):
         self.assertIn("absolute", result.stderr)
         self.assertNotIn(sentinel, result.stdout + result.stderr)
 
+    def test_root_private_environment_requires_the_fixed_production_path(self):
+        parser = load_python_script(PARSER, "private_env_root_path")
+        with mock.patch.object(parser.os, "geteuid", return_value=0), \
+             mock.patch.object(parser.os, "open", side_effect=AssertionError("must not open")):
+            with self.assertRaisesRegex(
+                parser.PrivateEnvironmentError,
+                "fixed root private environment path",
+            ):
+                parser.read_private_environment("/tmp/private.env")
+
     def test_emit_nul_rejects_a_regular_output_file_before_emitting_secrets(self):
         sentinel = "PRIVATE_ENV_REGULAR_OUTPUT_SENTINEL"
         with tempfile.TemporaryDirectory() as directory:
@@ -241,6 +251,53 @@ class PrivateEnvironmentTests(unittest.TestCase):
             ):
                 parser.read_private_environment(aliased_path)
 
+    def test_root_private_environment_checks_every_ancestor_directory(self):
+        parser = load_python_script(PARSER, "private_env_root_ancestor_boundary")
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            parent = root / "private"
+            parent.mkdir(mode=0o700)
+            path = self.write_environment(parent, "VALUE=literal\n")
+            real_fstat = os.fstat
+
+            for name in ("uid", "gid", "group_writable", "world_writable"):
+                directory_calls = [0]
+
+                def root_owned_stat(descriptor, case=name):
+                    metadata = real_fstat(descriptor)
+                    fields = list(metadata)
+                    if stat.S_ISDIR(metadata.st_mode):
+                        directory_calls[0] += 1
+                        fields[0] = stat.S_IFDIR | 0o700
+                        fields[4] = 0
+                        fields[5] = 0
+                        if directory_calls[0] == 2:
+                            if case == "uid":
+                                fields[4] = 1
+                            elif case == "gid":
+                                fields[5] = 1
+                            elif case == "group_writable":
+                                fields[0] = stat.S_IFDIR | 0o720
+                            else:
+                                fields[0] = stat.S_IFDIR | 0o702
+                    elif stat.S_ISREG(metadata.st_mode):
+                        fields[0] = stat.S_IFREG | 0o600
+                        fields[3] = 1
+                        fields[4] = 0
+                        fields[5] = 0
+                    return os.stat_result(fields)
+
+                with self.subTest(case=name), \
+                     mock.patch.object(parser, "PRODUCTION_PRIVATE_ENV_PATH", path), \
+                     mock.patch.object(parser.os, "geteuid", return_value=0), \
+                     mock.patch.object(parser.os, "getegid", return_value=0), \
+                     mock.patch.object(parser.os, "fstat", side_effect=root_owned_stat):
+                    with self.assertRaisesRegex(
+                        parser.PrivateEnvironmentError,
+                        "ancestor directory",
+                    ):
+                        parser.read_private_environment(path)
+
     def test_private_environment_rejects_multiply_linked_files(self):
         parser = load_python_script(PARSER, "private_env_hardlink_boundary")
         with tempfile.TemporaryDirectory() as directory:
@@ -305,6 +362,23 @@ class PrivateEnvironmentTests(unittest.TestCase):
                     parser.PrivateEnvironmentError, "changed while being read"
                 ):
                     parser.read_private_environment(path)
+
+    def test_private_environment_reads_values_and_identity_from_one_descriptor(self):
+        parser = load_python_script(PARSER, "private_env_read_identity")
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_environment(directory, "VALUE=literal\n")
+            with mock.patch.object(
+                parser,
+                "private_environment_identity",
+                side_effect=AssertionError("must not reopen the private environment"),
+            ):
+                values, identity = parser.read_private_environment_with_identity(path)
+
+            metadata = path.stat()
+            self.assertEqual(values, {"VALUE": "literal"})
+            self.assertEqual(identity["device"], metadata.st_dev)
+            self.assertEqual(identity["inode"], metadata.st_ino)
+            self.assertEqual(identity["mode"], metadata.st_mode)
 
     def test_private_environment_rejects_a_writable_parent_directory(self):
         parser = load_python_script(PARSER, "private_env_parent_mode")

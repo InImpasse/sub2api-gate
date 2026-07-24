@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """Strict parser for private Compose environment files.
 
 The accepted format intentionally has no quoting, escaping, interpolation, or
@@ -21,6 +21,7 @@ MAX_LINE_CHARACTERS = 8192
 KEY_PATTERN = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 FORBIDDEN_KEY_PREFIXES = ("COMPOSE_", "DOCKER_")
 FORBIDDEN_VALUE_CHARACTERS = frozenset("'\"\\#$")
+PRODUCTION_PRIVATE_ENV_PATH = pathlib.Path("/mnt/data/sub2api-gate/private/.env")
 
 
 class PrivateEnvironmentError(ValueError):
@@ -67,7 +68,7 @@ def _expected_operator_identity():
     return expected_uid, expected_gid
 
 
-def _open_private_environment(path, expected_uid):
+def _normalize_private_environment_path(path, *, root_operator):
     path = pathlib.Path(path)
     if not path.is_absolute():
         raise PrivateEnvironmentError(
@@ -76,6 +77,30 @@ def _open_private_environment(path, expected_uid):
     components = path.parts[1:]
     if not components or any(component in {"", ".", ".."} for component in components):
         raise PrivateEnvironmentError("private environment file path is invalid")
+    if root_operator and path != PRODUCTION_PRIVATE_ENV_PATH:
+        raise PrivateEnvironmentError(
+            "root private environment must use the fixed root private environment path"
+        )
+    return path, components
+
+
+def _validate_root_ancestor_directory(directory_stat):
+    if (
+        not stat.S_ISDIR(directory_stat.st_mode)
+        or directory_stat.st_uid != 0
+        or directory_stat.st_gid != 0
+        or stat.S_IMODE(directory_stat.st_mode) & 0o022
+    ):
+        raise PrivateEnvironmentError(
+            "root private environment ancestor directory is unsafe"
+        )
+
+
+def _open_private_environment(path, expected_uid):
+    path, components = _normalize_private_environment_path(
+        path,
+        root_operator=expected_uid == 0,
+    )
     if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
         raise PrivateEnvironmentError(
             "private environment file boundary is unavailable"
@@ -90,6 +115,8 @@ def _open_private_environment(path, expected_uid):
         ) from error
     try:
         for component in components[:-1]:
+            if expected_uid == 0:
+                _validate_root_ancestor_directory(os.fstat(directory_descriptor))
             try:
                 next_descriptor = os.open(
                     component, directory_flags, dir_fd=directory_descriptor
@@ -105,7 +132,9 @@ def _open_private_environment(path, expected_uid):
             os.close(directory_descriptor)
             directory_descriptor = next_descriptor
         parent_stat = os.fstat(directory_descriptor)
-        if (
+        if expected_uid == 0:
+            _validate_root_ancestor_directory(parent_stat)
+        elif (
             not stat.S_ISDIR(parent_stat.st_mode)
             or parent_stat.st_uid != expected_uid
             or stat.S_IMODE(parent_stat.st_mode) & 0o022
@@ -129,29 +158,50 @@ def _open_private_environment(path, expected_uid):
         os.close(directory_descriptor)
 
 
-def read_private_environment(path):
-    expected_uid, expected_gid = _expected_operator_identity()
+def _identity_document(file_stat):
+    return {
+        "device": file_stat.st_dev,
+        "inode": file_stat.st_ino,
+        "mode": file_stat.st_mode,
+        "links": file_stat.st_nlink,
+        "uid": file_stat.st_uid,
+        "gid": file_stat.st_gid,
+        "size": file_stat.st_size,
+        "modified_ns": file_stat.st_mtime_ns,
+        "changed_ns": file_stat.st_ctime_ns,
+    }
+
+
+def _validate_private_environment_file(file_stat, *, expected_uid, expected_gid):
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise PrivateEnvironmentError(
+            "private environment file must be a regular non-symlink file"
+        )
+    if file_stat.st_nlink != 1:
+        raise PrivateEnvironmentError(
+            "private environment file must have a single filesystem link"
+        )
+    if (file_stat.st_uid, file_stat.st_gid) != (expected_uid, expected_gid):
+        raise PrivateEnvironmentError(
+            "private environment file must be owned by the expected operator"
+        )
+    if stat.S_IMODE(file_stat.st_mode) != 0o600:
+        raise PrivateEnvironmentError(
+            "private environment file must use mode 0600"
+        )
+    if file_stat.st_size > MAX_FILE_BYTES:
+        raise PrivateEnvironmentError("private environment file is too large")
+
+
+def _read_private_environment_payload(path, *, expected_uid, expected_gid):
     descriptor = _open_private_environment(path, expected_uid)
     try:
         file_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise PrivateEnvironmentError(
-                "private environment file must be a regular non-symlink file"
-            )
-        if file_stat.st_nlink != 1:
-            raise PrivateEnvironmentError(
-                "private environment file must have a single filesystem link"
-            )
-        if (file_stat.st_uid, file_stat.st_gid) != (expected_uid, expected_gid):
-            raise PrivateEnvironmentError(
-                "private environment file must be owned by the expected operator"
-            )
-        if stat.S_IMODE(file_stat.st_mode) != 0o600:
-            raise PrivateEnvironmentError(
-                "private environment file must use mode 0600"
-            )
-        if file_stat.st_size > MAX_FILE_BYTES:
-            raise PrivateEnvironmentError("private environment file is too large")
+        _validate_private_environment_file(
+            file_stat,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
         chunks = []
         remaining = MAX_FILE_BYTES + 1
         while remaining:
@@ -168,16 +218,19 @@ def read_private_environment(path):
             raise PrivateEnvironmentError(
                 "private environment file changed while being read"
             )
-        source = _decode_private_environment(payload)
+        return payload, _identity_document(final_stat)
     except PrivateEnvironmentError:
         raise
-    except (OSError, UnicodeError) as error:
+    except OSError as error:
         raise PrivateEnvironmentError(
             "private environment file could not be read"
         ) from error
     finally:
         os.close(descriptor)
 
+
+def _parse_private_environment(payload):
+    source = _decode_private_environment(payload)
     values = {}
     for raw_line in source.split("\n"):
         if len(raw_line) > MAX_LINE_CHARACTERS:
@@ -207,6 +260,49 @@ def read_private_environment(path):
                 "private environment file contains too many entries"
             )
     return values
+
+
+def read_private_environment_with_identity(path):
+    expected_uid, expected_gid = _expected_operator_identity()
+    payload, identity = _read_private_environment_payload(
+        path,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    return _parse_private_environment(payload), identity
+
+
+def read_private_environment(path):
+    values, _identity = read_private_environment_with_identity(path)
+    return values
+
+
+def private_environment_identity(path, *, expected_uid=None, expected_gid=None):
+    operator_uid, operator_gid = _expected_operator_identity()
+    if (
+        (expected_uid is not None or expected_gid is not None)
+        and (expected_uid, expected_gid) != (operator_uid, operator_gid)
+    ):
+        raise PrivateEnvironmentError(
+            "private environment expected operator identity is invalid"
+        )
+    descriptor = _open_private_environment(path, operator_uid)
+    try:
+        file_stat = os.fstat(descriptor)
+        _validate_private_environment_file(
+            file_stat,
+            expected_uid=operator_uid,
+            expected_gid=operator_gid,
+        )
+        return _identity_document(file_stat)
+    except PrivateEnvironmentError:
+        raise
+    except OSError as error:
+        raise PrivateEnvironmentError(
+            "private environment file could not be read"
+        ) from error
+    finally:
+        os.close(descriptor)
 
 
 def main(argv=None):

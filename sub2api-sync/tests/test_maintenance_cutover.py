@@ -881,6 +881,11 @@ class MaintenanceCutoverTests(unittest.TestCase):
                 "CLOUDFLARE_API_TOKEN": "ambient-secret",
                 "SSH_AUTH_SOCK": "/private/agent.sock",
                 "SUB2API_SOURCE_DATABASE_URL": "ambient-database-secret",
+                "HOME": "/tmp/attacker-home",
+                "LANG": "attacker-locale",
+                "LC_ALL": "attacker-locale",
+                "TZ": "attacker-timezone",
+                "GIT_CONFIG_GLOBAL": "/tmp/attacker-gitconfig",
             },
             clear=False,
         ):
@@ -889,6 +894,16 @@ class MaintenanceCutoverTests(unittest.TestCase):
         self.assertNotIn("SSH_AUTH_SOCK", environment)
         self.assertNotIn("SUB2API_SOURCE_DATABASE_URL", environment)
         self.assertEqual(environment["DOCKER_HOST"], "unix:///var/run/docker.sock")
+        self.assertEqual(environment["HOME"], "/root")
+        self.assertEqual(environment["LANG"], "C.UTF-8")
+        self.assertEqual(environment["LC_ALL"], "C.UTF-8")
+        self.assertEqual(environment["TZ"], "UTC")
+        self.assertEqual(environment["PYTHONNOUSERSITE"], "1")
+        self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(environment["GIT_CONFIG_SYSTEM"], "/dev/null")
+        self.assertEqual(environment["GIT_CONFIG_COUNT"], "0")
+        self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
 
     def test_operator_authentication_precedes_private_environment_read(self):
         source = TOOL_PATH.read_text(encoding="utf-8")
@@ -896,7 +911,48 @@ class MaintenanceCutoverTests(unittest.TestCase):
         main_source = source[main_start:]
         self.assertLess(
             main_source.index("        authenticate()"),
-            main_source.index("private_env.read_private_environment(options.env_file)"),
+            main_source.index(
+                "private_env.read_private_environment_with_identity(options.env_file)"
+            ),
+        )
+        self.assertNotIn(
+            "env_file_identity = private_environment_identity(\n                options.env_file",
+            main_source,
+        )
+
+    def test_privileged_python_helpers_use_the_fixed_isolated_interpreter(self):
+        source = TOOL_PATH.read_text(encoding="utf-8")
+        self.assertTrue(source.startswith("#!/usr/bin/python3 -I\n"))
+        self.assertEqual(
+            self.tool.privileged_python_command("/tmp/helper.py", "--apply"),
+            ["/usr/bin/python3", "-I", "/tmp/helper.py", "--apply"],
+        )
+        self.assertNotIn("[str(PYTHON_BINARY)", source)
+
+    def test_apply_context_gate_precedes_argument_parsing(self):
+        with mock.patch.object(
+            self.tool,
+            "require_production_apply_context",
+            side_effect=self.tool.CutoverError("blocked"),
+        ) as context_gate, mock.patch.object(
+            self.tool,
+            "parse_arguments",
+            side_effect=AssertionError("arguments must not be parsed first"),
+        ):
+            self.assertEqual(
+                self.tool.main(["--apply"], stderr=io.StringIO()),
+                1,
+            )
+        context_gate.assert_called_once()
+
+    def test_trusted_release_tree_includes_filesystem_root(self):
+        with mock.patch.object(
+            self.tool, "TRUSTED_RELEASE_ROOT", ROOT
+        ), mock.patch.object(self.tool, "_require_trusted_release_path") as path_gate:
+            self.tool.require_trusted_release_tree(ROOT, source_path=TOOL_PATH)
+        self.assertIn(
+            mock.call(self.tool.TRUSTED_FILESYSTEM_ROOT, expects_directory=True),
+            path_gate.call_args_list,
         )
 
     def test_safe_export_policy_binds_totp_and_role_migration_controls(self):
@@ -1276,8 +1332,9 @@ class MaintenanceCutoverTests(unittest.TestCase):
 
         def runner(argv, **kwargs):
             calls.append((list(argv), dict(kwargs["environment"])))
-            if argv[:2] == [
-                "python3",
+            if argv[:3] == [
+                str(self.tool.PYTHON_BINARY),
+                "-I",
                 str(ROOT / "deploy" / "source-postgres-exec.py"),
             ]:
                 return self.tool.CommandResult(
@@ -1319,14 +1376,15 @@ class MaintenanceCutoverTests(unittest.TestCase):
         )
         source_calls = [
             call for call in calls
-            if call[0][:2] == [
-                "python3",
+            if call[0][:3] == [
+                str(self.tool.PYTHON_BINARY),
+                "-I",
                 str(ROOT / "deploy" / "source-postgres-exec.py"),
             ]
         ]
         self.assertEqual(len(source_calls), 1)
         self.assertEqual(
-            source_calls[0][0][2:],
+            source_calls[0][0][3:],
             [
                 "--env-file", "/private/env",
                 "--source-app-container", "legacy-app",
@@ -1340,8 +1398,9 @@ class MaintenanceCutoverTests(unittest.TestCase):
         self.assertNotIn("SUB2API_SOURCE_DATABASE_URL", source_calls[0][1])
         target_calls = [
             call for call in calls
-            if call[0][:2] == [
-                "python3",
+            if call[0][:3] == [
+                str(self.tool.PYTHON_BINARY),
+                "-I",
                 str(ROOT / "deploy" / "pg-env-exec.py"),
             ]
         ]
@@ -1358,8 +1417,9 @@ class MaintenanceCutoverTests(unittest.TestCase):
         )
 
         def runner(argv, **_kwargs):
-            if argv[:2] == [
-                "python3",
+            if argv[:3] == [
+                str(self.tool.PYTHON_BINARY),
+                "-I",
                 str(ROOT / "deploy" / "source-postgres-exec.py"),
             ]:
                 return self.tool.CommandResult(

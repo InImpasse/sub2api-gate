@@ -1,12 +1,14 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 import ipaddress
 import importlib.util
 import os
 import pathlib
 import re
+import stat
 import sys
 import urllib.parse
 
+REPO_DIR = pathlib.Path(__file__).resolve().parents[1]
 
 ALL_URL_ENVIRONMENT_NAMES = {
     "SUB2API_DATABASE_URL",
@@ -51,10 +53,53 @@ TLS_ENVIRONMENT_NAMES = {
     "SSL_CERT_FILE",
     "SSLKEYLOGFILE",
 }
+SAFE_COMMAND_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+PSQL_BINARY = pathlib.Path("/usr/bin/psql")
+TRUSTED_FILESYSTEM_ROOT = pathlib.Path("/")
+TRUSTED_RELEASE_PARENT = pathlib.Path("/opt")
+TRUSTED_RELEASE_ROOT = TRUSTED_RELEASE_PARENT / "sub2api-gate-release"
+TRUSTED_CONTROLLER = TRUSTED_RELEASE_ROOT / "deploy" / "pg-env-exec.py"
 
 
 class ConfigurationError(ValueError):
     pass
+
+def require_trusted_release_path(path, *, expects_directory):
+    target = pathlib.Path(path)
+    try:
+        metadata = target.lstat()
+    except OSError as error:
+        raise ConfigurationError('trusted PostgreSQL release path is unavailable') from error
+    if (
+        not target.is_absolute()
+        or stat.S_ISLNK(metadata.st_mode)
+        or (expects_directory and not stat.S_ISDIR(metadata.st_mode))
+        or (not expects_directory and not stat.S_ISREG(metadata.st_mode))
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise ConfigurationError('trusted PostgreSQL release path is unsafe')
+
+
+def require_production_context():
+    if os.geteuid() != 0:
+        return
+    try:
+        source_path = pathlib.Path(__file__).resolve(strict=True)
+    except OSError as error:
+        raise ConfigurationError('trusted PostgreSQL controller source is unavailable') from error
+    if REPO_DIR != TRUSTED_RELEASE_ROOT or source_path != TRUSTED_CONTROLLER:
+        raise ConfigurationError('PostgreSQL helper must run from the trusted production release tree')
+    for path, expects_directory in (
+        (TRUSTED_FILESYSTEM_ROOT, True),
+        (TRUSTED_RELEASE_PARENT, True),
+        (TRUSTED_RELEASE_ROOT, True),
+        (TRUSTED_RELEASE_ROOT / 'deploy', True),
+        (TRUSTED_CONTROLLER, False),
+        (TRUSTED_RELEASE_ROOT / "deploy" / "private_env.py", False),
+    ):
+        require_trusted_release_path(path, expects_directory=expects_directory)
 
 
 def _validate_percent_encoding(value):
@@ -413,17 +458,45 @@ def private_libpq_environment(environment, private_env_path, url_name):
     return parsed_environments[url_name]
 
 
+def clean_cli_environment():
+    environment = {
+        "PATH": SAFE_COMMAND_PATH,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+    }
+    pgoptions = os.environ.get(ENFORCED_OPTIONS_ENV)
+    if pgoptions is not None:
+        if len(pgoptions) > 512 or any(
+            character in pgoptions for character in ("\x00", "\r", "\n")
+        ):
+            raise ConfigurationError("enforced PostgreSQL options are invalid")
+        environment[ENFORCED_OPTIONS_ENV] = pgoptions
+    return environment
+
+
+def postgres_client_command(command):
+    if not command or not isinstance(command[0], str) or "\x00" in command[0]:
+        raise ConfigurationError("PostgreSQL client command is required")
+    if command[0] == "psql":
+        return [str(PSQL_BINARY), *command[1:]]
+    if pathlib.PurePath(command[0]).is_absolute():
+        return list(command)
+    raise ConfigurationError("PostgreSQL client command is not allowed")
+
+
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) >= 3 and args[0] == "--target-private-env-file":
         try:
+            require_production_context()
+            command = postgres_client_command(args[2:])
             child_environment = private_libpq_environment(
-                os.environ, args[1], "SUB2API_TARGET_DATABASE_URL"
+                clean_cli_environment(), args[1], "SUB2API_TARGET_DATABASE_URL"
             )
         except ConfigurationError as error:
             print(str(error), file=sys.stderr)
             return 1
-        command = args[2:]
     else:
         print(
             f"usage: {pathlib.Path(sys.argv[0]).name} "
@@ -432,7 +505,7 @@ def main(argv=None):
         )
         return 2
     try:
-        os.execvpe(command[0], command, child_environment)
+        os.execve(command[0], command, child_environment)
     except OSError:
         print("PostgreSQL client command could not be started", file=sys.stderr)
         return 1

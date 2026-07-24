@@ -88,6 +88,24 @@ NGINX_OPERATION_LOCK = pathlib.Path(
 SYSTEM_CA_BUNDLE = pathlib.Path("/etc/ssl/certs/ca-certificates.crt")
 OPENSSL_BINARY = pathlib.Path("/usr/bin/openssl")
 FINDMNT_BINARY = pathlib.Path("/usr/bin/findmnt")
+TRUSTED_RELEASE_ROOT = pathlib.Path("/opt/sub2api-gate-release")
+AOP_SOURCE_RELATIVE_PATH = pathlib.Path("deploy/configure-cloudflare-aop.py")
+RELEASE_GUARD_RELATIVE_PATH = pathlib.Path("deploy/require-clean-worktree.sh")
+AOP_INSTALLER_RELATIVE_PATH = pathlib.Path("deploy/install-nginx-aop.sh")
+AOP_OPTIONAL_SNIPPET_RELATIVE_PATH = pathlib.Path(
+    "nginx/snippets/sub2api-aop-optional.conf"
+)
+TRUSTED_RELEASE_DIRECTORIES = (
+    pathlib.Path("deploy"),
+    pathlib.Path("nginx"),
+    pathlib.Path("nginx/snippets"),
+)
+TRUSTED_RELEASE_FILES = (
+    (AOP_SOURCE_RELATIVE_PATH, True),
+    (RELEASE_GUARD_RELATIVE_PATH, True),
+    (AOP_INSTALLER_RELATIVE_PATH, True),
+    (AOP_OPTIONAL_SNIPPET_RELATIVE_PATH, False),
+)
 PEM_CERTIFICATE_BEGIN = "-----BEGIN CERTIFICATE-----"
 PEM_CERTIFICATE_END = "-----END CERTIFICATE-----"
 MAX_CONTROL_STATE_BYTES = 4 * 1024
@@ -125,6 +143,95 @@ _MISSING_RESULT = object()
 class AopError(RuntimeError):
     pass
 
+def _require_trusted_release_path(
+    path, *, expects_directory, expects_executable, expected_uid
+):
+    path = pathlib.Path(path)
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise AopError("trusted AOP release source is unavailable") from error
+    if (
+        not path.is_absolute()
+        or stat.S_ISLNK(metadata.st_mode)
+        or (
+            expects_directory
+            and not stat.S_ISDIR(metadata.st_mode)
+        )
+        or (
+            not expects_directory
+            and not stat.S_ISREG(metadata.st_mode)
+        )
+        or metadata.st_uid != expected_uid
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or (expects_executable and not metadata.st_mode & stat.S_IXUSR)
+    ):
+        raise AopError("trusted AOP release source has an unsafe identity")
+
+
+def require_trusted_release_tree(repo_dir, *, source_path=None, expected_uid=0):
+    repo_dir = pathlib.Path(repo_dir)
+    trusted_root = pathlib.Path(TRUSTED_RELEASE_ROOT)
+    if repo_dir != trusted_root:
+        raise AopError("AOP apply must run from the trusted production release tree")
+    if not trusted_root.is_absolute():
+        raise AopError("trusted AOP release root is invalid")
+    try:
+        source_path = (
+            pathlib.Path(__file__).resolve(strict=True)
+            if source_path is None
+            else pathlib.Path(source_path).resolve(strict=True)
+        )
+    except OSError as error:
+        raise AopError("trusted AOP controller source is unavailable") from error
+    expected_source = trusted_root / AOP_SOURCE_RELATIVE_PATH
+    if source_path != expected_source:
+        raise AopError("AOP controller source is outside the trusted release tree")
+
+    _require_trusted_release_path(
+        trusted_root.parent,
+        expects_directory=True,
+        expects_executable=False,
+        expected_uid=expected_uid,
+    )
+    _require_trusted_release_path(
+        trusted_root,
+        expects_directory=True,
+        expects_executable=False,
+        expected_uid=expected_uid,
+    )
+    for relative_path in TRUSTED_RELEASE_DIRECTORIES:
+        _require_trusted_release_path(
+            trusted_root / relative_path,
+            expects_directory=True,
+            expects_executable=False,
+            expected_uid=expected_uid,
+        )
+    for relative_path, expects_executable in TRUSTED_RELEASE_FILES:
+        _require_trusted_release_path(
+            trusted_root / relative_path,
+            expects_directory=False,
+            expects_executable=expects_executable,
+            expected_uid=expected_uid,
+        )
+
+
+def require_production_apply_context(repo_dir, *, streams=None):
+    repo_dir = pathlib.Path(repo_dir)
+    if os.geteuid() != 0 or repo_dir != TRUSTED_RELEASE_ROOT:
+        raise AopError(
+            "AOP apply requires root from the trusted production release tree"
+        )
+    if streams is None:
+        streams = (sys.stdin, sys.stdout, sys.stderr)
+    try:
+        stdin, stdout, stderr = streams
+        private_tty = stdin.isatty() and stdout.isatty() and stderr.isatty()
+    except (AttributeError, OSError, ValueError):
+        private_tty = False
+    if not private_tty:
+        raise AopError("AOP apply requires a private interactive TTY")
+    require_trusted_release_tree(repo_dir)
 
 class AopRemoteResultUnknown(AopError):
     """The server may have applied a remote write, but it was not confirmed."""
@@ -1355,17 +1462,18 @@ def main(argv=None):
             "legacy one-step --apply is forbidden; select --stage upload or --stage associate"
         )
     sanitize_privileged_environment()
-    if not sys.stdin.isatty():
-        raise AopError("--apply requires a private interactive terminal")
-    if os.geteuid() != 0:
-        raise AopError("--apply must run as root to use the fixed origin AOP state")
+    repo_dir = pathlib.Path(__file__).resolve().parents[1]
+    require_production_apply_context(
+        repo_dir,
+        streams=(sys.stdin, sys.stdout, sys.stderr),
+    )
     if args.ca_output and pathlib.Path(args.ca_output) != AOP_CA_OUTPUT:
         raise AopError("AOP CA public certificate must remain at the fixed origin /etc path")
     validate_zone_and_hostname(args.zone_id, args.hostname)
-    repo_dir = pathlib.Path(__file__).resolve().parents[1]
     subprocess.run(
-        [repo_dir / "deploy" / "require-clean-worktree.sh", "check"],
+        [repo_dir / RELEASE_GUARD_RELATIVE_PATH, "check"],
         check=True,
+        cwd=repo_dir,
         env=safe_subprocess_environment(),
     )
     require_ephemeral_secret_runtime()

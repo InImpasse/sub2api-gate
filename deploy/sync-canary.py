@@ -23,6 +23,44 @@ import uuid
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+TRUSTED_RELEASE_ROOT = pathlib.Path("/opt/sub2api-gate-release")
+SYNC_CANARY_SOURCE_RELATIVE_PATH = pathlib.Path("deploy/sync-canary.py")
+RELEASE_GUARD_RELATIVE_PATH = pathlib.Path("deploy/require-clean-worktree.sh")
+TRAFFIC_CONTROLLER_RELATIVE_PATH = pathlib.Path("deploy/traffic-canary.py")
+PRIVATE_ENV_RELATIVE_PATH = pathlib.Path("deploy/private_env.py")
+SYNC_COMPOSE_RELATIVE_PATH = pathlib.Path("docker-compose.sync-canary.yml")
+SYNC_ROLE_GATE_RELATIVE_PATH = pathlib.Path(
+    "migrations/verify_sync_role_least_privilege.sql"
+)
+SYNC_DOCKERFILE_RELATIVE_PATH = pathlib.Path("sub2api-sync/Dockerfile")
+SYNC_DOCKERIGNORE_RELATIVE_PATH = pathlib.Path("sub2api-sync/.dockerignore")
+SYNC_PSQL_WRAPPER_RELATIVE_PATH = pathlib.Path("sub2api-sync/psql-wrapper.sh")
+SYNC_APPLICATION_RELATIVE_PATH = pathlib.Path("sub2api-sync/sub2api_sync.py")
+SYNC_USAGE_METADATA_RELATIVE_PATH = pathlib.Path("sub2api-sync/usage_metadata.py")
+TRAFFIC_COMPOSE_RELATIVE_PATH = pathlib.Path("docker-compose.traffic-canary.yml")
+POSTGRES_LOG_GATE_RELATIVE_PATH = pathlib.Path(
+    "deploy/verify-postgres-runtime-logging.sql"
+)
+TRUSTED_RELEASE_DIRECTORIES = (
+    pathlib.Path("deploy"),
+    pathlib.Path("migrations"),
+    pathlib.Path("sub2api-sync"),
+)
+TRUSTED_RELEASE_FILES = (
+    (SYNC_CANARY_SOURCE_RELATIVE_PATH, False),
+    (RELEASE_GUARD_RELATIVE_PATH, True),
+    (TRAFFIC_CONTROLLER_RELATIVE_PATH, False),
+    (PRIVATE_ENV_RELATIVE_PATH, False),
+    (SYNC_COMPOSE_RELATIVE_PATH, False),
+    (SYNC_ROLE_GATE_RELATIVE_PATH, False),
+    (SYNC_DOCKERFILE_RELATIVE_PATH, False),
+    (SYNC_DOCKERIGNORE_RELATIVE_PATH, False),
+    (SYNC_PSQL_WRAPPER_RELATIVE_PATH, True),
+    (SYNC_APPLICATION_RELATIVE_PATH, False),
+    (SYNC_USAGE_METADATA_RELATIVE_PATH, False),
+    (TRAFFIC_COMPOSE_RELATIVE_PATH, False),
+    (POSTGRES_LOG_GATE_RELATIVE_PATH, False),
+)
 COMPOSE = ROOT / "docker-compose.sync-canary.yml"
 SYNC_DOCKERFILE = ROOT / "sub2api-sync" / "Dockerfile"
 SYNC_BUILD_CONTEXT = ROOT / "sub2api-sync"
@@ -34,6 +72,12 @@ DATA_ROOT = pathlib.Path("/mnt/data/sub2api-gate")
 STATE_DIRECTORY = pathlib.Path("/run/sub2api-gate")
 SYNC_IMAGE_STATE = STATE_DIRECTORY / "sync-image.json"
 DOCKER_SOCKET = pathlib.Path("/var/run/docker.sock")
+DOCKER_BINARY = "/usr/bin/docker"
+GIT_BINARY = "/usr/bin/git"
+SYSTEMCTL_BINARY = "/usr/bin/systemctl"
+SAFE_SYSTEM_COMMAND_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+LOCAL_DOCKER_HOST = "unix:///var/run/docker.sock"
+DOCKER_SELECTOR_ENV_PREFIXES = ("DOCKER_", "BUILDKIT_", "BUILDX_")
 TARGET_NETWORK = "sub2api-gate-traffic-canary_traffic-canary-data"
 TARGET_POSTGRES = "sub2api-traffic-canary-postgres"
 TARGET_APP = "sub2api-traffic-canary"
@@ -72,6 +116,179 @@ GIT_HEAD_PATTERN = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 class CanaryError(RuntimeError):
     pass
 
+def _require_trusted_release_path(
+    path, *, expects_directory, expects_executable, expected_uid
+):
+    path = pathlib.Path(path)
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise CanaryError("trusted sync release source is unavailable") from error
+    if (
+        not path.is_absolute()
+        or stat.S_ISLNK(metadata.st_mode)
+        or (expects_directory and not stat.S_ISDIR(metadata.st_mode))
+        or (not expects_directory and not stat.S_ISREG(metadata.st_mode))
+        or metadata.st_uid != expected_uid
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or (expects_executable and not metadata.st_mode & stat.S_IXUSR)
+    ):
+        raise CanaryError("trusted sync release source has an unsafe identity")
+
+
+def require_trusted_release_tree(
+    repo_dir,
+    *,
+    source_path=None,
+    clean_worktree=None,
+    traffic_controller=None,
+    private_env=None,
+    expected_uid=0,
+):
+    repo_dir = pathlib.Path(repo_dir)
+    trusted_root = pathlib.Path(TRUSTED_RELEASE_ROOT)
+    if repo_dir != trusted_root:
+        raise CanaryError(
+            "sync canary apply must run from the trusted production release tree"
+        )
+    if not trusted_root.is_absolute():
+        raise CanaryError("trusted sync release root is invalid")
+    try:
+        source_path = (
+            pathlib.Path(__file__).resolve(strict=True)
+            if source_path is None
+            else pathlib.Path(source_path).resolve(strict=True)
+        )
+    except OSError as error:
+        raise CanaryError("trusted sync controller source is unavailable") from error
+    expected_source = trusted_root / SYNC_CANARY_SOURCE_RELATIVE_PATH
+    expected_guard = trusted_root / RELEASE_GUARD_RELATIVE_PATH
+    expected_traffic_controller = trusted_root / TRAFFIC_CONTROLLER_RELATIVE_PATH
+    expected_private_env = trusted_root / PRIVATE_ENV_RELATIVE_PATH
+    if source_path != expected_source:
+        raise CanaryError("sync controller source is outside the trusted release tree")
+    if pathlib.Path(
+        CLEAN_WORKTREE if clean_worktree is None else clean_worktree
+    ) != expected_guard:
+        raise CanaryError("trusted sync release guard has an unsafe identity")
+    if pathlib.Path(
+        TRAFFIC_CONTROLLER if traffic_controller is None else traffic_controller
+    ) != expected_traffic_controller:
+        raise CanaryError("trusted traffic controller has an unsafe identity")
+    if pathlib.Path(PRIVATE_ENV if private_env is None else private_env) != expected_private_env:
+        raise CanaryError("trusted private environment parser has an unsafe identity")
+
+    _require_trusted_release_path(
+        trusted_root.parent,
+        expects_directory=True,
+        expects_executable=False,
+        expected_uid=expected_uid,
+    )
+    _require_trusted_release_path(
+        trusted_root,
+        expects_directory=True,
+        expects_executable=False,
+        expected_uid=expected_uid,
+    )
+    for relative_path in TRUSTED_RELEASE_DIRECTORIES:
+        _require_trusted_release_path(
+            trusted_root / relative_path,
+            expects_directory=True,
+            expects_executable=False,
+            expected_uid=expected_uid,
+        )
+    for relative_path, expects_executable in TRUSTED_RELEASE_FILES:
+        _require_trusted_release_path(
+            trusted_root / relative_path,
+            expects_directory=False,
+            expects_executable=expects_executable,
+            expected_uid=expected_uid,
+        )
+
+
+def require_production_apply_context(repo_dir, *, streams=None):
+    repo_dir = pathlib.Path(repo_dir)
+    if os.geteuid() != 0 or repo_dir != TRUSTED_RELEASE_ROOT:
+        raise CanaryError(
+            "sync canary apply requires root from the trusted production release tree"
+        )
+    if streams is None:
+        streams = (sys.stdin, sys.stdout, sys.stderr)
+    try:
+        stdin, stdout, stderr = streams
+        private_tty = stdin.isatty() and stdout.isatty() and stderr.isatty()
+    except (AttributeError, OSError, ValueError):
+        private_tty = False
+    if not private_tty:
+        raise CanaryError("sync canary apply requires a private interactive TTY")
+    require_trusted_release_tree(repo_dir)
+
+
+
+def local_docker_environment(environment=None):
+    """Return a Docker child environment that cannot select a remote builder."""
+    result = dict(
+        safe_system_environment() if environment is None else environment
+    )
+    for key in tuple(result):
+        if key.startswith(DOCKER_SELECTOR_ENV_PREFIXES):
+            result.pop(key, None)
+    result["DOCKER_HOST"] = LOCAL_DOCKER_HOST
+    return result
+def safe_system_environment():
+    return {
+        "PATH": SAFE_SYSTEM_COMMAND_PATH,
+        "HOME": "/root",
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+
+
+def require_trusted_system_binary(binary):
+    binary = pathlib.Path(binary)
+    try:
+        metadata = binary.lstat()
+    except OSError as error:
+        raise CanaryError("trusted system command is unavailable") from error
+    if (
+        not binary.is_absolute()
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or not metadata.st_mode & stat.S_IXUSR
+    ):
+        raise CanaryError("trusted system command is unsafe")
+    return binary
+
+
+def require_local_docker_socket():
+    try:
+        metadata = DOCKER_SOCKET.lstat()
+    except OSError as error:
+        raise CanaryError("local Docker socket is unavailable") from error
+    if (
+        not stat.S_ISSOCK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o002
+    ):
+        raise CanaryError("local Docker socket is unsafe")
+
+
+def require_trusted_docker_binary():
+    try:
+        metadata = pathlib.Path(DOCKER_BINARY).lstat()
+    except OSError as error:
+        raise CanaryError("trusted Docker binary is unavailable") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or not metadata.st_mode & stat.S_IXUSR
+    ):
+        raise CanaryError("trusted Docker binary is unsafe")
 
 def load_private_env_parser():
     try:
@@ -84,6 +301,26 @@ def load_private_env_parser():
 
 
 def run_command(command, *, input_bytes=None, timeout=30, environment=None):
+    command = list(command)
+    # Runtime values arrive only through Compose's reviewed --env-file. Never
+    # inherit a root caller's process environment into any child command.
+    child_environment = safe_system_environment()
+    executable = str(command[0]) if command else ""
+    if executable == "docker":
+        command[0] = DOCKER_BINARY
+        executable = DOCKER_BINARY
+    if executable == DOCKER_BINARY:
+        require_trusted_docker_binary()
+        require_local_docker_socket()
+        child_environment = local_docker_environment(child_environment)
+    elif executable in {"git", GIT_BINARY}:
+        command[0] = GIT_BINARY
+        require_trusted_system_binary(GIT_BINARY)
+        child_environment = safe_system_environment()
+    elif executable in {"systemctl", SYSTEMCTL_BINARY}:
+        command[0] = SYSTEMCTL_BINARY
+        require_trusted_system_binary(SYSTEMCTL_BINARY)
+        child_environment = safe_system_environment()
     try:
         result = subprocess.run(
             command,
@@ -91,7 +328,7 @@ def run_command(command, *, input_bytes=None, timeout=30, environment=None):
             input=input_bytes,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            env=environment,
+            env=child_environment,
             timeout=timeout,
             check=False,
         )
@@ -508,17 +745,9 @@ def parse_private_env(path):
     return values
 
 
-def compose_environment(private_values):
-    # Compose receives runtime values only from the reviewed --env-file. Keep a
-    # minimal process environment so shell variables cannot silently override
-    # the private file or select a different project/context.
-    environment = {
-        key: os.environ[key]
-        for key in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
-        if key in os.environ
-    }
-    environment["DOCKER_HOST"] = "unix:///var/run/docker.sock"
-    return environment
+def compose_environment(_private_values):
+    # Compose receives runtime values only from the reviewed --env-file.
+    return local_docker_environment(safe_system_environment())
 
 
 def compose_command(env_file, profile, *arguments):
@@ -528,17 +757,11 @@ def compose_command(env_file, profile, *arguments):
     ]
 
 
-def require_apply_context(stdin):
-    if os.geteuid() != 0:
-        raise CanaryError("apply requires root")
-    if not stdin.isatty():
-        raise CanaryError("apply requires a private TTY")
-    try:
-        mode = DOCKER_SOCKET.stat().st_mode
-    except OSError as error:
-        raise CanaryError("local Docker socket is unavailable") from error
-    if not stat.S_ISSOCK(mode):
-        raise CanaryError("local Docker socket is invalid")
+def require_apply_context(stdin, stdout, stderr):
+    require_production_apply_context(
+        ROOT, streams=(stdin, stdout, stderr)
+    )
+    require_local_docker_socket()
 
 
 def require_storage_layout():
@@ -990,6 +1213,13 @@ def main(argv=None, *, runner=run_command, stdin=sys.stdin, stdout=sys.stdout, s
     options = parser().parse_args(argv)
     try:
         validate_contract()
+        requires_privileged_context = (
+            (options.apply and options.action != "check")
+            or options.action in {"status", "verify"}
+        )
+        if requires_privileged_context:
+            require_apply_context(stdin, stdout, stderr)
+
         if options.action == "check":
             if options.apply:
                 raise CanaryError("check mode does not accept --apply")
@@ -1000,7 +1230,6 @@ def main(argv=None, *, runner=run_command, stdin=sys.stdin, stdout=sys.stdout, s
             print(f"sync canary {options.action} dry-run passed; add --apply from a private root TTY to change services", file=stdout)
             return 0
 
-        require_apply_context(stdin)
         runner([str(CLEAN_WORKTREE)], timeout=15)
         if options.action == "prepare-image":
             prepare_sync_image(runner=runner)

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 import base64
 import getpass
 import hashlib
@@ -14,6 +14,30 @@ import sys
 
 WRANGLER_VERSION = "4.112.0"
 MAX_SECRET_LIST_BYTES = 64 * 1024
+TRUSTED_FILESYSTEM_ROOT = pathlib.Path("/")
+TRUSTED_RELEASE_ROOT = pathlib.Path("/opt/sub2api-gate-release")
+TRUSTED_RELEASE_PARENT = TRUSTED_RELEASE_ROOT.parent
+SECRET_INITIALIZER_SOURCE_RELATIVE_PATH = pathlib.Path(
+    "deploy/generate-worker-secrets.py"
+)
+RELEASE_GUARD_RELATIVE_PATH = pathlib.Path("deploy/require-clean-worktree.sh")
+RUNTIME_ATTESTOR_RELATIVE_PATH = pathlib.Path(
+    "deploy/worker-runtime-attestation.py"
+)
+TRUSTED_RELEASE_DIRECTORIES = (
+    pathlib.Path("deploy"),
+    pathlib.Path("worker-allow-ip"),
+)
+PRIVATE_WRANGLER_CONFIG_RELATIVE_PATH = pathlib.Path(
+    "worker-allow-ip/wrangler.private.jsonc"
+)
+SAFE_WRANGLER_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+NODE_BINARY = pathlib.Path("/usr/bin/node")
+PYTHON_BINARY = pathlib.Path("/usr/bin/python3")
+WRANGLER_ENTRY_RELATIVE_PATH = pathlib.Path(
+    "worker-allow-ip/node_modules/wrangler/bin/wrangler.js"
+)
+
 MANAGED_SECRET_NAMES = (
     "ADMIN_PASSWORD_PBKDF2",
     "CREDENTIAL_ENCRYPTION_KEY",
@@ -200,31 +224,174 @@ def destroy_hmac_state(state_path, expected_uid):
         os.close(descriptor)
 
 
-def require_ignored_state_path(repo_dir, state_path, runner=subprocess.run):
+def require_ignored_state_path(repo_dir, state_path, runner=subprocess.run, child_env=None):
     repo_dir = pathlib.Path(repo_dir).resolve()
     state_path = pathlib.Path(state_path).resolve(strict=False)
     try:
         relative = state_path.relative_to(repo_dir)
     except ValueError as error:
         raise SecretInitializationError("private HMAC state path must stay inside the repository") from error
+    options = {
+        "capture_output": True,
+        "text": True,
+        "check": False,
+    }
+    if child_env is not None:
+        options["env"] = child_env
     result = runner(
-        ["git", "-C", repo_dir, "check-ignore", "--quiet", "--", relative],
-        capture_output=True,
-        text=True,
-        check=False,
+        ["/usr/bin/git", "-C", repo_dir, "check-ignore", "--quiet", "--", relative],
+        **options,
     )
     if result.returncode != 0:
         raise SecretInitializationError("private HMAC state path is not ignored by Git")
 
 
-def build_wrangler_environment(source=None):
-    environment = dict(os.environ if source is None else source)
-    environment["WRANGLER_SEND_METRICS"] = "false"
-    environment["CLOUDFLARE_INCLUDE_PROCESS_ENV"] = "false"
-    environment["CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV"] = "false"
-    for secret_name in MANAGED_SECRET_NAMES:
-        environment.pop(secret_name, None)
-    return environment
+def build_wrangler_environment(_source=None):
+    """Return the complete, minimal environment for root-owned Wrangler calls."""
+    return {
+        "PATH": SAFE_WRANGLER_PATH,
+        "HOME": "/root",
+        "WRANGLER_SEND_METRICS": "false",
+        "CLOUDFLARE_INCLUDE_PROCESS_ENV": "false",
+        "CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV": "false",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+    }
+
+
+def _require_trusted_release_path(
+    path,
+    *,
+    expects_directory,
+    expects_executable=False,
+    expects_single_link=False,
+    expected_uid=0,
+    expected_gid=0,
+):
+    target = pathlib.Path(path)
+    try:
+        metadata = target.lstat()
+    except OSError as error:
+        raise SecretInitializationError("trusted Worker release path is unavailable") from error
+    if (
+        not target.is_absolute()
+        or stat.S_ISLNK(metadata.st_mode)
+        or (expects_directory and not stat.S_ISDIR(metadata.st_mode))
+        or (not expects_directory and not stat.S_ISREG(metadata.st_mode))
+        or metadata.st_uid != expected_uid
+        or metadata.st_gid != expected_gid
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or (expects_single_link and metadata.st_nlink != 1)
+        or (expects_executable and not metadata.st_mode & stat.S_IXUSR)
+    ):
+        raise SecretInitializationError("trusted Worker release path is unsafe")
+
+
+def _require_trusted_private_wrangler_config(path, *, expected_uid=0, expected_gid=0):
+    target = pathlib.Path(path)
+    try:
+        metadata = target.lstat()
+    except OSError as error:
+        raise SecretInitializationError("trusted private Wrangler config is unavailable") from error
+    if (
+        not target.is_absolute()
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or metadata.st_gid != expected_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+    ):
+        raise SecretInitializationError(
+            "trusted private Wrangler config must be a root-owned single-link mode-0600 regular file"
+        )
+
+
+def require_trusted_release_tree(
+    repo_dir,
+    wrangler_config,
+    *,
+    source_path=None,
+    release_guard=None,
+    trusted_root=None,
+    expected_uid=0,
+    expected_gid=0,
+):
+    repo_dir = pathlib.Path(repo_dir)
+    trusted_root = pathlib.Path(
+        TRUSTED_RELEASE_ROOT if trusted_root is None else trusted_root
+    )
+    if not trusted_root.is_absolute() or repo_dir != trusted_root:
+        raise SecretInitializationError(
+            "Worker Secret initialization requires the trusted production release tree"
+        )
+    source_path = (
+        pathlib.Path(__file__).absolute()
+        if source_path is None
+        else pathlib.Path(source_path)
+    )
+    expected_source = trusted_root / SECRET_INITIALIZER_SOURCE_RELATIVE_PATH
+    expected_guard = trusted_root / RELEASE_GUARD_RELATIVE_PATH
+    expected_attestor = trusted_root / RUNTIME_ATTESTOR_RELATIVE_PATH
+    expected_config = trusted_root / PRIVATE_WRANGLER_CONFIG_RELATIVE_PATH
+    if source_path != expected_source or pathlib.Path(release_guard or expected_guard) != expected_guard:
+        raise SecretInitializationError(
+            "Worker Secret initialization requires the trusted production release tree"
+        )
+    if pathlib.Path(wrangler_config) != expected_config:
+        raise SecretInitializationError(
+            "Worker Secret initialization does not accept a Wrangler config override"
+        )
+    for path, expects_directory, expects_executable, expects_single_link in (
+        (TRUSTED_FILESYSTEM_ROOT, True, False, False),
+        (trusted_root.parent, True, False, False),
+        (trusted_root, True, False, False),
+        *((trusted_root / value, True, False, False) for value in TRUSTED_RELEASE_DIRECTORIES),
+        (expected_source, False, False, True),
+        (expected_guard, False, True, True),
+        (expected_attestor, False, False, True),
+    ):
+        _require_trusted_release_path(
+            path,
+            expects_directory=expects_directory,
+            expects_executable=expects_executable,
+            expects_single_link=expects_single_link,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
+    _require_trusted_private_wrangler_config(
+        expected_config,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+
+
+def require_production_apply_context(
+    repo_dir, wrangler_config, *, release_guard=None, streams=None
+):
+    if os.geteuid() != 0 or repo_dir != TRUSTED_RELEASE_ROOT:
+        raise SecretInitializationError(
+            "Worker Secret initialization requires root from the trusted production release tree"
+        )
+    if streams is None:
+        streams = (sys.stdin, sys.stdout, sys.stderr)
+    try:
+        private_tty = all(stream.isatty() for stream in streams)
+    except (AttributeError, OSError, ValueError):
+        private_tty = False
+    if not private_tty:
+        raise SecretInitializationError(
+            "Worker Secret initialization requires a private interactive TTY"
+        )
+    if "SUB2API_WRANGLER_CONFIG" in os.environ:
+        raise SecretInitializationError(
+            "Worker Secret initialization does not accept a Wrangler config override"
+        )
+    require_trusted_release_tree(
+        repo_dir,
+        wrangler_config,
+        release_guard=release_guard,
+    )
 
 
 def load_managed_secret_names(manifest_path):
@@ -269,8 +436,8 @@ def parse_secret_names(raw):
 
 def read_remote_secret_names(runner, wrangler, wrangler_config, child_env):
     result = runner(
-        [wrangler, "secret", "list", "--format", "json", "--config", wrangler_config],
-        cwd=wrangler.parents[2],
+        [NODE_BINARY, wrangler, "secret", "list", "--format", "json", "--config", wrangler_config],
+        cwd=wrangler.parents[3],
         env=child_env,
         capture_output=True,
         text=True,
@@ -322,7 +489,12 @@ def initialize_missing_secrets(
     password_reader=getpass.getpass,
 ):
     managed = load_managed_secret_names(manifest_path)
-    runner([release_guard, "check"], check=True)
+    runner(
+        [release_guard, "check"],
+        cwd=release_guard.parent.parent,
+        env=child_env,
+        check=True,
+    )
 
     before = read_remote_secret_names(runner, wrangler, wrangler_config, child_env)
     missing = tuple(name for name in managed if name not in before)
@@ -360,8 +532,8 @@ def initialize_missing_secrets(
 
     serialized = json.dumps(payload, separators=(",", ":"))
     result = runner(
-        [wrangler, "secret", "bulk", "--config", wrangler_config],
-        cwd=wrangler.parents[2],
+        [NODE_BINARY, wrangler, "secret", "bulk", "--config", wrangler_config],
+        cwd=wrangler.parents[3],
         env=child_env,
         input=serialized,
         capture_output=True,
@@ -396,32 +568,46 @@ def main(argv=None):
             "rerun with --apply in a private terminal to initialize only missing managed Worker Secrets"
         )
         return 0
-    if not sys.stdin.isatty():
-        raise SecretInitializationError("--apply requires a private interactive terminal")
-    repo_dir = pathlib.Path(__file__).resolve().parents[1]
+    repo_dir = pathlib.Path(__file__).absolute().parents[1]
     worker_dir = repo_dir / "worker-allow-ip"
-    wrangler = worker_dir / "node_modules" / ".bin" / "wrangler"
-    wrangler_config = pathlib.Path(
-        os.environ.get("SUB2API_WRANGLER_CONFIG", worker_dir / "wrangler.private.jsonc")
-    )
+    wrangler = repo_dir / WRANGLER_ENTRY_RELATIVE_PATH
+    wrangler_config = repo_dir / PRIVATE_WRANGLER_CONFIG_RELATIVE_PATH
     manifest_path = worker_dir / "required-secrets.json"
-    release_guard = repo_dir / "deploy" / "require-clean-worktree.sh"
+    release_guard = repo_dir / RELEASE_GUARD_RELATIVE_PATH
+    runtime_attestor = repo_dir / RUNTIME_ATTESTOR_RELATIVE_PATH
     hmac_state_path = repo_dir / HMAC_STATE_RELATIVE_PATH
-    if not wrangler.is_file() or not os.access(wrangler, os.X_OK):
-        raise SecretInitializationError("locked local Wrangler binary is missing")
-    if not wrangler_config.is_file():
-        raise SecretInitializationError("private Wrangler config is missing")
+    require_production_apply_context(
+        repo_dir,
+        wrangler_config,
+        release_guard=release_guard,
+    )
+    child_env = build_wrangler_environment()
+    subprocess.run(
+        [release_guard, "check"],
+        cwd=repo_dir,
+        env=child_env,
+        check=True,
+    )
+    subprocess.run(
+        [PYTHON_BINARY, "-I", runtime_attestor, "verify"],
+        cwd=repo_dir,
+        env=child_env,
+        check=True,
+    )
+    if not wrangler.is_file() or wrangler.is_symlink():
+        raise SecretInitializationError("attested Wrangler entry is missing")
     version = subprocess.run(
-        [wrangler, "--version"],
+        [NODE_BINARY, wrangler, "--version"],
+        cwd=worker_dir,
+        env=child_env,
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
     if version != WRANGLER_VERSION:
         raise SecretInitializationError(f"locked Wrangler {WRANGLER_VERSION} is required")
-    require_ignored_state_path(repo_dir, hmac_state_path)
+    require_ignored_state_path(repo_dir, hmac_state_path, child_env=child_env)
 
-    child_env = build_wrangler_environment()
     initialized = initialize_missing_secrets(
         runner=subprocess.run,
         wrangler=wrangler,

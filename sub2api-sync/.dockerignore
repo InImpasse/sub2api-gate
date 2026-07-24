@@ -1,0 +1,8 @@
+# The sync release image copies only these reviewed inputs. Keep ignored local
+# environment files, tests, bytecode, and future tooling out of the build
+# context as well as out of the final image.
+*
+!Dockerfile
+!psql-wrapper.sh
+!sub2api_sync.py
+!usage_metadata.py

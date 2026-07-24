@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 set -eu
 
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 repo_dir="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 env_file="${SUB2API_ENV_FILE:-$repo_dir/.env}"
 wrangler_config="${SUB2API_WRANGLER_CONFIG:-$repo_dir/worker-allow-ip/wrangler.private.jsonc}"
 secret_manifest="$repo_dir/worker-allow-ip/required-secrets.json"
 private_env_parser="$repo_dir/deploy/private_env.py"
+
+run_sanitized() {
+  /usr/bin/env -i \
+    PATH="$PATH" \
+    PYTHONNOUSERSITE=1 \
+    "$@"
+}
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -53,7 +62,7 @@ declare -A values=()
 declare -A url_hostnames=()
 declare -A url_origins=()
 declare -a private_env_fields=()
-coproc PRIVATE_ENV_READER { python3 "$private_env_parser" --emit-nul "$env_file"; }
+coproc PRIVATE_ENV_READER { run_sanitized python3 "$private_env_parser" --emit-nul "$env_file"; }
 private_env_pid="$PRIVATE_ENV_READER_PID"
 private_env_fd="${PRIVATE_ENV_READER[0]}"
 while IFS= read -r -d '' private_env_field <&"$private_env_fd"; do
@@ -291,12 +300,15 @@ if [ -e "$cutover_state" ] || [ -L "$cutover_state" ]; then
 fi
 require_storage_free_space
 require_no_active_swap
-if ! SUB2API_DATA_ROOT="${values[SUB2API_DATA_ROOT]-}" \
+if ! /usr/bin/env -i \
+  PATH="$PATH" \
+  PYTHONNOUSERSITE=1 \
+  SUB2API_DATA_ROOT="${values[SUB2API_DATA_ROOT]-}" \
   python3 "$repo_dir/deploy/verify-runtime-privacy.py" check >/dev/null; then
   echo "PostgreSQL log residue preflight failed" >&2
   failed=1
 fi
-if ! python3 "$repo_dir/deploy/verify-nginx-core-dumps.py" verify >/dev/null 2>&1; then
+if ! run_sanitized python3 "$repo_dir/deploy/verify-nginx-core-dumps.py" verify >/dev/null 2>&1; then
   echo "Nginx core-dump preflight failed" >&2
   failed=1
 fi
@@ -453,7 +465,7 @@ if [ -f "${values[SUB2API_DATA_ROOT]-}/redis/nonce-users.acl" ]; then
   fi
 fi
 
-if ! node "$repo_dir/deploy/validate-wrangler-config.mjs" \
+if ! run_sanitized node "$repo_dir/deploy/validate-wrangler-config.mjs" \
   "$wrangler_config" "$secret_manifest" "${url_hostnames[SUB2API_LOGIN_URL]-}"; then
   failed=1
 fi

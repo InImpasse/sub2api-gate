@@ -226,7 +226,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertNotIn('--dbname="$SUB2API_DATABASE_URL"', script)
         self.assertNotIn('PGDATABASE="$SUB2API_DATABASE_URL"', script)
         self.assertIn(
-            'python3 "$pg_env_exec" --target-private-env-file "$env_file"', script
+            '"$PYTHON3" -I "$pg_env_exec" --target-private-env-file "$env_file"', script
         )
         self.assertIn('source_pg_exec="$repo_dir/deploy/source-postgres-exec.py"', script)
         self.assertIn("--source-app-container", script)
@@ -234,7 +234,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("--source-postgres-container", script)
         self.assertIn("--source-postgres-id", script)
         self.assertIn("privacy_deadline_seconds=300", script)
-        self.assertIn("timeout --foreground -s TERM -k 5", script)
+        self.assertIn('"$TIMEOUT" --foreground -s TERM -k 5', script)
         self.assertIn("lock_timeout=5000", script)
         self.assertIn("statement_timeout=30000", script)
         self.assertIn("statement_timeout=180000", script)
@@ -286,11 +286,11 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertTrue(MIGRATION_TOTP.exists())
         self.assertIn("reads the administrator TOTP secret", DEPLOYMENT)
         self.assertIn("never pass either value through arguments or environment variables", DEPLOYMENT)
-        self.assertIn('python3 "$repo_dir/deploy/verify-migration-totp.py"', script)
-        verifier_index = script.index('python3 "$repo_dir/deploy/verify-migration-totp.py"')
+        self.assertIn('"$PYTHON3" -I "$repo_dir/deploy/verify-migration-totp.py"', script)
+        verifier_index = script.index('"$PYTHON3" -I "$repo_dir/deploy/verify-migration-totp.py"')
         self.assertLess(
             verifier_index,
-            script.index('python3 "$source_pg_exec"'),
+            script.index('"$PYTHON3" -I "$source_pg_exec"'),
         )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -335,18 +335,20 @@ class DeploymentConfigTests(unittest.TestCase):
         # A dirty release tree is now rejected before any interactive TOTP
         # input. In a clean release tree the verifier remains the next gate.
         self.assertTrue(
-            "interactive TTY" in result.stderr
+            "requires root" in result.stderr
+            or "interactive TTY" in result.stderr
             or "Git worktree is dirty" in result.stderr
         )
         self.assertFalse(psql_called)
 
     def test_privacy_apply_loads_only_the_private_source_after_totp(self):
         script = MIGRATION_RUNNER.read_text()
-        totp_call = 'python3 "$repo_dir/deploy/verify-migration-totp.py" verify'
-        source_loader = 'python3 "$source_pg_exec"'
+        totp_call = '"$PYTHON3" -I "$repo_dir/deploy/verify-migration-totp.py" verify'
+        source_loader = '"$PYTHON3" -I "$source_pg_exec"'
 
         self.assertIn("privacy --apply requires the private file", script)
         self.assertIn(totp_call, script)
+        self.assertEqual(script.count(totp_call), 1)
         self.assertIn(source_loader, script)
         self.assertLess(script.index(totp_call), script.index(source_loader))
         privacy_case = script[script.index("case \"$target\" in", script.index("run_sql()")):]
@@ -620,7 +622,11 @@ class DeploymentConfigTests(unittest.TestCase):
             main.index('mode != "--apply"'),
             main.index("initialize_missing_secrets("),
         )
-        self.assertIn("if not sys.stdin.isatty()", main)
+        self.assertIn("require_production_apply_context(", main)
+        self.assertLess(
+            main.index("require_production_apply_context("),
+            main.index("initialize_missing_secrets("),
+        )
         self.assertIn("no secret was generated", script)
 
     def test_security_preflight_is_local_read_only_and_fail_closed(self):

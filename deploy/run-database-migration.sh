@@ -1,9 +1,88 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
+readonly SAFE_COMMAND_PATH='/usr/sbin:/usr/bin:/sbin:/bin'
+readonly PYTHON3='/usr/bin/python3'
+readonly SHA256SUM='/usr/bin/sha256sum'
+readonly TIMEOUT='/usr/bin/timeout'
+readonly READLINK='/usr/bin/readlink'
+readonly STAT='/usr/bin/stat'
+readonly BASH='/bin/bash'
+readonly TRUSTED_RELEASE_ROOT='/opt/sub2api-gate-release'
+readonly TRUSTED_RELEASE_PARENT='/opt'
+readonly TRUSTED_CONTROLLER="$TRUSTED_RELEASE_ROOT/deploy/run-database-migration.sh"
+readonly TRUSTED_CLEAN_WORKTREE="$TRUSTED_RELEASE_ROOT/deploy/require-clean-worktree.sh"
+
+export PATH="$SAFE_COMMAND_PATH"
+export LANG='C'
+export LC_ALL='C'
+export TZ='UTC'
+unset BASH_ENV ENV CDPATH LD_PRELOAD LD_LIBRARY_PATH PYTHONHOME PYTHONPATH PYTHONSTARTUP \
+  GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
+  GIT_CONFIG_NOSYSTEM
+IFS=$' \t\n'
+
+release_failure() {
+  echo 'database migration apply requires the trusted production release tree' >&2
+  exit 1
+}
+
+require_trusted_path() {
+  local path="$1"
+  local kind="$2"
+  local ownership owner group permissions mode_value
+
+  [ ! -L "$path" ] && [ -e "$path" ] || release_failure
+  case "$kind" in
+    directory) [ -d "$path" ] || release_failure ;;
+    regular) [ -f "$path" ] || release_failure ;;
+    *) release_failure ;;
+  esac
+  ownership="$("$STAT" -c '%u:%g:%a' -- "$path")" || release_failure
+  IFS=: read -r owner group permissions <<<"$ownership"
+  case "$owner:$group:$permissions" in
+    0:0:[0-7][0-7][0-7][0-7]|0:0:[0-7][0-7][0-7]) ;;
+    *) release_failure ;;
+  esac
+  mode_value=$((8#$permissions))
+  (( (mode_value & 18) == 0 )) || release_failure
+}
+
+require_production_apply_context() {
+  local source_path
+
+  if [ "$EUID" -ne 0 ]; then
+    echo 'database migration apply requires root' >&2
+    exit 1
+  fi
+  if ! { [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; }; then
+    echo 'database migration apply requires a private interactive TTY' >&2
+    exit 1
+  fi
+  source_path="$("$READLINK" -f -- "${BASH_SOURCE[0]}")" || release_failure
+  [ "$repo_dir" = "$TRUSTED_RELEASE_ROOT" ] \
+    && [ "$source_path" = "$TRUSTED_CONTROLLER" ] || release_failure
+  for trusted_path in / "$TRUSTED_RELEASE_PARENT" "$TRUSTED_RELEASE_ROOT" \
+    "$TRUSTED_RELEASE_ROOT/deploy" "$TRUSTED_CONTROLLER" "$TRUSTED_CLEAN_WORKTREE"; do
+    case "$trusted_path" in
+      /|"$TRUSTED_RELEASE_PARENT"|"$TRUSTED_RELEASE_ROOT"|"$TRUSTED_RELEASE_ROOT/deploy")
+        require_trusted_path "$trusted_path" directory
+        ;;
+      *) require_trusted_path "$trusted_path" regular ;;
+    esac
+  done
+  "$BASH" "$TRUSTED_CLEAN_WORKTREE" check
+}
+
+script_source="${BASH_SOURCE[0]}"
+script_directory="${script_source%/*}"
+if [ "$script_directory" = "$script_source" ]; then
+  script_directory='.'
+fi
+repo_dir="$(cd -P -- "$script_directory/.." && pwd -P)"
 target="${1:-}"
 mode="${2:-check}"
-repo_dir="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 pg_env_exec="$repo_dir/deploy/pg-env-exec.py"
 source_pg_exec="$repo_dir/deploy/source-postgres-exec.py"
 runtime_logging_gate="$repo_dir/deploy/verify-postgres-runtime-logging.sql"
@@ -98,10 +177,24 @@ if [ "$target" != "privacy" ] && [ -n "$source_identity_arguments" ]; then
   exit 2
 fi
 
+if [ "$mode" = "--apply" ]; then
+  if [ -z "$env_file" ]; then
+    echo "every database migration --apply requires --env-file" >&2
+    exit 1
+  fi
+  if [ "$target" = "privacy" ] && { [ -z "$source_app_container" ] \
+    || [ -z "$source_app_id" ] || [ -z "$source_postgres_container" ] \
+    || [ -z "$source_postgres_id" ]; }; then
+    echo "privacy --apply requires the private file and exact source container identities" >&2
+    exit 1
+  fi
+  require_production_apply_context
+fi
+
 echo "database migration target: $target"
 echo "mode: $mode"
 for relative_path in $files; do
-  sha256sum "$repo_dir/$relative_path"
+  "$SHA256SUM" "$repo_dir/$relative_path"
 done
 
 if [ "$mode" != "--apply" ]; then
@@ -116,23 +209,10 @@ if [ "$mode" != "--apply" ]; then
   exit 0
 fi
 
-if [ -z "$env_file" ]; then
-  echo "every database migration --apply requires --env-file" >&2
-  exit 1
-fi
-
-"$repo_dir/deploy/require-clean-worktree.sh" check
-
 if [ "$target" = "privacy" ]; then
-  if [ -z "$env_file" ] || [ -z "$source_app_container" ] \
-    || [ -z "$source_app_id" ] || [ -z "$source_postgres_container" ] \
-    || [ -z "$source_postgres_id" ]; then
-    echo "privacy --apply requires the private file and exact source container identities" >&2
-    exit 1
-  fi
-  python3 "$repo_dir/deploy/verify-migration-totp.py" verify
+  "$PYTHON3" -I "$repo_dir/deploy/verify-migration-totp.py" verify
   database_exec=(
-    python3 "$source_pg_exec"
+    "$PYTHON3" -I "$source_pg_exec"
     --env-file "$env_file"
     --source-app-container "$source_app_container"
     --source-app-id "$source_app_id"
@@ -142,7 +222,7 @@ if [ "$target" = "privacy" ]; then
   )
   privacy_started_at=$SECONDS
 else
-  database_exec=(python3 "$pg_env_exec" --target-private-env-file "$env_file")
+  database_exec=("$PYTHON3" -I "$pg_env_exec" --target-private-env-file "$env_file")
 fi
 
 privacy_guard_options='-c lock_timeout=5000 -c statement_timeout=30000 -c idle_in_transaction_session_timeout=30000'
@@ -161,7 +241,7 @@ privacy_remaining_seconds() {
 run_privacy_bounded() {
   local remaining
   remaining="$(privacy_remaining_seconds)" || return 1
-  timeout --foreground -s TERM -k 5 "$remaining" "$@"
+  "$TIMEOUT" --foreground -s TERM -k 5 "$remaining" "$@"
 }
 
 run_source_sql() {

@@ -56,6 +56,7 @@ class NginxAopConfigTests(unittest.TestCase):
         config = NGINX.read_text()
         upstream = config.split("upstream sub2api_backend {", 1)[1].split("}", 1)[0]
         v1 = config.split("location ^~ /v1/ {", 1)[1].split("}", 1)[0]
+        general = config.rsplit("location / {", 1)[1].split("}", 1)[0]
         self.assertIn(
             "include /etc/nginx/snippets/sub2api-upstream-active.conf;", upstream
         )
@@ -65,6 +66,11 @@ class NginxAopConfigTests(unittest.TestCase):
         self.assertNotIn("3021", v1)
         self.assertNotIn("mirror", v1.lower())
         self.assertNotIn("capture", v1.lower())
+        for proxy_location in (v1, general, SYNC_LOCATION.read_text()):
+            self.assertIn(
+                "include /etc/nginx/snippets/cloudflare-only.conf;",
+                proxy_location,
+            )
 
     def test_cloudflare_peer_check_survives_real_ip_restoration(self):
         config = NGINX.read_text()
@@ -127,6 +133,43 @@ class NginxAopInstallerTests(unittest.TestCase):
         )
         self.assertNotIn("LC_ALL=C openssl", installer)
         self.assertNotIn("$(openssl ", installer)
+
+    def test_test_mode_root_guard_precedes_path_selected_executables(self):
+        installer = INSTALLER.read_text()
+        root_guard = 'if [ "$test_mode" = "1" ] && [ "$EUID" -eq 0 ]; then'
+        self.assertIn(root_guard, installer)
+        for executable_lookup in (
+            'env_bin="$(command -v env)"',
+            'openssl_bin="$(command -v openssl)"',
+            'nginx_bin="$(command -v nginx)"',
+            'systemctl_bin="$(command -v systemctl)"',
+            'flock_bin="$(command -v flock)"',
+            'curl_bin="$(command -v curl)"',
+        ):
+            self.assertLess(installer.index(root_guard), installer.index(executable_lookup))
+
+    def test_test_mode_rejects_root_or_canonical_production_nginx_root(self):
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "SUB2API_AOP_TEST_MODE": "1",
+            "SUB2API_NGINX_ROOT": "/etc/../etc/nginx",
+        }
+        result = subprocess.run(
+            ["bash", str(INSTALLER), "check"],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        expected_error = (
+            "test mode may not run as root"
+            if os.geteuid() == 0
+            else "test mode may not target the production Nginx root"
+        )
+        self.assertIn(expected_error, result.stderr)
 
     def make_fake_commands(
         self,

@@ -52,6 +52,14 @@ class FakeOpener:
         return FakeResponse(response)
 
 
+class FakeTTY:
+    def __init__(self, is_tty=True):
+        self._is_tty = is_tty
+
+    def isatty(self):
+        return self._is_tty
+
+
 class CloudflareAopApiTests(unittest.TestCase):
     def test_api_token_is_canonical_and_bounded_before_any_request(self):
         for token in ("short", "t" * 513, "t" * 20 + "\r\nInjected: yes"):
@@ -479,20 +487,105 @@ class CloudflareAopCertificateTests(unittest.TestCase):
             ),
             source.index("import ssl"),
         )
-        self.assertIn("if not sys.stdin.isatty()", source)
-        self.assertIn("if os.geteuid() != 0", source)
+        self.assertIn("TRUSTED_RELEASE_ROOT = pathlib.Path", source)
+        self.assertIn(
+            "stdin.isatty() and stdout.isatty() and stderr.isatty()", source
+        )
+        self.assertIn("require_production_apply_context(", source)
         self.assertIn("sanitize_privileged_environment()", source)
         self.assertLess(
             source.index("sanitize_privileged_environment()", source.index("def main")),
             source.index('getpass.getpass("One-time Cloudflare AOP API token: ")'),
         )
-        self.assertIn('"require-clean-worktree.sh", "check"', source)
+        self.assertIn("RELEASE_GUARD_RELATIVE_PATH", source)
         self.assertLess(
             source.index("require_ephemeral_secret_runtime()"),
             source.index('getpass.getpass("One-time Cloudflare AOP API token: ")'),
         )
         self.assertNotIn("CLOUDFLARE_API_TOKEN", source)
         self.assertEqual(AOP.API_BASE, "https://api.cloudflare.com/client/v4")
+
+    def test_apply_context_requires_canonical_sources_and_all_private_ttys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trusted_root = pathlib.Path(directory) / "sub2api-gate-release"
+            source = trusted_root / "deploy" / "configure-cloudflare-aop.py"
+            release_guard = trusted_root / "deploy" / "require-clean-worktree.sh"
+            installer = trusted_root / "deploy" / "install-nginx-aop.sh"
+            optional_snippet = (
+                trusted_root / "nginx" / "snippets" / "sub2api-aop-optional.conf"
+            )
+            for path in (
+                trusted_root,
+                trusted_root / "deploy",
+                trusted_root / "nginx",
+                trusted_root / "nginx" / "snippets",
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+                path.chmod(0o755)
+            for path in (source, release_guard, installer):
+                path.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+                path.chmod(0o755)
+            optional_snippet.write_text("ssl_verify_client optional;\n", encoding="ascii")
+            optional_snippet.chmod(0o644)
+
+            with mock.patch.object(AOP, "TRUSTED_RELEASE_ROOT", trusted_root):
+                AOP.require_trusted_release_tree(
+                    trusted_root,
+                    source_path=source,
+                    expected_uid=os.getuid(),
+                )
+                outside_source = trusted_root / "deploy" / "other.py"
+                outside_source.write_text("pass\n", encoding="ascii")
+                outside_source.chmod(0o644)
+                with self.assertRaisesRegex(
+                    AOP.AopError, "outside the trusted release tree"
+                ):
+                    AOP.require_trusted_release_tree(
+                        trusted_root,
+                        source_path=outside_source,
+                        expected_uid=os.getuid(),
+                    )
+
+        with mock.patch.object(AOP, "TRUSTED_RELEASE_ROOT", ROOT), \
+             mock.patch.object(AOP.os, "geteuid", return_value=0), \
+             mock.patch.object(AOP, "require_trusted_release_tree") as trusted_tree:
+            with self.assertRaisesRegex(AOP.AopError, "private interactive TTY"):
+                AOP.require_production_apply_context(
+                    ROOT,
+                    streams=(FakeTTY(), FakeTTY(False), FakeTTY()),
+                )
+            trusted_tree.assert_not_called()
+
+            AOP.require_production_apply_context(
+                ROOT,
+                streams=(FakeTTY(), FakeTTY(), FakeTTY()),
+            )
+            trusted_tree.assert_called_once_with(ROOT)
+
+        original_environment = os.environ.copy()
+        with mock.patch.dict(os.environ, original_environment, clear=True), \
+             mock.patch.object(AOP.os, "geteuid", return_value=0), \
+             mock.patch.object(AOP.sys, "stdin", FakeTTY()), \
+             mock.patch.object(AOP.sys, "stdout", FakeTTY()), \
+             mock.patch.object(AOP.sys, "stderr", FakeTTY()), \
+             mock.patch.object(AOP.getpass, "getpass") as token_reader, \
+             mock.patch.object(AOP.subprocess, "run") as runner:
+            with self.assertRaisesRegex(
+                AOP.AopError, "trusted production release tree"
+            ):
+                AOP.main([
+                    "--apply",
+                    "--stage",
+                    "upload",
+                    "--zone-id",
+                    ZONE_ID,
+                    "--hostname",
+                    HOSTNAME,
+                ])
+            self.assertEqual(os.environ["PATH"], AOP.SAFE_COMMAND_PATH)
+        self.assertEqual(dict(os.environ), original_environment)
+        token_reader.assert_not_called()
+        runner.assert_not_called()
 
     def test_legacy_one_step_apply_is_rejected_before_token_or_network(self):
         with mock.patch.object(AOP.getpass, "getpass") as getpass_mock:
