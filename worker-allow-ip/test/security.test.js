@@ -11,9 +11,7 @@ import { findInvite } from "../src/admin.js";
 import { fetchWithTimeout } from "../src/request-security.js";
 
 const TEST_ADMIN_TOTP_SECRET = "JBSWY3DPEHPK3PXP";
-const TEST_ADMIN_TOTP_SECRET_ALIAS = "JBSWY3DPEHPK3PXPA";
 const TEST_NEXT_TOTP_SECRET = "KRUGS4ZANFZSAYJA";
-const TEST_REPLACEMENT_TOTP_SECRET = "GEZDGNBVGY3TQOJQ";
 const TEST_ADMIN_SESSION_BINDING_KEY = "h".repeat(32);
 const ADMIN_SOURCE = readFileSync(new URL("../src/admin.js", import.meta.url), "utf8");
 
@@ -600,20 +598,14 @@ test("admin configuration rejects HTTP and unapproved Sub2API URLs", () => {
     adminTest.getAdminSetupError({ ...valid, ADMIN_TOTP_SECRET: "invalid-characters!" }),
     /Base32/,
   );
-  assert.match(
+  assert.equal(
     adminTest.getAdminSetupError({
       ...valid,
       ADMIN_TOTP_SECRET_NEXT: "invalid-characters!",
       ADMIN_TOTP_ROTATION_PHASE: "stage",
     }),
-    /ADMIN_TOTP_SECRET_NEXT.*Base32/,
+    "",
   );
-  assert.match(adminTest.getAdminSetupError({ ...valid, ADMIN_TOTP_SECRET_NEXT: TEST_NEXT_TOTP_SECRET }), /configured together/);
-  assert.match(adminTest.getAdminSetupError({ ...valid, ADMIN_TOTP_ROTATION_PHASE: "stage" }), /configured together/);
-  assert.match(adminTest.getAdminSetupError({ ...valid, ADMIN_TOTP_SECRET_NEXT: TEST_NEXT_TOTP_SECRET, ADMIN_TOTP_ROTATION_PHASE: "unknown" }), /exactly stage or promoted/);
-  assert.match(adminTest.getAdminSetupError({ ...valid, ADMIN_TOTP_SECRET_NEXT: TEST_ADMIN_TOTP_SECRET_ALIAS, ADMIN_TOTP_ROTATION_PHASE: "stage" }), /requires a distinct/);
-  assert.match(adminTest.getAdminSetupError({ ...valid, ADMIN_TOTP_SECRET_NEXT: TEST_NEXT_TOTP_SECRET, ADMIN_TOTP_ROTATION_PHASE: "promoted" }), /requires ADMIN_TOTP_SECRET_NEXT to match/);
-  assert.equal(adminTest.getAdminSetupError({ ...valid, ADMIN_TOTP_SECRET_NEXT: TEST_ADMIN_TOTP_SECRET_ALIAS, ADMIN_TOTP_ROTATION_PHASE: "promoted" }), "");
   assert.match(
     adminTest.getAdminSetupError({
       ...valid,
@@ -1556,41 +1548,38 @@ test("TOTP step-up accepts the current code and rejects an invalid code", async 
   }
 });
 
-test("staged admin TOTP accepts both seeds only while the next seed is configured", async () => {
+test("final Worker accepts only the canonical TOTP while staging Secrets remain", async () => {
   const originalNow = Date.now;
   const fixedNow = Date.parse("2026-07-23T12:00:00Z");
   Date.now = () => fixedNow;
   try {
     const counter = Math.floor(fixedNow / 1000 / 30);
     const canonicalCode = await adminTest.totp(TEST_ADMIN_TOTP_SECRET, counter);
-    const stagedCode = await adminTest.totp(TEST_NEXT_TOTP_SECRET, counter);
-    assert.notEqual(canonicalCode, stagedCode);
-    const stagedEnv = {
+    const temporaryCode = await adminTest.totp(TEST_NEXT_TOTP_SECRET, counter);
+    assert.notEqual(canonicalCode, temporaryCode);
+    const envWithStagingSecrets = {
       ADMIN_TOTP_SECRET: TEST_ADMIN_TOTP_SECRET,
       ADMIN_TOTP_SECRET_NEXT: TEST_NEXT_TOTP_SECRET,
       ADMIN_TOTP_ROTATION_PHASE: "stage",
     };
 
-    assert.equal(await adminTest.verifyAdminTotp(stagedEnv, canonicalCode), true);
-    assert.equal(await adminTest.verifyAdminTotp(stagedEnv, stagedCode), true);
-    assert.equal(
-      await adminTest.verifyAdminTotp({ ADMIN_TOTP_SECRET: TEST_ADMIN_TOTP_SECRET }, stagedCode),
-      false,
-    );
+    assert.equal(await adminTest.verifyAdminTotp(envWithStagingSecrets, canonicalCode), true);
+    assert.equal(await adminTest.verifyAdminTotp(envWithStagingSecrets, temporaryCode), false);
 
     const form = new FormData();
-    form.set("step_up_token", stagedCode);
-    await assert.doesNotReject(adminTest.requireStepUpTotp(form, stagedEnv));
+    form.set("step_up_token", temporaryCode);
     await assert.rejects(
-      adminTest.requireStepUpTotp(form, { ADMIN_TOTP_SECRET: TEST_ADMIN_TOTP_SECRET }),
+      adminTest.requireStepUpTotp(form, envWithStagingSecrets),
       /valid 2FA code/,
     );
+    form.set("step_up_token", canonicalCode);
+    await assert.doesNotReject(adminTest.requireStepUpTotp(form, envWithStagingSecrets));
   } finally {
     Date.now = originalNow;
   }
 });
 
-test("administrator TOTP rotation accepts only the approved seed set at each transition", async () => {
+test("administrator TOTP follows canonical secret replacement", async () => {
   const originalNow = Date.now;
   const fixedNow = Date.parse("2026-07-23T12:00:00Z");
   Date.now = () => fixedNow;
@@ -1598,79 +1587,52 @@ test("administrator TOTP rotation accepts only the approved seed set at each tra
     const counter = Math.floor(fixedNow / 1000 / 30);
     const oldCode = await adminTest.totp(TEST_ADMIN_TOTP_SECRET, counter);
     const newCode = await adminTest.totp(TEST_NEXT_TOTP_SECRET, counter);
-    const oldOnly = { ADMIN_TOTP_SECRET: TEST_ADMIN_TOTP_SECRET };
-    const staged = {
-      ADMIN_TOTP_SECRET: TEST_ADMIN_TOTP_SECRET,
-      ADMIN_TOTP_SECRET_NEXT: TEST_NEXT_TOTP_SECRET,
-      ADMIN_TOTP_ROTATION_PHASE: "stage",
-    };
-    const promoted = {
+    const oldCanonical = { ADMIN_TOTP_SECRET: TEST_ADMIN_TOTP_SECRET };
+    const newCanonicalWithStagingSecrets = {
       ADMIN_TOTP_SECRET: TEST_NEXT_TOTP_SECRET,
-      ADMIN_TOTP_SECRET_NEXT: TEST_NEXT_TOTP_SECRET,
+      ADMIN_TOTP_SECRET_NEXT: TEST_ADMIN_TOTP_SECRET,
       ADMIN_TOTP_ROTATION_PHASE: "promoted",
     };
-    const final = { ADMIN_TOTP_SECRET: TEST_NEXT_TOTP_SECRET };
-    assert.equal(await adminTest.verifyAdminTotp(oldOnly, oldCode), true);
-    assert.equal(await adminTest.verifyAdminTotp(oldOnly, newCode), false);
-    assert.equal(await adminTest.verifyAdminTotp(staged, oldCode), true);
-    assert.equal(await adminTest.verifyAdminTotp(staged, newCode), true);
-    assert.equal(await adminTest.verifyAdminTotp(promoted, oldCode), false);
-    assert.equal(await adminTest.verifyAdminTotp(promoted, newCode), true);
-    assert.equal(await adminTest.verifyAdminTotp(final, oldCode), false);
-    assert.equal(await adminTest.verifyAdminTotp(final, newCode), true);
+    assert.equal(await adminTest.verifyAdminTotp(oldCanonical, oldCode), true);
+    assert.equal(await adminTest.verifyAdminTotp(oldCanonical, newCode), false);
+    assert.equal(await adminTest.verifyAdminTotp(newCanonicalWithStagingSecrets, oldCode), false);
+    assert.equal(await adminTest.verifyAdminTotp(newCanonicalWithStagingSecrets, newCode), true);
   } finally {
     Date.now = originalNow;
   }
 });
 
-test("administrator TOTP rotation phase contract rejects ambiguous seed sets", () => {
+test("administrator TOTP configuration is canonical-only", () => {
   const canonical = { ADMIN_TOTP_SECRET: TEST_ADMIN_TOTP_SECRET };
-  const alias = { ...canonical, ADMIN_TOTP_SECRET_NEXT: TEST_ADMIN_TOTP_SECRET_ALIAS };
   assert.deepEqual(adminTest.configuredAdminTotpSecrets(canonical), [TEST_ADMIN_TOTP_SECRET]);
-  assert.throws(() => adminTest.configuredAdminTotpSecrets({ ...canonical, ADMIN_TOTP_SECRET_NEXT: TEST_NEXT_TOTP_SECRET }), /configured together/);
-  assert.throws(() => adminTest.configuredAdminTotpSecrets({ ...canonical, ADMIN_TOTP_ROTATION_PHASE: "stage" }), /configured together/);
-  assert.throws(() => adminTest.configuredAdminTotpSecrets({ ...canonical, ADMIN_TOTP_SECRET_NEXT: TEST_NEXT_TOTP_SECRET, ADMIN_TOTP_ROTATION_PHASE: "unknown" }), /exactly stage or promoted/);
-  assert.throws(() => adminTest.configuredAdminTotpSecrets({ ...alias, ADMIN_TOTP_ROTATION_PHASE: "stage" }), /requires a distinct/);
-  assert.throws(() => adminTest.configuredAdminTotpSecrets({ ...canonical, ADMIN_TOTP_SECRET_NEXT: TEST_NEXT_TOTP_SECRET, ADMIN_TOTP_ROTATION_PHASE: "promoted" }), /requires ADMIN_TOTP_SECRET_NEXT to match/);
-  assert.deepEqual(adminTest.configuredAdminTotpSecrets({ ...alias, ADMIN_TOTP_ROTATION_PHASE: "promoted" }), [TEST_ADMIN_TOTP_SECRET]);
+  assert.deepEqual(
+    adminTest.configuredAdminTotpSecrets({
+      ...canonical,
+      ADMIN_TOTP_SECRET_NEXT: TEST_NEXT_TOTP_SECRET,
+      ADMIN_TOTP_ROTATION_PHASE: "stage",
+    }),
+    [TEST_ADMIN_TOTP_SECRET],
+  );
 });
 
-test("administrator session binding changes at every TOTP rotation transition", async () => {
-  const oldOnly = await adminSessionTotpBinding(TEST_ADMIN_TOTP_SECRET);
-  const staged = await adminSessionTotpBinding(
-    TEST_ADMIN_TOTP_SECRET,
-    TEST_NEXT_TOTP_SECRET,
-    "stage",
-  );
-  const promoted = await adminSessionTotpBinding(
-    TEST_NEXT_TOTP_SECRET,
-    TEST_NEXT_TOTP_SECRET,
-    "promoted",
-  );
-  const final = await adminSessionTotpBinding(TEST_NEXT_TOTP_SECRET);
+test("administrator session binding changes when the canonical TOTP secret changes", async () => {
+  const oldCanonical = await adminSessionTotpBinding(TEST_ADMIN_TOTP_SECRET);
+  const newCanonical = await adminSessionTotpBinding(TEST_NEXT_TOTP_SECRET);
 
-  assert.notEqual(oldOnly, staged);
-  assert.notEqual(staged, promoted);
-  assert.notEqual(promoted, final);
+  assert.notEqual(oldCanonical, newCanonical);
 });
 
 test("administrator session binding is HMAC-keyed and rejects short keys", async () => {
   const binding = await adminTest.adminSessionTotpBinding(
     TEST_ADMIN_TOTP_SECRET,
-    "",
-    "",
     TEST_ADMIN_SESSION_BINDING_KEY,
   );
   const repeat = await adminTest.adminSessionTotpBinding(
     TEST_ADMIN_TOTP_SECRET,
-    "",
-    "",
     TEST_ADMIN_SESSION_BINDING_KEY,
   );
   const otherKey = await adminTest.adminSessionTotpBinding(
     TEST_ADMIN_TOTP_SECRET,
-    "",
-    "",
     "k".repeat(32),
   );
 
@@ -1680,35 +1642,13 @@ test("administrator session binding is HMAC-keyed and rejects short keys", async
   await assert.rejects(
     adminTest.adminSessionTotpBinding(
       TEST_ADMIN_TOTP_SECRET,
-      "",
-      "",
       "s".repeat(31),
     ),
     /INVITE_ACCESS_HMAC_KEY must be at least 32 characters/,
   );
 });
 
-test("admin session binding changes for staged seed addition, replacement, and removal", async () => {
-  const canonicalOnly = await adminSessionTotpBinding(TEST_ADMIN_TOTP_SECRET);
-  const staged = await adminSessionTotpBinding(
-    TEST_ADMIN_TOTP_SECRET,
-    TEST_NEXT_TOTP_SECRET,
-    "stage",
-  );
-  const replaced = await adminSessionTotpBinding(
-    TEST_ADMIN_TOTP_SECRET,
-    TEST_REPLACEMENT_TOTP_SECRET,
-    "stage",
-  );
-  const removed = await adminSessionTotpBinding(TEST_ADMIN_TOTP_SECRET);
-
-  assert.notEqual(canonicalOnly, staged);
-  assert.notEqual(staged, replaced);
-  assert.notEqual(replaced, removed);
-  assert.equal(removed, canonicalOnly);
-});
-
-test("adding a staged TOTP seed revokes sessions bound to the prior secret set", async () => {
+test("temporary rotation Secrets do not invalidate canonical-bound sessions", async () => {
   const token = "prior-set-bound-session";
   const key = `session:${await sha256Hex(token)}`;
   const values = new Map([[
@@ -1724,11 +1664,11 @@ test("adding a staged TOTP seed revokes sessions bound to the prior secret set",
   }), env);
 
   assert.equal(response.status, 200);
-  assert.match(await response.text(), /Admin sign in/);
-  assert.equal(values.has(key), false);
+  assert.match(await response.text(), /UUID Admin/);
+  assert.equal(values.has(key), true);
 });
 
-test("admin login persists the active canonical and staged TOTP binding", async () => {
+test("admin login persists the canonical TOTP binding while temporary Secrets remain", async () => {
   const values = new Map();
   const env = validAdminEnv(memoryKv(values));
   env.ADMIN_TOTP_SECRET_NEXT = TEST_NEXT_TOTP_SECRET;
@@ -1743,7 +1683,7 @@ test("admin login persists the active canonical and staged TOTP binding", async 
   form.set("password", "test-admin-password");
   form.set(
     "token",
-    await adminTest.totp(env.ADMIN_TOTP_SECRET_NEXT, Math.floor(Date.now() / 1000 / 30)),
+    await adminTest.totp(env.ADMIN_TOTP_SECRET, Math.floor(Date.now() / 1000 / 30)),
   );
 
   const response = await adminTest.handleAdminLogin(
@@ -1760,11 +1700,7 @@ test("admin login persists the active canonical and staged TOTP binding", async 
   assert.match(persisted[0], /^session:[a-f0-9]{64}$/);
   assert.equal(
     JSON.parse(persisted[1]).totpBinding,
-    await adminSessionTotpBinding(
-      env.ADMIN_TOTP_SECRET,
-      env.ADMIN_TOTP_SECRET_NEXT,
-      env.ADMIN_TOTP_ROTATION_PHASE,
-    ),
+    await adminSessionTotpBinding(env.ADMIN_TOTP_SECRET),
   );
 });
 
@@ -2270,24 +2206,18 @@ async function sha256Hex(value) {
   return [...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function adminSessionTotpBinding(canonicalSecret, nextSecret = "", phase = "") {
+async function adminSessionTotpBinding(canonicalSecret) {
   return await adminTest.adminSessionTotpBinding(
     canonicalSecret,
-    nextSecret,
-    phase,
     TEST_ADMIN_SESSION_BINDING_KEY,
   );
 }
 
-async function boundAdminSession(csrf, expiresAt, nextSecret = "", phase = "") {
+async function boundAdminSession(csrf, expiresAt) {
   return {
     csrf,
     expiresAt,
-    totpBinding: await adminSessionTotpBinding(
-      TEST_ADMIN_TOTP_SECRET,
-      nextSecret,
-      phase,
-    ),
+    totpBinding: await adminSessionTotpBinding(TEST_ADMIN_TOTP_SECRET),
   };
 }
 

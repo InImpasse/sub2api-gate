@@ -174,15 +174,13 @@ test("unbound AuthState admin sessions are rejected and deleted", async () => {
   assert.deepEqual(kvDeletes, [`session:${sessionHash}`]);
 });
 
-test("TOTP-bound AuthState sessions are rejected and deleted when the seed set changes", async () => {
+test("TOTP-bound AuthState sessions are rejected and deleted when the canonical seed changes", async () => {
   const sessionToken = "mismatched-auth-state-session";
   const sessionHash = await sha256Hex(sessionToken);
   const authStateDeletes = [];
   const kvDeletes = [];
   const priorBinding = await adminTest.adminSessionTotpBinding(
     "JBSWY3DPEHPK3PXP",
-    "",
-    "",
     "h".repeat(32),
   );
   const env = adminEnv({
@@ -206,8 +204,7 @@ test("TOTP-bound AuthState sessions are rejected and deleted when the seed set c
       };
     },
   });
-  env.ADMIN_TOTP_SECRET_NEXT = "KRUGS4ZANFZSAYJA";
-  env.ADMIN_TOTP_ROTATION_PHASE = "stage";
+  env.ADMIN_TOTP_SECRET = "KRUGS4ZANFZSAYJA";
   env.INVITE_STORE.delete = async (key) => kvDeletes.push(key);
 
   const response = await handleAdmin(new Request("https://api.example.test/allow-ip/admin", {
@@ -280,8 +277,6 @@ test("admin CAS conflicts return a safe HTTP 409 response", async () => {
   const csrf = "auth-state-conflict-csrf";
   const totpBinding = await adminTest.adminSessionTotpBinding(
     "JBSWY3DPEHPK3PXP",
-    "",
-    "",
     "h".repeat(32),
   );
   let replaceCalls = 0;

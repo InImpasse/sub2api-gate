@@ -34,16 +34,8 @@ const ADMIN_PATH = "/allow-ip/admin";
 const COOKIE_NAME = "sub2api_allow_admin";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
 const ADMIN_SESSION_TOTP_BINDING_DOMAIN =
-  "sub2api-gate/admin-session-totp-binding/v3\0";
+  "sub2api-gate/admin-session-totp-binding/v4\0";
 const ADMIN_SESSION_TOTP_BINDING = /^[a-f0-9]{64}$/;
-const ADMIN_TOTP_ROTATION_PHASE_STAGE = "stage";
-const ADMIN_TOTP_ROTATION_PHASE_PROMOTED = "promoted";
-const ADMIN_TOTP_ROTATION_PHASE_SINGLE = "single";
-const ADMIN_TOTP_ROTATION_PHASE_IDS = Object.freeze({
-  [ADMIN_TOTP_ROTATION_PHASE_SINGLE]: 1,
-  [ADMIN_TOTP_ROTATION_PHASE_STAGE]: 2,
-  [ADMIN_TOTP_ROTATION_PHASE_PROMOTED]: 3,
-});
 const INVITES_KEY = "invites";
 const TRASH_KEY = "trash";
 const INVITES_REVISION = Symbol("invitesRevision");
@@ -2362,62 +2354,7 @@ async function findCloudflareListItem(env, ip) {
 }
 
 function configuredAdminTotpSecrets(env) {
-  return adminTotpRotationConfiguration(env).secrets;
-}
-
-function adminTotpRotationConfiguration(env) {
-  const canonicalSecret = String(env?.ADMIN_TOTP_SECRET || "");
-  const nextSecret = String(env?.ADMIN_TOTP_SECRET_NEXT || "");
-  const phase = String(env?.ADMIN_TOTP_ROTATION_PHASE || "");
-  const canonical = decodeConfiguredAdminTotpSecret(
-    canonicalSecret,
-    "ADMIN_TOTP_SECRET",
-  );
-
-  if (!nextSecret && !phase) {
-    return {
-      phase: ADMIN_TOTP_ROTATION_PHASE_SINGLE,
-      secrets: [canonicalSecret],
-      decodedSecrets: [canonical],
-    };
-  }
-  if (!nextSecret || !phase) {
-    throw new Error(
-      "ADMIN_TOTP_SECRET_NEXT and ADMIN_TOTP_ROTATION_PHASE must be configured together.",
-    );
-  }
-
-  const next = decodeConfiguredAdminTotpSecret(
-    nextSecret,
-    "ADMIN_TOTP_SECRET_NEXT",
-  );
-  if (phase === ADMIN_TOTP_ROTATION_PHASE_STAGE) {
-    if (totpSecretBytesEqual(canonical, next)) {
-      throw new Error(
-        "ADMIN_TOTP_ROTATION_PHASE=stage requires a distinct ADMIN_TOTP_SECRET_NEXT.",
-      );
-    }
-    return {
-      phase,
-      secrets: [canonicalSecret, nextSecret],
-      decodedSecrets: [canonical, next],
-    };
-  }
-  if (phase === ADMIN_TOTP_ROTATION_PHASE_PROMOTED) {
-    if (!totpSecretBytesEqual(canonical, next)) {
-      throw new Error(
-        "ADMIN_TOTP_ROTATION_PHASE=promoted requires ADMIN_TOTP_SECRET_NEXT to match ADMIN_TOTP_SECRET.",
-      );
-    }
-    return {
-      phase,
-      secrets: [canonicalSecret],
-      decodedSecrets: [canonical],
-    };
-  }
-  throw new Error(
-    "ADMIN_TOTP_ROTATION_PHASE must be exactly stage or promoted.",
-  );
+  return [String(env?.ADMIN_TOTP_SECRET || "")];
 }
 
 function decodeConfiguredAdminTotpSecret(secret, name) {
@@ -2428,75 +2365,38 @@ function decodeConfiguredAdminTotpSecret(secret, name) {
   }
 }
 
-function totpSecretBytesEqual(left, right) {
-  if (left.byteLength !== right.byteLength) return false;
-  let difference = 0;
-  for (let index = 0; index < left.byteLength; index += 1) {
-    difference |= left[index] ^ right[index];
-  }
-  return difference === 0;
-}
-
 async function verifyAdminTotp(env, token) {
   try {
-    const matches = await Promise.all(
-      configuredAdminTotpSecrets(env).map(async (secret) => await verifyTotp(secret, token)),
-    );
-    return matches.some(Boolean);
+    return await verifyTotp(configuredAdminTotpSecrets(env)[0], token);
   } catch {
     return false;
   }
 }
 
-async function adminSessionTotpBinding(
-  canonicalSecret,
-  nextSecret = "",
-  phase = "",
-  bindingSecret = "",
-) {
-  return await adminSessionTotpBindingForConfiguration(
-    adminTotpRotationConfiguration({
-      ADMIN_TOTP_SECRET: canonicalSecret,
-      ADMIN_TOTP_SECRET_NEXT: nextSecret,
-      ADMIN_TOTP_ROTATION_PHASE: phase,
-    }),
-    bindingSecret,
-  );
-}
-
-async function adminSessionTotpBindingForConfiguration(configuration, bindingSecret) {
+async function adminSessionTotpBinding(canonicalSecret, bindingSecret = "") {
   const bindingKey = String(bindingSecret || "");
   if (bindingKey.length < 32) {
     throw new Error("INVITE_ACCESS_HMAC_KEY must be at least 32 characters");
   }
-  const phaseId = ADMIN_TOTP_ROTATION_PHASE_IDS[configuration.phase];
-  if (!phaseId) throw new Error("administrator TOTP rotation phase is invalid");
-  const secrets = configuration.decodedSecrets;
-  const domain = new TextEncoder().encode(ADMIN_SESSION_TOTP_BINDING_DOMAIN);
-  const size = domain.byteLength + 2 + secrets.reduce(
-    (total, secret) => total + 1 + secret.byteLength,
-    0,
+  const secret = decodeConfiguredAdminTotpSecret(
+    canonicalSecret,
+    "ADMIN_TOTP_SECRET",
   );
+  const domain = new TextEncoder().encode(ADMIN_SESSION_TOTP_BINDING_DOMAIN);
+  const size = domain.byteLength + 1 + secret.byteLength;
   const material = new Uint8Array(size);
   let offset = 0;
   material.set(domain, offset);
   offset += domain.byteLength;
-  material[offset] = phaseId;
+  material[offset] = secret.byteLength;
   offset += 1;
-  material[offset] = secrets.length;
-  offset += 1;
-  for (const secret of secrets) {
-    material[offset] = secret.byteLength;
-    offset += 1;
-    material.set(secret, offset);
-    offset += secret.byteLength;
-  }
+  material.set(secret, offset);
   return await hmacSha256HexBytes(bindingKey, material);
 }
 
 async function adminSessionTotpBindingForEnvironment(env) {
-  return await adminSessionTotpBindingForConfiguration(
-    adminTotpRotationConfiguration(env),
+  return await adminSessionTotpBinding(
+    env.ADMIN_TOTP_SECRET,
     env.INVITE_ACCESS_HMAC_KEY,
   );
 }
@@ -5256,9 +5156,9 @@ function getAdminSetupError(env) {
     return "ADMIN_PASSWORD_PBKDF2 must be a valid PBKDF2-HMAC-SHA256 record.";
   }
   try {
-    adminTotpRotationConfiguration(env);
+    decodeConfiguredAdminTotpSecret(env.ADMIN_TOTP_SECRET, "ADMIN_TOTP_SECRET");
   } catch (error) {
-    return String(error?.message || "Administrator TOTP rotation configuration is invalid.");
+    return String(error?.message || "Administrator TOTP configuration is invalid.");
   }
   try {
     if (base64UrlByteLength(env.CREDENTIAL_ENCRYPTION_KEY) !== 32) {

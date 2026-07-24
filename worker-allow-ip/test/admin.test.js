@@ -584,8 +584,6 @@ async function boundAdminSession(csrf, expiresAt) {
     expiresAt,
     totpBinding: await __test.adminSessionTotpBinding(
       "JBSWY3DPEHPK3PXP",
-      "",
-      "",
       "h".repeat(32),
     ),
   };
