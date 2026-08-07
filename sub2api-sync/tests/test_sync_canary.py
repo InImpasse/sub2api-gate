@@ -103,6 +103,12 @@ class SyncCanaryComposeTests(unittest.TestCase):
         self.assertIn('psql (PostgreSQL) 18.4', dockerfile)
         self.assertNotRegex(dockerfile, r"\b(?:apk\s+add|apt-get|dnf\s|yum\s)")
 
+    def test_sync_psql_wrapper_is_owner_executable_for_trusted_image_builds(self):
+        wrapper = ROOT / "sub2api-sync" / "psql-wrapper.sh"
+        metadata = wrapper.stat()
+        self.assertTrue(stat.S_ISREG(metadata.st_mode))
+        self.assertTrue(metadata.st_mode & stat.S_IXUSR)
+
     def test_sync_build_context_is_an_explicit_source_allowlist(self):
         entries = [
             line
