@@ -604,10 +604,14 @@
     }
 
     .cf-turnstile-mock {
+      min-height: 132px;
       padding: 16px;
       border-radius: 8px;
       border: 1px dashed var(--line-strong);
       background: var(--surface-muted);
+      display: grid;
+      align-content: start;
+      gap: 12px;
     }
 
     .cf-turnstile-mock.checked {
@@ -634,6 +638,34 @@
       padding: 0;
       accent-color: var(--accent);
     }
+
+    .turnstile-feedback {
+      min-height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .turnstile-status,
+    .copy-status {
+      min-height: 20px;
+      color: var(--text-faint);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .cf-turnstile-mock[data-state="expired"] .turnstile-status,
+    .copy-status[role="alert"] {
+      color: var(--error);
+    }
+
+    button.turnstile-retry {
+      flex: 0 0 auto;
+      min-height: 36px;
+    }
+
+    [hidden] { display: none !important; }
 
     .message {
       padding: 16px;
@@ -1192,6 +1224,10 @@
                   <span class="helper-note">This demo uses a mock check instead of a real Turnstile token.</span>
                 </span>
               </label>
+              <div class="turnstile-feedback">
+                <p id="turnstileStatus" class="turnstile-status" role="status" aria-live="polite">Complete the human verification.</p>
+                <button id="turnstileRetry" class="ghost turnstile-retry" type="button" hidden>Retry verification</button>
+              </div>
             </div>
           </div>
 
@@ -1199,6 +1235,7 @@
             <button id="submitBtn" class="btn-primary" type="submit" disabled>Authorize current network</button>
             <button class="ghost-wide" type="button" id="previewDemo">Load demo key</button>
           </div>
+          <p id="allowFormStatus" class="message error" role="alert" tabindex="-1" hidden></p>
         </form>
 
         <section class="message" aria-label="Demo disclaimer">
@@ -1291,6 +1328,7 @@
             </div>
           </article>
         </section>
+        <p id="copyStatus" class="copy-status" role="status" aria-live="polite"></p>
 
         <section class="message">
           <strong class="section-title">Session details</strong>
@@ -1465,14 +1503,25 @@
 
       document.querySelectorAll(".copy-value").forEach((button) => {
         button.addEventListener("click", async () => {
+          const original = button.textContent;
+          const copyStatus = document.getElementById("copyStatus");
           try {
             await navigator.clipboard.writeText(button.dataset.copy || "");
-            const original = button.textContent;
             button.textContent = "Copied";
-            setTimeout(() => {
-              button.textContent = original;
-            }, 1400);
-          } catch {}
+            if (copyStatus) {
+              copyStatus.setAttribute("role", "status");
+              copyStatus.textContent = "Copied to clipboard.";
+            }
+          } catch {
+            button.textContent = "Copy failed";
+            if (copyStatus) {
+              copyStatus.setAttribute("role", "alert");
+              copyStatus.textContent = "Copy failed. Select the value and copy it manually.";
+            }
+          }
+          setTimeout(() => {
+            button.textContent = original;
+          }, 1400);
         });
       });
 
@@ -1489,11 +1538,33 @@
       const check = document.getElementById("turnstileCheck");
       const submitButton = document.getElementById("submitBtn");
       const turnstileMock = document.getElementById("turnstileMock");
-      if (check && submitButton && turnstileMock) {
+      const turnstileStatus = document.getElementById("turnstileStatus");
+      const turnstileRetry = document.getElementById("turnstileRetry");
+      if (check && submitButton && turnstileMock && turnstileStatus && turnstileRetry) {
+        const setDemoVerificationState = (state, message, { alert = false, retry = false } = {}) => {
+          turnstileMock.dataset.state = state;
+          turnstileMock.classList.toggle("checked", state === "verified");
+          turnstileStatus.setAttribute("role", alert ? "alert" : "status");
+          turnstileStatus.textContent = message;
+          turnstileRetry.hidden = !retry;
+          submitButton.disabled = state !== "verified";
+        };
         check.addEventListener("change", () => {
+          const wasVerified = turnstilePassed;
           turnstilePassed = check.checked;
-          submitButton.disabled = !turnstilePassed;
-          turnstileMock.classList.toggle("checked", turnstilePassed);
+          if (turnstilePassed) {
+            setDemoVerificationState("verified", "Verification complete.");
+          } else if (wasVerified) {
+            setDemoVerificationState("expired", "Verification expired. Complete it again.", { alert: true, retry: true });
+          } else {
+            setDemoVerificationState("ready", "Complete the human verification.");
+          }
+        });
+        turnstileRetry.addEventListener("click", () => {
+          turnstilePassed = false;
+          check.checked = false;
+          setDemoVerificationState("ready", "Complete the human verification.");
+          check.focus();
         });
       }
 
@@ -1504,9 +1575,16 @@
           const key = document.getElementById("invite_key")?.value.trim();
           const invite = MOCK_INVITES[key];
           if (!invite) {
-            alert("Invalid key. Try demo-key-001 or demo-invite-001.");
+            const status = document.getElementById("allowFormStatus");
+            if (status) {
+              status.hidden = false;
+              status.textContent = "Invalid key. Try demo-key-001 or demo-invite-001.";
+              status.focus();
+            }
             return;
           }
+          submitButton.disabled = true;
+          submitButton.textContent = "Authorizing...";
           currentInvite = { ...invite };
           view = "dashboard";
           render();

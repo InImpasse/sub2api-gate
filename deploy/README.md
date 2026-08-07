@@ -10,6 +10,11 @@ Cloudflare IP boundary files from Cloudflare's published lists.
 
 Run these before requesting deployment approval:
 
+The reviewed Sub2API release and its PostgreSQL/Redis/sync image identities are
+declared in `deploy/release-policy.json`. The consistency check is offline and
+credential-free; it rejects a version or digest drift across Compose, canary,
+runtime gates, migration policy, and this runbook.
+
 The preflight rejects `.env` and `worker-allow-ip/wrangler.private.jsonc` when
 either file is readable, writable, or executable by group or other users. Set
 both files to mode `0600` before running it. The private environment parser is
@@ -60,6 +65,7 @@ requires both its soft and hard core-file limits to be zero. Resolve any host
 condition before rollout rather than bypassing the gate.
 
 ```bash
+python3 ./deploy/verify-release-policy.py
 bash ./deploy/security-preflight.sh check --env-file .env
 bash ./deploy/prepare-sync-role.sh check
 bash ./deploy/prepare-app-role.sh check
@@ -99,7 +105,13 @@ docker compose --env-file .env.example \
   -f docker-compose.redis-migration.yml \
   --profile sync-canary config --quiet
 git diff --check
+bash ./deploy/check-release-candidate.sh
 ```
+
+`verify-local.sh` accepts a dirty development checkout. Run
+`check-release-candidate.sh` only from the reviewed clean commit that will be
+installed as the trusted release tree; it performs no deployment or remote
+write.
 
 ## Private database role preparation
 
@@ -160,7 +172,7 @@ database and committed only after privacy, row-count, relationship, and usage
 metadata checks pass. Before either a safe schema fingerprint or a logical
 migration, the PostgreSQL portability gate rejects every FDW, foreign server,
 user mapping, foreign table, and extension other than the exact `plpgsql`,
-`pgcrypto`, and PostgreSQL 18 trusted `pg_trgm` allowlist. Sub2API 0.1.162 uses
+`pgcrypto`, and PostgreSQL 18 trusted `pg_trgm` allowlist. Sub2API 0.1.171 uses
 `pg_trgm` only for local fuzzy-search indexes; it has no remote connection or
 credential boundary. This prevents `pg_dump` from serializing foreign
 connection options or credentials into the target cluster. The safe export
@@ -177,7 +189,7 @@ an incomplete, extra, linked, non-root-owned, or modified file is rejected.
 The current Redis migration copies only unexpired HMAC
 sync nonce markers into the dedicated Redis 8.8.0 nonce store; Sub2API session,
 OAuth, scheduler, billing, and concurrency cache is deliberately rebuilt rather
-than copied because reviewed 0.1.162 values can contain credentials or
+than copied because reviewed 0.1.171 values can contain credentials or
 request-derived identifiers. The application
 directory starts empty; only a strictly validated model pricing document may
 be projected into it. No tool copies an old PostgreSQL data directory, WAL,
@@ -199,7 +211,7 @@ cache is imported, copied, or expected to survive a container restart.
 Source-audited `wait:account:*`
 counters, `sticky_session:*` routing hashes, and `cyber_session_block:*`
 SHA-256 references are available only in that volatile instance so Sub2API
-0.1.162 can operate normally. Their values are respectively an expiring integer,
+0.1.171 can operate normally. Their values are respectively an expiring integer,
 a numeric account ID, and the marker `1`; all are discarded during migration.
 Raw prompts, requests, responses, moderation data, and image payload keyspaces
 remain denied by ACL. The integration gate verifies the required runtime
@@ -602,7 +614,7 @@ rollback itself cannot be proven complete.
 It cannot be promoted or passed to the Nginx switcher. The independent
 `docker-compose.traffic-canary.yml` is the only stack allowed to bind `8081`.
 It starts PostgreSQL 18 from the already logically migrated target directory,
-an empty memory-only Redis 8.8.0 application cache, and Sub2API 0.1.162 from the
+an empty memory-only Redis 8.8.0 application cache, and Sub2API 0.1.171 from the
 credential-free app metadata directory. It contains no sync service, publishes
 neither PostgreSQL nor Redis, uses no `AUTO_SETUP`, and discards every
 container's stdout/stderr. All three containers set the core-file ulimit to
@@ -1027,7 +1039,7 @@ the first failed checkpoint; never skip ahead.
    content backup.
 5. Run `docker-compose.canary.yml` only as an isolated empty-data preflight. Its
    PostgreSQL and Redis are tmpfs services on a private Compose network. Verify
-   the pinned 0.1.162 binary, startup, health, and no-file/no-Docker-log controls,
+   the pinned 0.1.171 binary, startup, health, and no-file/no-Docker-log controls,
    through loopback port `18081`, then stop it. It has no production account or
    API key and must never be used as an Nginx upstream or as a `/v1/responses`
    acceptance canary. Port `8081` remains reserved for the later migrated-target

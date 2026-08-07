@@ -14,7 +14,12 @@ export const CLOUDFLARE_MUTATION_GRACE_MS = 2 * 60 * 1000;
 export const CLOUDFLARE_MUTATION_RETRY_MS = 60 * 1000;
 const MAX_MUTATION_VALUES = 100;
 
-export async function createManagedCloudflareListItems(env, values, now = Date.now()) {
+export async function createManagedCloudflareListItems(
+  env,
+  values,
+  now = Date.now(),
+  requestStore = null,
+) {
   const normalizedValues = normalizeListValues(values);
   if (!isAuthStateBindingConfigured(env)) {
     throw new Error("auth_state_unavailable");
@@ -28,7 +33,7 @@ export async function createManagedCloudflareListItems(env, values, now = Date.n
   const expectedValueHashes = await Promise.all(
     normalizedValues.map((value) => cloudflareListValueHmac(env.INVITE_ACCESS_HMAC_KEY, value)),
   );
-  const store = createAuthStateStore(env);
+  const store = requestStore || createAuthStateStore(env);
   await store.registerCloudflareMutation({
     mutationId,
     comment,
@@ -106,9 +111,9 @@ export async function findCloudflareMutationCandidates(env, marker, listItems) {
   return deduplicateItemsById(candidates);
 }
 
-export async function resolveCloudflareMutation(env, mutationId) {
+export async function resolveCloudflareMutation(env, mutationId, requestStore = null) {
   if (!mutationId) return;
-  await createAuthStateStore(env).resolveCloudflareMutation(mutationId);
+  await (requestStore || createAuthStateStore(env)).resolveCloudflareMutation(mutationId);
 }
 
 export function cloudflareMutationIdFromError(error) {

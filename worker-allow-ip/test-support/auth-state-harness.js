@@ -1,7 +1,11 @@
-import { AuthState } from "../src/worker-entry.js";
+import { AuthState as ProductionAuthState } from "../src/worker-entry.js";
 import { AUTH_STATE_DO_NAME, createAuthStateStore } from "../src/auth-state.js";
 
-export { AuthState };
+export class AuthState extends ProductionAuthState {
+  async runTestAlarm() {
+    return await this.alarm();
+  }
+}
 
 export default {
   async fetch(request, env) {
@@ -15,6 +19,9 @@ export default {
       if (url.pathname === "/legacy-cleanup-complete") return Response.json(await stub.markLegacyCleanupComplete(body.completedAt));
       if (url.pathname === "/legacy-cleanup-run") {
         return Response.json(await stub.runLegacyCleanup(body.reason));
+      }
+      if (url.pathname === "/legacy-cleanup-alarm") {
+        return Response.json(await stub.runTestAlarm());
       }
       if (url.pathname === "/invites") return Response.json(await stub.getInvites());
       if (url.pathname === "/credential-migration-batch") {

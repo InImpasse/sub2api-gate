@@ -20,12 +20,13 @@ test("admin GET path does not run full invite synchronization", async () => {
   assert.match(source, /readAdminPage\(/);
   assert.match(source, /getAdminDashboard\(env, adminUrl\)/);
   assert.match(source, /ADMIN_IP_GROUP_PAGE_SIZE = 20/);
-  assert.match(source, /ADMIN_LIST_HTML_MAX_BYTES = 256 \* 1024/);
-  assert.match(source, /ADMIN_DETAIL_HTML_MAX_BYTES = 512 \* 1024/);
+  assert.match(source, /ADMIN_LIST_HTML_MAX_BYTES = 96 \* 1024/);
+  assert.match(source, /ADMIN_DETAIL_HTML_MAX_BYTES = 128 \* 1024/);
   assert.doesNotMatch(source, /hydrateAdminInvites/);
   assert.match(source, /ADMIN_RECORD_PAYLOAD_MAX_BYTES = 256 \* 1024/);
   assert.doesNotMatch(source, /getInvitesWithRecords/);
-  assert.match(source, /AbortSignal\.timeout\(SUB2API_SYNC_TIMEOUT_MS\)/);
+  assert.match(source, /AbortSignal\.timeout\(sub2apiSyncTimeoutForAction\(action\)\)/);
+  assert.match(source, /SUB2API_SYNC_LOGIN_TIMEOUT_MS = 10_000/);
   assert.match(source, /fetchWithTimeout\(lookupUrl/);
   assert.match(source, /GEOIP_TIMEOUT_MS/);
   assert.match(source, /GEOIP_ALLOWED_HOSTNAMES/);
@@ -77,7 +78,8 @@ test("Worker production entry exports both RPC classes and fails closed without 
   assert.match(source, /async runLegacyCleanup\(reason\)/);
   assert.match(source, /reason !== "explicit"/);
   assert.doesNotMatch(source, /await this\.runLegacyCleanup\("alarm"\)/);
-  assert.match(source, /async alarm\(\) \{\s+return \{ ok: true, cleaned: false \};/);
+  assert.match(source, /async alarm\(\) \{[\s\S]*inspectLegacySourceKeys/);
+  assert.match(source, /authStateConsumeLegacyCleanupRecheck/);
   assert.match(source, /initializeAuthStateStorage\(ctx\.storage\)/);
   assert.match(source, /async consume\(scope\)/);
   assert.match(source, /async reset\(scope\)/);

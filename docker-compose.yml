@@ -21,7 +21,7 @@ services:
   # Sub2API Application
   # ===========================================================================
   sub2api:
-    image: weishaw/sub2api@sha256:469790e0389bf31379978687149280a4e135393ad98a9a401951b6be9b1df444
+    image: weishaw/sub2api@sha256:8469b859dbc0fb299ffa01d4cc8890dfce671b1ae9fa9cb54651bd258a3577d2
     container_name: sub2api
     restart: unless-stopped
     user: "1000:1000"
@@ -56,7 +56,7 @@ services:
       # Auto Setup (REQUIRED for Docker deployment)
       # =======================================================================
       - AUTO_SETUP=false
-      # Sub2API 0.1.162 probes DATA_DIR for writability and its pricing service
+      # Sub2API 0.1.171 probes DATA_DIR for writability and its pricing service
       # atomically refreshes reviewed model metadata here. The bind itself is
       # owner-only; the container root filesystem remains read-only.
       - DATA_DIR=/app/data
@@ -193,7 +193,7 @@ services:
       test:
         - CMD-SHELL
         - >-
-          /app/sub2api --version 2>&1 | grep -F 'Sub2API 0.1.162' >/dev/null &&
+          /app/sub2api --version 2>&1 | grep -F 'Sub2API 0.1.171' >/dev/null &&
           wget -q -T 5 -O /dev/null http://localhost:8080/health
       interval: 30s
       timeout: 10s

@@ -10,6 +10,8 @@ controller passes its name-only JSON directly to the existing verifier.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import pathlib
 import shutil
@@ -28,6 +30,18 @@ WRANGLER_VERSION = "4.112.0"
 COMPATIBILITY_RELEASE = "e5b6104bc8a8ec6f920a811de83e51310c6b5874"
 FINAL_SOURCE_RELEASE = "f805877b8c8c82e40f21b20967b5981adea8491c"
 MAX_CONFIG_BYTES = 1024 * 1024
+MAX_TOOLCHAIN_BYTES = 8 * 1024 * 1024
+REVIEWED_TOOLCHAIN_SHA256 = {
+    "package.json": "a3d11acfccda4e2776ccee98650d34d600df4d3eb9cd5532bb3cd2d8dc782790",
+    "package-lock.json": "408a8d2623a8950282eab6ba96998a57d27380f10df8dc01e5821e11056d2721",
+}
+MINIFLARE_VERSION = "4.20260714.0"
+UNDICI_VERSION = "7.29.0"
+SHARP_VERSION = "0.35.3"
+REMOTE_OUTCOME_UNKNOWN = (
+    "remote_outcome_unknown: Worker publish may have completed; "
+    "verify the exact remote deployment before retrying"
+)
 
 
 class LocalPublishError(RuntimeError):
@@ -46,6 +60,116 @@ class PublishCommand:
         self.label = label
         self.arguments = tuple(str(argument) for argument in arguments)
         self.output_label = output_label
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with pathlib.Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_reviewed_toolchain(path, expected_hash):
+    target = pathlib.Path(path)
+    try:
+        metadata = target.lstat()
+    except OSError as error:
+        raise LocalPublishError("reviewed Worker toolchain manifest is unavailable") from error
+    if target.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise LocalPublishError("reviewed Worker toolchain manifest must be a single-link regular file")
+    if metadata.st_size > MAX_TOOLCHAIN_BYTES:
+        raise LocalPublishError("reviewed Worker toolchain manifest is too large")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+    except OSError as error:
+        raise LocalPublishError("reviewed Worker toolchain manifest could not be opened") from error
+    try:
+        opened = os.fstat(descriptor)
+        payload = os.read(descriptor, MAX_TOOLCHAIN_BYTES + 1)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or len(payload) > MAX_TOOLCHAIN_BYTES
+        or (metadata.st_dev, metadata.st_ino, metadata.st_size)
+        != (after.st_dev, after.st_ino, after.st_size)
+        or hashlib.sha256(payload).hexdigest() != expected_hash
+    ):
+        raise LocalPublishError("reviewed Worker toolchain hash does not match the approved candidate")
+    return payload
+
+
+def _validate_reviewed_toolchain(package_payload, lock_payload):
+    try:
+        package = json.loads(package_payload.decode("utf-8", "strict"))
+        lock = json.loads(lock_payload.decode("utf-8", "strict"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise LocalPublishError("reviewed Worker toolchain manifests must be valid JSON") from error
+    expected_dependencies = {
+        "miniflare": MINIFLARE_VERSION,
+        "wrangler": WRANGLER_VERSION,
+    }
+    dependencies = package.get("devDependencies")
+    lock_packages = lock.get("packages")
+    if (
+        not isinstance(dependencies, dict)
+        or any(dependencies.get(name) != version for name, version in expected_dependencies.items())
+        or package.get("overrides") != {"undici": UNDICI_VERSION, "sharp": SHARP_VERSION}
+        or not isinstance(lock_packages, dict)
+        or any(lock_packages.get("", {}).get("devDependencies", {}).get(name) != version for name, version in expected_dependencies.items())
+        or lock_packages.get("node_modules/miniflare", {}).get("version") != MINIFLARE_VERSION
+        or lock_packages.get("node_modules/wrangler", {}).get("version") != WRANGLER_VERSION
+        or lock_packages.get("node_modules/undici", {}).get("version") != UNDICI_VERSION
+    ):
+        raise LocalPublishError("reviewed Worker toolchain dependency pins do not match policy")
+
+
+def _replace_staged_manifest(path, payload):
+    target = pathlib.Path(path)
+    try:
+        metadata = target.lstat()
+    except OSError as error:
+        raise LocalPublishError("staged Worker toolchain manifest is unavailable") from error
+    if target.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise LocalPublishError("staged Worker toolchain manifest must be a regular file")
+    temporary = target.with_name(f".{target.name}.reviewed")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o644)
+            written = 0
+            while written < len(payload):
+                written += os.write(descriptor, payload[written:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, target)
+    except OSError as error:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise LocalPublishError("reviewed Worker toolchain could not be staged") from error
+
+
+def overlay_reviewed_toolchain(repo_dir, stage_dir):
+    source_worker = pathlib.Path(repo_dir) / WORKER_RELATIVE
+    staged_worker = pathlib.Path(stage_dir) / WORKER_RELATIVE
+    payloads = {
+        name: _read_reviewed_toolchain(source_worker / name, expected_hash)
+        for name, expected_hash in REVIEWED_TOOLCHAIN_SHA256.items()
+    }
+    _validate_reviewed_toolchain(payloads["package.json"], payloads["package-lock.json"])
+    for name, payload in payloads.items():
+        _replace_staged_manifest(staged_worker / name, payload)
+        if sha256_file(staged_worker / name) != REVIEWED_TOOLCHAIN_SHA256[name]:
+            raise LocalPublishError("staged Worker toolchain hash does not match the approved candidate")
+    return dict(REVIEWED_TOOLCHAIN_SHA256)
 
 
 def release_spec(stage):
@@ -220,7 +344,12 @@ def run_publish_plan(stage_dir, spec, node_path, home, *, apply, runner=subproce
             run_command(runner, command.arguments, cwd=stage, environment=environment, input_text=secret_list)
             secret_list = None
             continue
-        result = run_command(runner, command.arguments, cwd=stage, environment=environment)
+        try:
+            result = run_command(runner, command.arguments, cwd=stage, environment=environment)
+        except (LocalPublishError, OSError, subprocess.SubprocessError) as error:
+            if command.label == "deploy":
+                raise LocalPublishError(REMOTE_OUTCOME_UNKNOWN) from error
+            raise
         if command.label == "verify-node":
             node_version = result.stdout.strip()
             verify_node_version(node_version)
@@ -273,18 +402,50 @@ def remove_stage(repo_dir, stage_dir, *, runner=subprocess.run):
     )
 
 
+def run_staged_publish(
+    repo_dir,
+    stage_dir,
+    spec,
+    private_config,
+    node,
+    home,
+    *,
+    apply,
+    runner=subprocess.run,
+    expected_uid=None,
+):
+    owner = os.geteuid() if expected_uid is None else expected_uid
+    stage_release(repo_dir, stage_dir, spec, runner=runner)
+    try:
+        overlay_reviewed_toolchain(repo_dir, stage_dir)
+        copy_private_config(
+            private_config,
+            pathlib.Path(stage_dir) / PRIVATE_CONFIG_RELATIVE,
+            expected_uid=owner,
+        )
+        run_publish_plan(stage_dir, spec, node, home, apply=apply, runner=runner)
+    finally:
+        remove_stage(repo_dir, stage_dir, runner=runner)
+
+
 def main(argv=None, *, runner=subprocess.run):
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("check", "--apply"), nargs="?", default="check")
+    parser.add_argument("mode", choices=("check",), nargs="?")
+    parser.add_argument("--apply", action="store_true", help="publish the reviewed Worker release after all gates pass")
     parser.add_argument("--totp-rotation-stage", choices=("compatibility", "stage", "promoted", "final-source"), default="compatibility")
     parser.add_argument("--node", type=pathlib.Path, default=pathlib.Path(shutil.which("node") or ""))
     parser.add_argument("--home", type=pathlib.Path, default=pathlib.Path(os.environ.get("HOME", "")))
     parser.add_argument("--wrangler-config", type=pathlib.Path, default=ROOT / PRIVATE_CONFIG_RELATIVE)
     arguments = parser.parse_args(argv)
+    if arguments.mode == "check" and arguments.apply:
+        parser.error("'check' cannot be combined with --apply")
     try:
         if os.geteuid() == 0:
             raise LocalPublishError("local Worker publishing must run as the OAuth-owning operator")
-        node = arguments.node.resolve(strict=True)
+        try:
+            node = arguments.node.resolve(strict=True)
+        except OSError as error:
+            raise LocalPublishError("local Node executable is unavailable") from error
         if not node.is_file() or not os.access(node, os.X_OK):
             raise LocalPublishError("local Node executable is unavailable")
         if not arguments.home.is_dir() or not arguments.home.is_absolute():
@@ -293,13 +454,18 @@ def main(argv=None, *, runner=subprocess.run):
         spec = release_spec(arguments.totp_rotation_stage)
         with tempfile.TemporaryDirectory(prefix="sub2api-worker-release-") as temporary:
             stage = pathlib.Path(temporary) / "release"
-            stage_release(ROOT, stage, spec, runner=runner)
-            copy_private_config(arguments.wrangler_config, stage / PRIVATE_CONFIG_RELATIVE, expected_uid=os.geteuid())
-            try:
-                run_publish_plan(stage, spec, node, arguments.home, apply=arguments.mode == "--apply", runner=runner)
-            finally:
-                remove_stage(ROOT, stage, runner=runner)
-        print("local Worker publish completed" if arguments.mode == "--apply" else "local Worker publish check passed; no Worker was published")
+            run_staged_publish(
+                ROOT,
+                stage,
+                spec,
+                arguments.wrangler_config,
+                node,
+                arguments.home,
+                apply=arguments.apply,
+                runner=runner,
+                expected_uid=os.geteuid(),
+            )
+        print("local Worker publish completed" if arguments.apply else "local Worker publish check passed; no Worker was published")
         return 0
     except (LocalPublishError, OSError, subprocess.SubprocessError) as error:
         print(str(error), file=sys.stderr)

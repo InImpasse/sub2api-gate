@@ -32,6 +32,8 @@ import {
 
 const ADMIN_PATH = "/allow-ip/admin";
 const COOKIE_NAME = "sub2api_allow_admin";
+const DELETE_ADMIN_COOKIE = `${COOKIE_NAME}=; Path=${ADMIN_PATH}; Max-Age=0; HttpOnly; Secure; SameSite=Strict`;
+const REQUEST_AUTH_STATE_STORE = Symbol("requestAuthStateStore");
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
 const ADMIN_SESSION_TOTP_BINDING_DOMAIN =
   "sub2api-gate/admin-session-totp-binding/v4\0";
@@ -43,6 +45,10 @@ const TRASH_REVISION = Symbol("trashRevision");
 const CLOUDFLARE_MUTATION_IDS = Symbol("cloudflareMutationIds");
 const DEFAULT_IP_TTL_DAYS = 365;
 const SUB2API_SYNC_TIMEOUT_MS = 5000;
+const SUB2API_SYNC_LOGIN_TIMEOUT_MS = 10_000;
+const SUB2API_SYNC_ERROR_STATUSES = new Set([
+  400, 401, 404, 408, 409, 411, 413, 415, 429, 500, 502, 503, 504,
+]);
 const SUB2API_SYNC_DEFAULT_RESPONSE_MAX_BYTES = 16 * 1024;
 const SUB2API_SYNC_ACCOUNT_RESPONSE_MAX_BYTES = 128 * 1024;
 const SUB2API_SYNC_MAX_TOKENS = 100;
@@ -70,8 +76,8 @@ const MAX_ADMIN_INVITE_PAGE = 400;
 const MAX_ADMIN_TRASH_PAGE = 800;
 const MAX_ADMIN_IP_GROUP_PAGE = 400;
 const ADMIN_RECORD_PAYLOAD_MAX_BYTES = 256 * 1024;
-const ADMIN_LIST_HTML_MAX_BYTES = 256 * 1024;
-const ADMIN_DETAIL_HTML_MAX_BYTES = 512 * 1024;
+const ADMIN_LIST_HTML_MAX_BYTES = 96 * 1024;
+const ADMIN_DETAIL_HTML_MAX_BYTES = 128 * 1024;
 const ISSUED_ACCESS_KEYS_HTML_MAX_BYTES = 256 * 1024;
 const MANAGED_CLOUDFLARE_COMMENT = /^sub2api ref [a-f0-9]{32}$/;
 const CLOUDFLARE_LIST_ITEM_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -98,7 +104,7 @@ const SUB2API_FAVICON = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3d
 
 export async function handleAdmin(request, env) {
   try {
-    return await handleAdminRequest(request, env);
+    return await handleAdminRequest(request, createAdminRequestEnvironment(env));
   } catch (error) {
     if (isRequestBodyTooLarge(error)) {
       return html(renderMessage("Request too large", "Form submissions are limited to 32 KiB."), 413);
@@ -112,6 +118,18 @@ export async function handleAdmin(request, env) {
         409,
       );
     }
+    if (error instanceof Sub2ApiSyncError) {
+      const retry = error.retryable ? " Try again after the dependency recovers." : "";
+      const response = html(renderMessage(
+        "Sub2API request failed",
+        `The sync service returned ${error.code}. Request ID: ${error.requestId}.${retry}`,
+      ), error.status);
+      response.headers.set("x-request-id", error.requestId);
+      if (error.retryable && [429, 503, 504].includes(error.status)) {
+        response.headers.set("retry-after", "1");
+      }
+      return response;
+    }
     console.error(JSON.stringify({ level: "error", message: "admin_action_failed" }));
     const message = isUserFacingAdminError(error)
       ? error.message
@@ -121,19 +139,34 @@ export async function handleAdmin(request, env) {
 }
 
 async function handleAdminRequest(request, env) {
+  const adminUrl = new URL(request.url);
+  const isDashboardPath = adminUrl.pathname === ADMIN_PATH;
+  const isUsagePath = adminUrl.pathname === `${ADMIN_PATH}/requests`
+    || adminUrl.pathname === `${ADMIN_PATH}/requests/detail`;
+  if (!isDashboardPath && !isUsagePath) {
+    return text("Not found", 404);
+  }
+  const allowedMethods = isDashboardPath ? ["GET", "POST"] : ["GET"];
+  if (!allowedMethods.includes(request.method)) {
+    return text("Method not allowed", 405, { allow: allowedMethods.join(", ") });
+  }
+  if (request.method === "POST" && !isSupportedAdminFormRequest(request)) {
+    return text("Unsupported media type", 415);
+  }
+
   const setupError = getAdminSetupError(env);
   if (setupError) {
     return html(renderAdminSetupError(setupError), 500);
   }
 
+  const hadSessionCookie = hasAdminSessionCookie(request);
   const session = await getAdminSession(request, env);
 
   if (request.method === "GET") {
     if (!session) {
-      return html(renderLogin());
+      return setResponseCookie(html(renderLogin()), hadSessionCookie ? DELETE_ADMIN_COOKIE : "");
     }
 
-    const adminUrl = new URL(request.url);
     if (adminUrl.pathname === `${ADMIN_PATH}/requests`) {
       const usage = await listUsageMetadata(env, request);
       return html(renderUsageInspector(usage, session.csrf, request), 200);
@@ -144,7 +177,12 @@ async function handleAdminRequest(request, env) {
       return html(renderUsageInspector(usage, session.csrf, request), 200);
     }
 
+    const canonicalLocation = legacyAdminCanonicalLocation(adminUrl);
+    if (canonicalLocation) return redirect(canonicalLocation);
     const dashboard = await getAdminDashboard(env, adminUrl);
+    if (dashboard.selectedUuidRequested && !dashboard.selectedInvite) {
+      return html(renderMessage("UUID not found", "Return to the UUID list and select an active UUID."), 404);
+    }
     return html(renderAdmin(
       dashboard.invites,
       dashboard.trash,
@@ -152,22 +190,30 @@ async function handleAdminRequest(request, env) {
       request,
       env,
       dashboard,
-    ), 200, dashboard.selectedInvite ? ADMIN_DETAIL_HTML_MAX_BYTES : ADMIN_LIST_HTML_MAX_BYTES);
+    ), 200, dashboard.view === "list" ? ADMIN_LIST_HTML_MAX_BYTES : ADMIN_DETAIL_HTML_MAX_BYTES);
   }
 
-  if (request.method !== "POST") {
-    return text("Method not allowed", 405, { allow: "GET, POST" });
+  let form;
+  try {
+    form = await parseBoundedFormData(request);
+  } catch (error) {
+    if (isRequestBodyTooLarge(error)) throw error;
+    return html(renderMessage(
+      "Invalid form submission",
+      "Refresh the admin page and submit the form again.",
+    ), 400);
   }
-
-  const form = await parseBoundedFormData(request);
   const action = String(form.get("action") || "");
 
   if (action === "login") {
-    return await handleAdminLogin(form, env, request);
+    const response = await handleAdminLogin(form, env, request);
+    return response.headers.has("set-cookie")
+      ? response
+      : setResponseCookie(response, hadSessionCookie ? DELETE_ADMIN_COOKIE : "");
   }
 
   if (!session) {
-    return redirect(ADMIN_PATH);
+    return redirect(ADMIN_PATH, hadSessionCookie ? DELETE_ADMIN_COOKIE : "");
   }
 
   if (!(await timingSafeEqual(String(form.get("csrf") || ""), session.csrf))) {
@@ -176,7 +222,7 @@ async function handleAdminRequest(request, env) {
 
   if (action === "logout") {
     await deleteSession(env, request);
-    return redirect(ADMIN_PATH, `${COOKIE_NAME}=; Path=${ADMIN_PATH}; Max-Age=0; HttpOnly; Secure; SameSite=Strict`);
+    return redirect(ADMIN_PATH, DELETE_ADMIN_COOKIE);
   }
 
   if (requiresStepUpAction(action)) {
@@ -206,30 +252,30 @@ async function handleAdminRequest(request, env) {
   }
 
   if (action === "migrate_invite_credentials") {
-    return await migrateInviteCredentials(env);
+    return await migrateInviteCredentials(env, new Date(), adminMaintenancePostHref(form));
   }
 
   if (action === "finalize_legacy_auth_state_cleanup") {
     await finalizeLegacyAuthStateCleanup(env);
-    return redirect(ADMIN_PATH);
+    return redirect(adminMaintenancePostHref(form));
   }
 
   if (action === "rotate_access_key") {
     const uuid = String(form.get("uuid") || "").trim();
     const issued = await rotateInviteAccessKey(env, uuid);
-    return html(renderIssuedAccessKeys([issued]), 200);
+    return html(renderIssuedAccessKeys([issued], 0, adminInvitePostHref(form, uuid)), 200);
   }
 
   if (action === "refresh_sub2api_status") {
     const uuid = String(form.get("uuid") || "").trim();
     await refreshInviteFromSub2Api(env, uuid);
-    return redirect(`${ADMIN_PATH}?edit=${encodeURIComponent(uuid)}`);
+    return redirect(adminInvitePostHref(form, uuid));
   }
 
   if (action === "reset_sub2api_password") {
     const uuid = String(form.get("uuid") || "").trim();
     await resetInviteSub2ApiPassword(env, uuid);
-    return redirect(`${ADMIN_PATH}?edit=${encodeURIComponent(uuid)}`);
+    return redirect(adminInvitePostHref(form, uuid));
   }
 
   if (action === "update_invite") {
@@ -244,46 +290,47 @@ async function handleAdminRequest(request, env) {
       { allowExistingCredentialReferences: true },
     );
     await updateInvite(env, originalUuid, { uuid, username, email, remark, apiConfigs });
-    return redirect(ADMIN_PATH);
+    return redirect(adminInvitePostHref(form, uuid));
   }
 
   if (action === "delete") {
     const uuid = String(form.get("uuid") || "").trim();
     await deleteInvite(env, uuid);
-    return redirect(ADMIN_PATH);
+    return redirect(adminPageHref(parseAdminInvitePostContext(form).page));
   }
 
   if (action === "restore_uuid") {
     const trashId = String(form.get("trash_id") || "").trim();
+    const maintenanceHref = adminMaintenancePostHref(form);
     const restored = await restoreInviteFromTrash(env, trashId);
     return restored
-      ? html(renderIssuedAccessKeys([restored]), 200)
-      : redirect(ADMIN_PATH);
+      ? html(renderIssuedAccessKeys([restored], 0, maintenanceHref), 200)
+      : redirect(maintenanceHref);
   }
 
   if (action === "purge_uuid") {
     const trashId = String(form.get("trash_id") || "").trim();
     await purgeInviteTrash(env, trashId);
-    return redirect(ADMIN_PATH);
+    return redirect(adminMaintenancePostHref(form));
   }
 
   if (action === "delete_ip_group") {
     const uuid = String(form.get("uuid") || "").trim();
     const groupId = String(form.get("group_id") || "").trim();
     await deleteIpGroup(env, uuid, groupId);
-    return redirect(ADMIN_PATH);
+    return redirect(adminInvitePostHref(form, uuid));
   }
 
   if (action === "restore_ip_group") {
     const trashId = String(form.get("trash_id") || "").trim();
     await restoreIpGroupFromTrash(env, trashId);
-    return redirect(ADMIN_PATH);
+    return redirect(adminMaintenancePostHref(form));
   }
 
   if (action === "purge_ip_group") {
     const trashId = String(form.get("trash_id") || "").trim();
     await purgeIpGroupTrash(env, trashId);
-    return redirect(ADMIN_PATH);
+    return redirect(adminMaintenancePostHref(form));
   }
 
   if (action === "update_ip_group_expiration") {
@@ -295,7 +342,7 @@ async function handleAdminRequest(request, env) {
       String(form.get("expiration_mode") || ""),
     );
     await updateIpGroupExpiration(env, uuid, groupId, expiresAt);
-    return redirect(ADMIN_PATH);
+    return redirect(adminInvitePostHref(form, uuid));
   }
 
   if (action === "add_ip_group") {
@@ -307,10 +354,53 @@ async function handleAdminRequest(request, env) {
       String(form.get("expiration_mode") || ""),
     ) || addDaysIso(new Date().toISOString(), DEFAULT_IP_TTL_DAYS);
     await addManualIpGroup(env, uuid, ipValue, expiresAt);
-    return redirect(ADMIN_PATH);
+    return redirect(adminInvitePostHref(form, uuid));
   }
 
-  return redirect(ADMIN_PATH);
+  return html(renderMessage("Unknown admin action", "Refresh the admin page and try again."), 400);
+}
+
+function createAdminRequestEnvironment(env) {
+  if (!isAuthStateBindingConfigured(env)) return env;
+  const requestEnvironment = Object.create(env);
+  Object.defineProperty(requestEnvironment, REQUEST_AUTH_STATE_STORE, {
+    value: createAuthStateStore(env),
+  });
+  return requestEnvironment;
+}
+
+function authStateStore(env) {
+  return env?.[REQUEST_AUTH_STATE_STORE] || createAuthStateStore(env);
+}
+
+function isSupportedAdminFormRequest(request) {
+  const contentType = String(request.headers.get("content-type") || "")
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+  return contentType === "application/x-www-form-urlencoded"
+    || contentType === "multipart/form-data";
+}
+
+function hasAdminSessionCookie(request) {
+  return Boolean(parseCookies(request.headers.get("Cookie") || "")[COOKIE_NAME]);
+}
+
+function setResponseCookie(response, cookie) {
+  if (cookie) response.headers.set("set-cookie", cookie);
+  return response;
+}
+
+class Sub2ApiSyncError extends Error {
+  constructor({ status, code, retryable, requestId, action }) {
+    super("Sub2API sync request failed");
+    this.name = "Sub2ApiSyncError";
+    this.status = status;
+    this.code = code;
+    this.retryable = retryable;
+    this.requestId = requestId;
+    this.action = action;
+  }
 }
 
 export async function findInvite(env, input) {
@@ -319,7 +409,7 @@ export async function findInvite(env, input) {
   }
 
   if (isAuthStateBindingConfigured(env)) {
-    const store = createAuthStateStore(env);
+    const store = authStateStore(env);
     const candidateHmac = await accessKeyHmac(env.INVITE_ACCESS_HMAC_KEY, input);
     let invite = await store.findInviteByAccessKeyHmac(candidateHmac);
     if (!invite && isUuid(input)) {
@@ -363,7 +453,7 @@ export async function getInviteByUuid(env, uuid) {
     return null;
   }
   if (isAuthStateBindingConfigured(env)) {
-    const invite = await createAuthStateStore(env).getInvite(uuid, { reveal: true });
+    const invite = await authStateStore(env).getInvite(uuid, { reveal: true });
     return invite ? sanitizeInviteUrls(env, invite) : null;
   }
   const invites = await getStoredInvites(env);
@@ -450,7 +540,7 @@ async function withIpRecordsLease(env, uuid, callback, existingLease = null) {
   }
 
   const ownerToken = randomHex(32);
-  const store = createAuthStateStore(env);
+  const store = authStateStore(env);
   const claim = await store.claimRecordLease(
     uuid,
     ownerToken,
@@ -476,7 +566,7 @@ async function withAllIpRecordsLease(env, callback, existingLease = null) {
   if (existingLease?.scope === "all") return await callback(existingLease);
 
   const ownerToken = existingLease?.ownerToken || randomHex(32);
-  const store = createAuthStateStore(env);
+  const store = authStateStore(env);
   const claim = await store.claimRecordMaintenanceLease(
     ownerToken,
     Date.now(),
@@ -649,7 +739,7 @@ async function handleAdminLogin(form, env, request) {
   const totpBinding = await adminSessionTotpBindingForEnvironment(env);
 
   if (isAuthStateBindingConfigured(env)) {
-    await createAuthStateStore(env).createAdminSession(sessionHash, {
+    await authStateStore(env).createAdminSession(sessionHash, {
       csrf,
       expiresAt,
       totpBinding,
@@ -684,7 +774,7 @@ async function getAdminSession(request, env) {
   const sessionHash = await sha256Hex(token);
   let session;
   if (isAuthStateBindingConfigured(env)) {
-    session = await createAuthStateStore(env).getAdminSession(sessionHash);
+    session = await authStateStore(env).getAdminSession(sessionHash);
   } else {
     const raw = await env.INVITE_STORE.get(sessionKey(sessionHash));
     if (!raw) return null;
@@ -714,7 +804,7 @@ async function deleteSession(env, request) {
 async function deleteAdminSession(env, sessionHash) {
   if (isAuthStateBindingConfigured(env)) {
     // AuthState removes the legacy KV fallback before its durable session.
-    await createAuthStateStore(env).deleteAdminSession(sessionHash);
+    await authStateStore(env).deleteAdminSession(sessionHash);
   } else {
     await env.INVITE_STORE.delete(sessionKey(sessionHash));
   }
@@ -728,21 +818,29 @@ async function getAdminDashboard(env, adminUrl) {
   const candidateDetailUuid = String(adminUrl.searchParams.get("detail") || "");
   const detailUuid = isUuid(candidateDetailUuid) ? candidateDetailUuid : "";
   const selectedUuid = editUuid || detailUuid;
+  const requestedView = String(adminUrl.searchParams.get("view") || "").trim().toLowerCase();
+  const view = selectedUuid
+    ? (editUuid ? "edit" : "detail")
+    : requestedView === "create" || requestedView === "maintenance"
+      ? requestedView
+      : "list";
   const requestedIpPage = parseAdminPageNumber(
     adminUrl.searchParams.get("ipPage"),
     MAX_ADMIN_IP_GROUP_PAGE,
   );
 
   if (isAuthStateBindingConfigured(env)) {
-    const store = createAuthStateStore(env);
+    const store = authStateStore(env);
     const authStateStatus = await store.ready();
     let page = requestedPage;
     let trashPage = requestedTrashPage;
+    const inviteLimit = view === "list" ? ADMIN_PAGE_SIZE : 1;
+    const trashLimit = view === "maintenance" ? ADMIN_PAGE_SIZE : 1;
     let result = await store.readAdminPage({
-      inviteOffset: (page - 1) * ADMIN_PAGE_SIZE,
-      inviteLimit: ADMIN_PAGE_SIZE,
-      trashOffset: (trashPage - 1) * ADMIN_PAGE_SIZE,
-      trashLimit: ADMIN_PAGE_SIZE,
+      inviteOffset: view === "list" ? (page - 1) * ADMIN_PAGE_SIZE : 0,
+      inviteLimit,
+      trashOffset: view === "maintenance" ? (trashPage - 1) * ADMIN_PAGE_SIZE : 0,
+      trashLimit,
     });
     const inviteCount = normalizeAdminTotal(result.inviteCount);
     const trashCount = normalizeAdminTotal(result.trashCount);
@@ -750,10 +848,10 @@ async function getAdminDashboard(env, adminUrl) {
     trashPage = Math.min(trashPage, adminPageCount(trashCount));
     if (page !== requestedPage || trashPage !== requestedTrashPage) {
       result = await store.readAdminPage({
-        inviteOffset: (page - 1) * ADMIN_PAGE_SIZE,
-        inviteLimit: ADMIN_PAGE_SIZE,
-        trashOffset: (trashPage - 1) * ADMIN_PAGE_SIZE,
-        trashLimit: ADMIN_PAGE_SIZE,
+        inviteOffset: view === "list" ? (page - 1) * ADMIN_PAGE_SIZE : 0,
+        inviteLimit,
+        trashOffset: view === "maintenance" ? (trashPage - 1) * ADMIN_PAGE_SIZE : 0,
+        trashLimit,
       });
     }
 
@@ -777,6 +875,8 @@ async function getAdminDashboard(env, adminUrl) {
       unmigratedInviteCount: normalizeAdminTotal(result.unmigratedInviteCount),
       authStateStatus,
       selectedInvite,
+      selectedUuidRequested: candidateEditUuid || candidateDetailUuid,
+      view,
       page,
       trashPage,
     };
@@ -787,7 +887,9 @@ async function getAdminDashboard(env, adminUrl) {
   const trashCount = storedTrash.length;
   const page = Math.min(requestedPage, adminPageCount(inviteCount));
   const trashPage = Math.min(requestedTrashPage, adminPageCount(trashCount));
-  const pageInvites = storedInvites.slice((page - 1) * ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE);
+  const pageInvites = view === "list"
+    ? storedInvites.slice((page - 1) * ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE)
+    : storedInvites.slice(0, 1);
   const invites = pageInvites.map((invite) => summarizeStoredInvite(env, invite));
   const selectedStoredInvite = selectedUuid
     ? storedInvites.find((invite) => invite.uuid === selectedUuid)
@@ -798,13 +900,18 @@ async function getAdminDashboard(env, adminUrl) {
   return {
     invites,
     trash: storedTrash
-      .slice((trashPage - 1) * ADMIN_PAGE_SIZE, trashPage * ADMIN_PAGE_SIZE)
+      .slice(
+        view === "maintenance" ? (trashPage - 1) * ADMIN_PAGE_SIZE : 0,
+        view === "maintenance" ? trashPage * ADMIN_PAGE_SIZE : 1,
+      )
       .map(summarizeAdminTrashItem)
       .filter(Boolean),
     inviteCount,
     trashCount,
     unmigratedInviteCount: storedInvites.filter((invite) => !invite.accessKeyHmac).length,
     selectedInvite,
+    selectedUuidRequested: candidateEditUuid || candidateDetailUuid,
+    view,
     page,
     trashPage,
   };
@@ -850,7 +957,7 @@ async function getInvites(env) {
 
 async function getStoredInvites(env) {
   if (isAuthStateBindingConfigured(env)) {
-    const result = await createAuthStateStore(env).readInvites();
+    const result = await authStateStore(env).readInvites();
     const invites = normalizeStoredInvites(result.items);
     return attachCollectionRevision(invites, INVITES_REVISION, result.revision);
   }
@@ -960,7 +1067,7 @@ function summarizeAdminTrashItem(item) {
 async function saveInvites(env, invites) {
   if (isAuthStateBindingConfigured(env)) {
     const revision = requireCollectionRevision(invites, INVITES_REVISION);
-    const result = await createAuthStateStore(env).compareAndSwapInvites(revision, invites);
+    const result = await authStateStore(env).compareAndSwapInvites(revision, invites);
     requireAuthStateWrite(result);
     return result;
   }
@@ -977,7 +1084,7 @@ async function saveInvites(env, invites) {
 
 async function getTrash(env) {
   if (isAuthStateBindingConfigured(env)) {
-    const result = await createAuthStateStore(env).readTrash();
+    const result = await authStateStore(env).readTrash();
     const trash = normalizeTrashCollection(result.items);
     return attachCollectionRevision(trash, TRASH_REVISION, result.revision);
   }
@@ -1002,7 +1109,7 @@ function normalizeTrashCollection(trash) {
 async function saveTrash(env, trash) {
   if (isAuthStateBindingConfigured(env)) {
     const revision = requireCollectionRevision(trash, TRASH_REVISION);
-    const result = await createAuthStateStore(env).compareAndSwapTrash(revision, trash);
+    const result = await authStateStore(env).compareAndSwapTrash(revision, trash);
     requireAuthStateWrite(result);
     return result;
   }
@@ -1116,14 +1223,14 @@ async function createInvite(env, uuid, data) {
   return issued;
 }
 
-async function migrateInviteCredentials(env, now = new Date()) {
+async function migrateInviteCredentials(env, now = new Date(), returnHref = ADMIN_PATH) {
   const migratedAt = now.getTime();
   if (!Number.isFinite(migratedAt)) {
     throw new Error("Invalid credential migration timestamp");
   }
 
   if (isAuthStateBindingConfigured(env)) {
-    const store = createAuthStateStore(env);
+    const store = authStateStore(env);
     const batch = await store.readCredentialMigrationBatch(
       MAX_INVITE_CREDENTIAL_MIGRATION_BATCH,
     );
@@ -1150,6 +1257,7 @@ async function migrateInviteCredentials(env, now = new Date()) {
     const response = prepareIssuedAccessKeysResponse(
       issued,
       Math.max(0, Number(batch.remainingCount || 0) - issued.length),
+      returnHref,
     );
     if (updates.length > 0) {
       requireAuthStateWrite(await store.commitCredentialMigrationBatch(
@@ -1182,7 +1290,7 @@ async function migrateInviteCredentials(env, now = new Date()) {
     });
   }
   const remainingCount = invites.filter((invite) => !invite.accessKeyHmac).length;
-  const response = prepareIssuedAccessKeysResponse(issued, remainingCount);
+  const response = prepareIssuedAccessKeysResponse(issued, remainingCount, returnHref);
 
   // Sanitize legacy trash before persisting any one-time access keys. If the
   // invite write fails, no generated key has been committed.
@@ -1197,7 +1305,7 @@ async function finalizeLegacyAuthStateCleanup(env, now = Date.now()) {
   if (!isAuthStateBindingConfigured(env)) {
     throw new Error("auth_state_binding_required_for_legacy_cleanup");
   }
-  const store = createAuthStateStore(env);
+  const store = authStateStore(env);
   const status = await store.ready();
   if (status.legacyCleanupComplete === true) return status;
 
@@ -1348,7 +1456,7 @@ async function deleteInviteWithLease(env, uuid, lease) {
   };
 
   if (isAuthStateBindingConfigured(env)) {
-    const result = await createAuthStateStore(env).removeInvite(
+    const result = await authStateStore(env).removeInvite(
       requireCollectionRevision(invites, INVITES_REVISION),
       requireCollectionRevision(trash, TRASH_REVISION),
       uuid,
@@ -1431,7 +1539,7 @@ async function restoreInviteFromTrash(env, trashId, lease = null) {
     await putIpRecords(env, invite.uuid, restoredGroups, lease);
 
     if (isAuthStateBindingConfigured(env)) {
-      const result = await createAuthStateStore(env).restoreInvite(
+      const result = await authStateStore(env).restoreInvite(
         requireCollectionRevision(invites, INVITES_REVISION),
         requireCollectionRevision(trash, TRASH_REVISION),
         trashId,
@@ -1674,7 +1782,7 @@ export async function cleanupExpiredIpGroups(env, now = new Date(), lease = null
   }
 
   const pendingMutationComments = isAuthStateBindingConfigured(env)
-    ? new Set(await createAuthStateStore(env).listCloudflareMutationComments())
+    ? new Set(await authStateStore(env).listCloudflareMutationComments())
     : new Set();
   const currentProtectedKeys = await getReferencedIpKeys(env, {}, lease);
   orphaned = await deleteOrphanedCloudflareListItems(
@@ -1779,7 +1887,7 @@ async function purgeIpGroupTrashWithLease(env, trashId, lease) {
 
 async function purgeTrashItem(env, trash, trashId) {
   if (isAuthStateBindingConfigured(env)) {
-    const result = await createAuthStateStore(env).purgeTrash(
+    const result = await authStateStore(env).purgeTrash(
       requireCollectionRevision(trash, TRASH_REVISION),
       trashId,
     );
@@ -1852,7 +1960,12 @@ async function ensureManagedCloudflareEntries(env, entries, lease = null) {
 
   let mutation;
   try {
-    mutation = await createManagedCloudflareListItems(env, valuesToCreate);
+    mutation = await createManagedCloudflareListItems(
+      env,
+      valuesToCreate,
+      Date.now(),
+      authStateStore(env),
+    );
   } catch (error) {
     const mutationId = cloudflareMutationIdFromError(error);
     if (mutationId) {
@@ -1957,7 +2070,7 @@ async function getAdminIpRecords(env, uuid) {
 
 async function getRawIpRecords(env, uuid) {
   return isAuthStateBindingConfigured(env)
-    ? await createAuthStateStore(env).getRecords(uuid)
+    ? await authStateStore(env).getRecords(uuid)
     : await env.INVITE_STORE.get(recordsKey(uuid));
 }
 
@@ -1992,7 +2105,7 @@ function exceedsUtf8ByteLimit(value, limit) {
 async function putIpRecords(env, uuid, records, lease) {
   requireIpRecordsLease(env, uuid, lease);
   if (isAuthStateBindingConfigured(env)) {
-    await createAuthStateStore(env).putRecords(uuid, records);
+    await authStateStore(env).putRecords(uuid, records);
     return;
   }
   await env.INVITE_STORE.put(recordsKey(uuid), JSON.stringify(records));
@@ -2001,7 +2114,7 @@ async function putIpRecords(env, uuid, records, lease) {
 async function deleteIpRecords(env, uuid, lease) {
   requireIpRecordsLease(env, uuid, lease);
   if (isAuthStateBindingConfigured(env)) {
-    await createAuthStateStore(env).deleteRecords(uuid);
+    await authStateStore(env).deleteRecords(uuid);
     return;
   }
   await env.INVITE_STORE.delete(recordsKey(uuid));
@@ -2116,9 +2229,10 @@ async function restoreCloudflareListItems(env, group, uuid, lease = null) {
 }
 
 async function finalizeCloudflareMutationIds(env, mutationIds) {
+  const store = isAuthStateBindingConfigured(env) ? authStateStore(env) : null;
   for (const mutationId of new Set(mutationIds || [])) {
     try {
-      await resolveCloudflareMutation(env, mutationId);
+      await resolveCloudflareMutation(env, mutationId, store);
     } catch {
       console.error(JSON.stringify({ level: "error", message: "cloudflare_mutation_finalize_deferred" }));
     }
@@ -2160,7 +2274,7 @@ async function compensateCloudflareMutation(
       lease,
     );
   }
-  const store = createAuthStateStore(env);
+  const store = authStateStore(env);
   const currentMarker = marker || await store.getCloudflareMutation(mutationId);
   if (!currentMarker) return { deleted: 0, retained: 0, pending: false };
 
@@ -2203,7 +2317,7 @@ async function compensateCloudflareMutation(
 
 async function reconcilePendingCloudflareMutations(env, now = Date.now(), lease = null) {
   if (!isAuthStateBindingConfigured(env)) return { checked: 0, deleted: 0, retained: 0 };
-  const store = createAuthStateStore(env);
+  const store = authStateStore(env);
   const markers = await store.claimCloudflareMutations(now, 25, 60_000);
   let deleted = 0;
   let retained = 0;
@@ -2513,8 +2627,11 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
   const currentPage = Number.isSafeInteger(dashboard.page) ? dashboard.page : 1;
   const currentTrashPage = Number.isSafeInteger(dashboard.trashPage) ? dashboard.trashPage : 1;
   const selectedInvite = dashboard.selectedInvite || null;
+  const view = String(dashboard.view || (selectedInvite ? "detail" : "list"));
   const authStateStatus = dashboard.authStateStatus || null;
   const legacyCleanupComplete = authStateStatus?.legacyCleanupComplete === true;
+  const legacyCleanupVerificationPending =
+    authStateStatus?.legacyCleanupVerificationPending === true;
   return page("UUID Admin", (nonce) => `
     <section class="admin">
       <header class="topbar">
@@ -2536,6 +2653,13 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
         </div>
       </header>
 
+      <nav class="admin-tabs" aria-label="Admin views">
+        <a class="nav-link${view === "list" ? " active" : ""}" href="${ADMIN_PATH}"${view === "list" ? ' aria-current="page"' : ""}>UUIDs</a>
+        <a class="nav-link${view === "create" ? " active" : ""}" href="${ADMIN_PATH}?view=create"${view === "create" ? ' aria-current="page"' : ""}>Create</a>
+        <a class="nav-link${view === "maintenance" ? " active" : ""}" href="${ADMIN_PATH}?view=maintenance"${view === "maintenance" ? ' aria-current="page"' : ""}>Maintenance</a>
+      </nav>
+
+      ${view === "maintenance" ? `
       <section class="panel create-panel">
         <div class="section-head">
           <div>
@@ -2550,6 +2674,7 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
           <form class="inline" method="post" action="${ADMIN_PATH}">
             <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
             <input type="hidden" name="action" value="migrate_invite_credentials" />
+            <input type="hidden" name="trashPage" value="${currentTrashPage}" />
             <label class="field"><span>2FA code</span><input name="step_up_token" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" required /></label>
             <button type="submit">Generate next ${Math.min(unmigratedInviteCount, MAX_INVITE_CREDENTIAL_MIGRATION_BATCH)} keys</button>
           </form>
@@ -2562,21 +2687,26 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
             <h2>Legacy rollback state</h2>
             <p class="muted">${legacyCleanupComplete
               ? "Legacy invite and session KV has been explicitly removed."
-              : "Legacy KV remains available for rollback. Finalization is allowed only after every account has a v2 access key and every seven-day UUID transition has expired."}</p>
+              : legacyCleanupVerificationPending
+                ? "Legacy keys were removed and await two consecutive read-only empty checks. Any residual keeps cleanup incomplete."
+                : "Legacy KV remains available for rollback. Finalization is allowed only after every account has a v2 access key and every seven-day UUID transition has expired."}</p>
           </div>
-          <span class="stat-pill ${legacyCleanupComplete ? "status-ok" : "status-warn"}">${legacyCleanupComplete ? "Cleanup complete" : "Cleanup pending"}</span>
+          <span class="stat-pill ${legacyCleanupComplete ? "status-ok" : "status-warn"}">${legacyCleanupComplete ? "Cleanup complete" : legacyCleanupVerificationPending ? "Verification pending" : "Cleanup pending"}</span>
         </div>
         ${!legacyCleanupComplete && unmigratedInviteCount === 0 ? `
           <form class="inline" method="post" action="${ADMIN_PATH}" data-confirm="Permanently remove legacy invite and session rollback data? This cannot be undone.">
             <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
             <input type="hidden" name="action" value="finalize_legacy_auth_state_cleanup" />
+            <input type="hidden" name="trashPage" value="${currentTrashPage}" />
             <label class="field"><span>2FA code</span><input name="step_up_token" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" required /></label>
             <button class="danger" type="submit">Finalize legacy cleanup</button>
           </form>
           <p class="hint">The server checks all transition deadlines again before deleting anything. An early request fails without deleting legacy state.</p>
         ` : ""}
       </section>` : ""}
+      ` : ""}
 
+      ${view === "create" ? `
       <section class="panel create-panel">
         <div class="section-head">
           <div>
@@ -2620,6 +2750,7 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
           </div>
         </form>
       </section>
+      ` : ""}
 
       ${selectedInvite ? `
         <section class="selected-invite-detail">
@@ -2640,7 +2771,7 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
         </section>
       ` : ""}
 
-      <section class="invite-list">
+      ${view === "list" ? `<section class="invite-list">
         <div class="section-head">
           <div>
             <h2>UUIDs</h2>
@@ -2654,20 +2785,20 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
           <div class="panel empty">No UUIDs yet</div>
         `}
         ${renderAdminPagination("invites", currentPage, inviteCount, currentPage, currentTrashPage)}
-      </section>
+      </section>` : ""}
 
-      <section class="trash-list">
+      ${view === "maintenance" ? `<section class="trash-list">
         <div class="section-head">
           <div>
             <h2>Recycle Bin</h2>
             <p class="muted">Restore deleted UUIDs or IP groups, or permanently remove their backend records.</p>
           </div>
         </div>
-        ${trash.length ? trash.map((item) => renderTrashRow(item, csrf)).join("") : `
+        ${trash.length ? trash.map((item) => renderTrashRow(item, csrf, currentTrashPage)).join("") : `
           <div class="panel empty">Recycle bin is empty</div>
         `}
         ${renderAdminPagination("trash", currentTrashPage, trashCount, currentPage, currentTrashPage)}
-      </section>
+      </section>` : ""}
     </section>
     <script nonce="${nonce}">
       const uuidInput = document.getElementById("uuid");
@@ -2689,7 +2820,7 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
         crypto.getRandomValues(bytes);
         return "sk-" + Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join("");
       };
-      document.getElementById("generate-user").addEventListener("click", () => {
+      document.getElementById("generate-user")?.addEventListener("click", () => {
         uuidInput.value = generateValue("uuid");
         ensureGeneratedSub2ApiKey(createEditor);
         copyButton.textContent = "Copy";
@@ -2702,23 +2833,15 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
         input.addEventListener("input", applyNormalizedUsername);
         input.addEventListener("blur", applyNormalizedUsername);
       });
-      copyButton.addEventListener("click", async () => {
+      copyButton?.addEventListener("click", async () => {
         if (!uuidInput.value) {
           uuidInput.value = generateValue("uuid");
         }
-        await navigator.clipboard.writeText(uuidInput.value);
-        copyButton.textContent = "Copied";
-        window.setTimeout(() => {
-          copyButton.textContent = "Copy";
-        }, 1400);
+        await window.copyAdminValue(copyButton, uuidInput.value);
       });
       document.querySelectorAll(".copy-row").forEach((button) => {
         button.addEventListener("click", async () => {
-          await navigator.clipboard.writeText(button.dataset.copy);
-          button.textContent = "Copied";
-          window.setTimeout(() => {
-            button.textContent = "Copy";
-          }, 1400);
+          await window.copyAdminValue(button, button.dataset.copy || "");
         });
       });
       document.querySelectorAll("[data-manual-ip-input]").forEach((input) => {
@@ -2793,11 +2916,7 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
         if (copyKeyButton) {
           const input = copyKeyButton.closest(".api-key-field")?.querySelector('[data-field="api-key"]');
           if (!input?.value) return;
-          await navigator.clipboard.writeText(input.value);
-          copyKeyButton.textContent = "Copied";
-          window.setTimeout(() => {
-            copyKeyButton.textContent = "Copy";
-          }, 1400);
+          await window.copyAdminValue(copyKeyButton, input.value);
           return;
         }
 
@@ -2934,8 +3053,8 @@ function renderAdminPagination(kind, currentPage, totalCount, invitePage, trashP
   if (totalPages <= 1) return "";
   const label = kind === "invites" ? "UUID" : "Recycle bin";
   const href = (targetPage) => kind === "invites"
-    ? adminPageHref(targetPage, trashPage)
-    : adminPageHref(invitePage, targetPage);
+    ? adminPageHref(targetPage)
+    : adminMaintenanceHref(targetPage);
   return `
     <nav class="pagination" aria-label="${label} pagination">
       <span class="muted">Page ${currentPage} of ${totalPages} · ${totalCount} total</span>
@@ -2947,12 +3066,51 @@ function renderAdminPagination(kind, currentPage, totalCount, invitePage, trashP
   `;
 }
 
-function adminPageHref(page, trashPage) {
+function adminPageHref(page) {
   const params = new URLSearchParams();
   if (page > 1) params.set("page", String(page));
-  if (trashPage > 1) params.set("trashPage", String(trashPage));
   const query = params.toString();
   return query ? `${ADMIN_PATH}?${query}` : ADMIN_PATH;
+}
+
+function adminMaintenanceHref(trashPage = 1) {
+  const params = new URLSearchParams({ view: "maintenance" });
+  if (trashPage > 1) params.set("trashPage", String(trashPage));
+  return `${ADMIN_PATH}?${params.toString()}`;
+}
+
+function adminMaintenancePostHref(form) {
+  return adminMaintenanceHref(parseAdminPageNumber(
+    form.get("trashPage"),
+    MAX_ADMIN_TRASH_PAGE,
+  ));
+}
+
+function legacyAdminCanonicalLocation(adminUrl) {
+  const requestedView = String(adminUrl.searchParams.get("view") || "").trim().toLowerCase();
+  if (
+    adminUrl.pathname === ADMIN_PATH
+    && adminUrl.searchParams.has("view")
+    && !adminUrl.searchParams.has("detail")
+    && !adminUrl.searchParams.has("edit")
+    && requestedView !== "create"
+    && requestedView !== "maintenance"
+  ) {
+    return ADMIN_PATH;
+  }
+  if (
+    adminUrl.pathname !== ADMIN_PATH
+    || adminUrl.searchParams.has("view")
+    || adminUrl.searchParams.has("detail")
+    || adminUrl.searchParams.has("edit")
+    || !adminUrl.searchParams.has("trashPage")
+  ) {
+    return "";
+  }
+  return adminMaintenanceHref(parseAdminPageNumber(
+    adminUrl.searchParams.get("trashPage"),
+    MAX_ADMIN_TRASH_PAGE,
+  ));
 }
 
 function adminInviteHref(uuid, pagination = {}, edit = false, ipPage = 1) {
@@ -2968,6 +3126,44 @@ function adminInviteHref(uuid, pagination = {}, edit = false, ipPage = 1) {
     params.set("ipPage", String(ipPage));
   }
   return `${ADMIN_PATH}?${params.toString()}`;
+}
+
+function adminInvitePostHref(form, uuid) {
+  const context = parseAdminInvitePostContext(form);
+  return adminInviteHref(
+    uuid,
+    { page: context.page, trashPage: context.trashPage },
+    context.edit,
+    context.ipPage,
+  );
+}
+
+function parseAdminInvitePostContext(form) {
+  const fallback = { page: 1, trashPage: 1, ipPage: 1, edit: false };
+  const raw = String(form.get("admin_context") || "");
+  try {
+    decodeURIComponent(raw.replace(/\+/g, " "));
+  } catch {
+    return fallback;
+  }
+  const params = new URLSearchParams(raw);
+  const allowedKeys = new Set(["p", "t", "i", "v"]);
+  const keys = [...params.keys()];
+  if (
+    keys.length !== allowedKeys.size
+    || keys.some((key) => !allowedKeys.has(key))
+    || [...allowedKeys].some((key) => params.getAll(key).length !== 1)
+  ) {
+    return fallback;
+  }
+  const view = params.get("v");
+  if (view !== "d" && view !== "e") return fallback;
+  return {
+    page: parseAdminPageNumber(params.get("p"), MAX_ADMIN_INVITE_PAGE),
+    trashPage: parseAdminPageNumber(params.get("t"), MAX_ADMIN_TRASH_PAGE),
+    ipPage: parseAdminPageNumber(params.get("i"), MAX_ADMIN_IP_GROUP_PAGE),
+    edit: view === "e",
+  };
 }
 
 function renderInviteListRow(invite, pagination = {}) {
@@ -2997,17 +3193,17 @@ function renderInviteListRow(invite, pagination = {}) {
   `;
 }
 
-function renderTrashRow(item, csrf) {
+function renderTrashRow(item, csrf, trashPage = 1) {
   if (item.type === "uuid") {
-    return renderUuidTrashRow(item, csrf);
+    return renderUuidTrashRow(item, csrf, trashPage);
   }
   if (item.type === "ip_group") {
-    return renderIpGroupTrashRow(item, csrf);
+    return renderIpGroupTrashRow(item, csrf, trashPage);
   }
   return "";
 }
 
-function renderUuidTrashRow(item, csrf) {
+function renderUuidTrashRow(item, csrf, trashPage) {
   const invite = item.invite || {};
   const recordCount = Number.isSafeInteger(Number(item.recordCount))
     ? Math.max(0, Number(item.recordCount))
@@ -3026,6 +3222,7 @@ function renderUuidTrashRow(item, csrf) {
             <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
             <input type="hidden" name="action" value="restore_uuid" />
             <input type="hidden" name="trash_id" value="${escapeHtml(item.id)}" />
+            <input type="hidden" name="trashPage" value="${parseAdminPageNumber(trashPage, MAX_ADMIN_TRASH_PAGE)}" />
             <input name="step_up_token" aria-label="2FA code for UUID restore" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />
             <button class="secondary compact" type="submit">Restore</button>
           </form>
@@ -3033,6 +3230,7 @@ function renderUuidTrashRow(item, csrf) {
             <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
             <input type="hidden" name="action" value="purge_uuid" />
             <input type="hidden" name="trash_id" value="${escapeHtml(item.id)}" />
+            <input type="hidden" name="trashPage" value="${parseAdminPageNumber(trashPage, MAX_ADMIN_TRASH_PAGE)}" />
             <input name="step_up_token" aria-label="2FA code" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />
             <button class="danger compact" type="submit">Delete forever</button>
           </form>
@@ -3042,7 +3240,7 @@ function renderUuidTrashRow(item, csrf) {
   `;
 }
 
-function renderIpGroupTrashRow(item, csrf) {
+function renderIpGroupTrashRow(item, csrf, trashPage) {
   const group = item.group || {};
   const place = [group.country, group.region, group.city].filter(Boolean).join(" / ") || "Unknown location";
   const ipCount = Number.isSafeInteger(Number(group.ipCount))
@@ -3061,6 +3259,7 @@ function renderIpGroupTrashRow(item, csrf) {
             <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
             <input type="hidden" name="action" value="restore_ip_group" />
             <input type="hidden" name="trash_id" value="${escapeHtml(item.id)}" />
+            <input type="hidden" name="trashPage" value="${parseAdminPageNumber(trashPage, MAX_ADMIN_TRASH_PAGE)}" />
             <input name="step_up_token" aria-label="2FA code to restore IP group" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />
             <button class="secondary compact" type="submit">Restore</button>
           </form>
@@ -3068,6 +3267,7 @@ function renderIpGroupTrashRow(item, csrf) {
             <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
             <input type="hidden" name="action" value="purge_ip_group" />
             <input type="hidden" name="trash_id" value="${escapeHtml(item.id)}" />
+            <input type="hidden" name="trashPage" value="${parseAdminPageNumber(trashPage, MAX_ADMIN_TRASH_PAGE)}" />
             <input name="step_up_token" aria-label="2FA code" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />
             <button class="danger compact" type="submit">Delete forever</button>
           </form>
@@ -3111,6 +3311,7 @@ function renderInviteRow(invite, csrf, request, env, pagination = {}) {
             <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
             <input type="hidden" name="action" value="rotate_access_key" />
             <input type="hidden" name="uuid" value="${escapeHtml(invite.uuid)}" />
+            ${renderInvitePostContextFields(pagination, ipPage, isEditing)}
             <input name="step_up_token" aria-label="2FA code for key rotation" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />
             <button class="secondary compact" type="submit">${invite.accessKeyHmac ? "Rotate key" : "Create access key"}</button>
           </form>
@@ -3118,6 +3319,7 @@ function renderInviteRow(invite, csrf, request, env, pagination = {}) {
             <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
             <input type="hidden" name="action" value="reset_sub2api_password" />
             <input type="hidden" name="uuid" value="${escapeHtml(invite.uuid)}" />
+            ${renderInvitePostContextFields(pagination, ipPage, isEditing)}
             <input name="step_up_token" aria-label="2FA code for login reset" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />
             <button class="secondary compact" type="submit">Reset login</button>
           </form>
@@ -3125,19 +3327,21 @@ function renderInviteRow(invite, csrf, request, env, pagination = {}) {
             <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
             <input type="hidden" name="action" value="refresh_sub2api_status" />
             <input type="hidden" name="uuid" value="${escapeHtml(invite.uuid)}" />
+            ${renderInvitePostContextFields(pagination, ipPage, isEditing)}
             <button class="secondary compact" type="submit">Refresh Sub2API</button>
           </form>
           <form method="post" action="${ADMIN_PATH}" data-confirm="Delete this UUID and all of its IP groups?">
             <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
             <input type="hidden" name="action" value="delete" />
             <input type="hidden" name="uuid" value="${escapeHtml(invite.uuid)}" />
+            ${renderInvitePostContextFields(pagination, ipPage, isEditing)}
             <input name="step_up_token" aria-label="2FA code to delete UUID" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />
             <button class="danger compact" type="submit">Delete UUID</button>
           </form>
         </div>
       </div>
       <div class="invite-main">
-        ${isEditing ? renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env) : renderInviteSummary(invite, apiConfigs, ADMIN_PATH, pagination)}
+        ${isEditing ? renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env, pagination, ipPage) : renderInviteSummary(invite, apiConfigs, ADMIN_PATH, pagination)}
         <section class="ip-panel">
           <div class="subhead">
             <h3>IP groups</h3>
@@ -3145,7 +3349,7 @@ function renderInviteRow(invite, csrf, request, env, pagination = {}) {
           </div>
           ${recordsOversized
             ? `<span class="error">IP group data is too large to display safely.</span>`
-            : `${renderManualIpGroupForm(invite.uuid, csrf)}${groups.length ? groups.map((group, index) => renderIpGroup(group, invite.uuid, csrf, index === 0)).join("") : `<span class="muted">No IP groups yet</span>`}${renderIpGroupPagination(invite.uuid, ipPage, recordCount, pagination, isEditing)}`}
+            : `${renderManualIpGroupForm(invite.uuid, csrf, pagination, ipPage, isEditing)}${groups.length ? groups.map((group, index) => renderIpGroup(group, invite.uuid, csrf, index === 0, pagination, ipPage, isEditing)).join("") : `<span class="muted">No IP groups yet</span>`}${renderIpGroupPagination(invite.uuid, ipPage, recordCount, pagination, isEditing)}`}
         </section>
       </div>
     </article>
@@ -3172,12 +3376,26 @@ function renderIpGroupPagination(uuid, currentPage, totalCount, pagination, isEd
   `;
 }
 
-function renderManualIpGroupForm(uuid, csrf) {
+function renderInvitePostContextFields(pagination, ipPage, isEditing) {
+  const page = parseAdminPageNumber(pagination?.page, MAX_ADMIN_INVITE_PAGE);
+  const trashPage = parseAdminPageNumber(pagination?.trashPage, MAX_ADMIN_TRASH_PAGE);
+  const currentIpPage = parseAdminPageNumber(ipPage, MAX_ADMIN_IP_GROUP_PAGE);
+  const context = new URLSearchParams({
+    p: String(page),
+    t: String(trashPage),
+    i: String(currentIpPage),
+    v: isEditing ? "e" : "d",
+  });
+  return `<input type="hidden" name="admin_context" value="${escapeHtml(context.toString())}" />`;
+}
+
+function renderManualIpGroupForm(uuid, csrf, pagination, ipPage, isEditing) {
   return `
     <form class="manual-ip-form" method="post" action="${ADMIN_PATH}">
       <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
       <input type="hidden" name="action" value="add_ip_group" />
       <input type="hidden" name="uuid" value="${escapeHtml(uuid)}" />
+      ${renderInvitePostContextFields(pagination, ipPage, isEditing)}
       <input class="expiration-mode" type="hidden" name="expiration_mode" value="days" />
       <div class="subhead compact-subhead">
         <h3>Add IP</h3>
@@ -3217,12 +3435,13 @@ function renderManualIpGroupForm(uuid, csrf) {
   `;
 }
 
-function renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env) {
+function renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env, pagination, ipPage) {
   return `
     <form class="invite-edit" method="post" action="${ADMIN_PATH}">
       <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
       <input type="hidden" name="action" value="update_invite" />
       <input type="hidden" name="original_uuid" value="${escapeHtml(invite.uuid)}" />
+      ${renderInvitePostContextFields(pagination, ipPage, true)}
       <div class="form-grid">
         <div class="field span-2">
           <label for="uuid-${escapeHtml(invite.uuid)}">UUID</label>
@@ -3303,7 +3522,15 @@ function renderApiConfigInputRow(config) {
   `;
 }
 
-function renderIpGroup(group, uuid, csrf, isInitiallyOpen = false) {
+function renderIpGroup(
+  group,
+  uuid,
+  csrf,
+  isInitiallyOpen = false,
+  pagination = {},
+  ipPage = 1,
+  isEditing = false,
+) {
   const place = formatGroupPlace(group) || "Unknown location";
   const meta = [group.asOrganization, group.colo, group.geoSource ? `geo: ${group.geoSource}` : ""].filter(Boolean).join(" · ");
   const expiresInDays = daysUntil(group.expiresAt);
@@ -3333,6 +3560,7 @@ function renderIpGroup(group, uuid, csrf, isInitiallyOpen = false) {
             <input type="hidden" name="action" value="delete_ip_group" />
             <input type="hidden" name="uuid" value="${escapeHtml(uuid)}" />
             <input type="hidden" name="group_id" value="${escapeHtml(group.id)}" />
+            ${renderInvitePostContextFields(pagination, ipPage, isEditing)}
             <input name="step_up_token" aria-label="2FA code to delete IP group" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />
             <button class="danger compact" type="submit">Delete group</button>
           </form>
@@ -3348,6 +3576,7 @@ function renderIpGroup(group, uuid, csrf, isInitiallyOpen = false) {
           <input type="hidden" name="action" value="update_ip_group_expiration" />
           <input type="hidden" name="uuid" value="${escapeHtml(uuid)}" />
           <input type="hidden" name="group_id" value="${escapeHtml(group.id)}" />
+          ${renderInvitePostContextFields(pagination, ipPage, isEditing)}
           <input class="expiration-mode" type="hidden" name="expiration_mode" value="date" />
           <label class="expiry-field" for="expires-${escapeHtml(group.id)}">
             <span>Expires</span>
@@ -3727,6 +3956,7 @@ async function callSub2ApiSync(env, action, payload, maxBytes = 0) {
   });
   const timestamp = String(Math.floor(Date.now() / 1000));
   const nonce = randomHex(16);
+  const requestId = `worker-${randomHex(16)}`;
   const signature = await hmacSha256Hex(syncSecret, `${timestamp}.${nonce}.${body}`);
   let response;
   try {
@@ -3737,15 +3967,22 @@ async function callSub2ApiSync(env, action, payload, maxBytes = 0) {
         "x-sub2api-sync-timestamp": timestamp,
         "x-sub2api-sync-nonce": nonce,
         "x-sub2api-sync-signature": signature,
+        "x-request-id": requestId,
       },
       // Workers supports follow/manual only. Manual prevents an unapproved
       // redirect from becoming a second outbound request.
       redirect: "manual",
-      signal: AbortSignal.timeout(SUB2API_SYNC_TIMEOUT_MS),
+      signal: AbortSignal.timeout(sub2apiSyncTimeoutForAction(action)),
       body,
     });
-  } catch {
-    throw new Error("Sub2API sync request failed");
+  } catch (error) {
+    throw new Sub2ApiSyncError({
+      status: error?.name === "TimeoutError" ? 504 : 502,
+      code: error?.name === "TimeoutError" ? "worker_timeout" : "transport_unavailable",
+      retryable: true,
+      requestId,
+      action,
+    });
   }
 
   let result;
@@ -3755,11 +3992,27 @@ async function callSub2ApiSync(env, action, payload, maxBytes = 0) {
       resolveSub2ApiSyncResponseLimit(action, maxBytes),
     );
   } catch {
-    throw new Error("Sub2API sync request failed");
+    throw new Sub2ApiSyncError({
+      status: 502,
+      code: "invalid_response",
+      retryable: true,
+      requestId,
+      action,
+    });
+  }
+  if (!response.ok) {
+    const failure = parseSub2ApiSyncFailure(response, result, action);
+    if (failure) throw failure;
+    throw new Sub2ApiSyncError({
+      status: 502,
+      code: "invalid_response",
+      retryable: true,
+      requestId,
+      action,
+    });
   }
   if (
-    !response.ok
-    || !result
+    !result
     || typeof result !== "object"
     || Array.isArray(result)
     || result.ok !== true
@@ -3769,6 +4022,35 @@ async function callSub2ApiSync(env, action, payload, maxBytes = 0) {
   }
   validateSub2ApiSyncResult(result, action, payload);
   return result;
+}
+
+function sub2apiSyncTimeoutForAction(action) {
+  return action === "login" ? SUB2API_SYNC_LOGIN_TIMEOUT_MS : SUB2API_SYNC_TIMEOUT_MS;
+}
+
+function parseSub2ApiSyncFailure(response, result, action) {
+  if (
+    !SUB2API_SYNC_ERROR_STATUSES.has(response.status)
+    || !result
+    || typeof result !== "object"
+    || Array.isArray(result)
+    || result.ok !== false
+    || typeof result.retryable !== "boolean"
+    || !/^[a-z][a-z0-9_]{0,63}$/.test(String(result.error || ""))
+    || !/^[A-Za-z0-9._-]{1,64}$/.test(String(result.requestId || ""))
+    || (Object.hasOwn(result, "action") && result.action !== action)
+  ) {
+    return null;
+  }
+  const responseRequestId = String(response.headers.get("x-request-id") || "");
+  if (responseRequestId && responseRequestId !== result.requestId) return null;
+  return new Sub2ApiSyncError({
+    status: response.status,
+    code: result.error,
+    retryable: result.retryable,
+    requestId: result.requestId,
+    action,
+  });
 }
 
 function resolveSub2ApiSyncResponseLimit(action, requestedMaxBytes) {
@@ -4389,9 +4671,9 @@ function renderMessage(title, message) {
   `);
 }
 
-function prepareIssuedAccessKeysResponse(items, remainingCount = 0) {
+function prepareIssuedAccessKeysResponse(items, remainingCount = 0, returnHref = ADMIN_PATH) {
   const response = html(
-    renderIssuedAccessKeys(items, remainingCount),
+    renderIssuedAccessKeys(items, remainingCount, returnHref),
     200,
     ISSUED_ACCESS_KEYS_HTML_MAX_BYTES,
   );
@@ -4401,7 +4683,7 @@ function prepareIssuedAccessKeysResponse(items, remainingCount = 0) {
   return response;
 }
 
-function renderIssuedAccessKeys(items, remainingCount = 0) {
+function renderIssuedAccessKeys(items, remainingCount = 0, returnHref = ADMIN_PATH) {
   const rows = items.length
     ? items.map((item) => `
       <div class="endpoint-summary">
@@ -4418,7 +4700,7 @@ function renderIssuedAccessKeys(items, remainingCount = 0) {
       <p>These keys are shown once. Distribute them securely before leaving this page.</p>
       <div class="endpoint-summary-list">${rows}</div>
       ${remainingCount > 0 ? `<p class="muted">${escapeHtml(String(remainingCount))} account${remainingCount === 1 ? "" : "s"} remain. Return to admin and run the next batch after saving these keys.</p>` : ""}
-      <a href="${ADMIN_PATH}">Return to admin</a>
+      <a href="${escapeHtml(returnHref)}">Return to admin</a>
     </section>
   `, "wide");
 }
@@ -4533,6 +4815,27 @@ function page(title, body, layout = "narrow") {
     .inspector-panel, .inspector-filters, .detail-card { display: grid; gap: 16px; }
     .inspector-filter-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
     .nav-link { text-decoration: none; }
+    .admin-tabs {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+    }
+    .admin-tabs .nav-link {
+      min-width: 0;
+      padding: 10px 12px;
+      border-radius: 0;
+      background: transparent;
+      color: #5f6065;
+      text-align: center;
+      border-bottom: 2px solid transparent;
+      box-shadow: none;
+    }
+    .admin-tabs .nav-link.active {
+      color: #1d1d1f;
+      border-bottom-color: #0071e3;
+      font-weight: 600;
+    }
+    .admin-tabs .nav-link:hover { background: rgba(0, 0, 0, 0.035); box-shadow: none; }
     .usage-list { display: grid; gap: 10px; }
     .usage-row { display: grid; grid-template-columns: minmax(220px, 1fr) auto auto; align-items: center; gap: 14px; padding: 14px 0; border-bottom: 1px solid rgba(0, 0, 0, 0.08); }
     .usage-row:last-child { border-bottom: 0; }
@@ -4543,6 +4846,17 @@ function page(title, body, layout = "narrow") {
     .usage-detail div { min-width: 0; padding: 14px; background: #fff; }
     .usage-detail dt { color: #5f6065; font-size: 13px; }
     .usage-detail dd { margin: 5px 0 0; font-size: 14px; overflow-wrap: anywhere; }
+    .clipboard-status {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
     .invite-summary, .endpoint-summary-list { display: grid; gap: 12px; min-width: 0; }
     .endpoint-summary { display: grid; gap: 5px; padding: 12px; border: 1px solid rgba(0, 0, 0, 0.08); border-radius: 8px; }
     .invite-card { content-visibility: auto; contain-intrinsic-size: auto 520px; }
@@ -4831,7 +5145,7 @@ function page(title, body, layout = "narrow") {
     .time-grid span { display: grid; gap: 4px; color: #5f6065; font-size: 13px; }
     .expiry-form {
       display: grid;
-      grid-template-columns: minmax(220px, 1fr) minmax(88px, 0.35fr) auto;
+      grid-template-columns: minmax(220px, 1fr) minmax(88px, 0.35fr);
       align-items: end;
       gap: 8px;
       min-width: 0;
@@ -4868,14 +5182,15 @@ function page(title, body, layout = "narrow") {
     .muted-pill { opacity: 0.78; }
     .manual-ip-grid {
       display: grid;
-      grid-template-columns: minmax(120px, 0.35fr) minmax(220px, 0.75fr) auto;
+      grid-template-columns: minmax(120px, 0.35fr) minmax(220px, 0.75fr);
       gap: 8px;
       align-items: end;
     }
+    .manual-ip-grid input[type="datetime-local"] { min-width: 0; }
     .manual-ip-action { display: flex; justify-content: flex-end; }
     .manual-ip-action button { height: 32px; }
     .expiry-form input { height: 32px; border-radius: 8px; font-size: 13px; }
-    .expiry-form input[type="datetime-local"] { min-width: 220px; }
+    .expiry-form input[type="datetime-local"] { min-width: 0; }
     .ip-pill {
       display: inline-flex;
       align-items: center;
@@ -4933,6 +5248,8 @@ function page(title, body, layout = "narrow") {
       th, td { padding: 10px 8px; }
       h1 { font-size: 28px; }
       .panel, .message { padding: 16px; border-radius: 8px; }
+      .admin-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .admin-tabs .nav-link:last-child { grid-column: 1 / -1; }
     }
     @media (max-width: 240px) {
       body { padding: 16px 6px; }
@@ -4984,6 +5301,10 @@ function page(title, body, layout = "narrow") {
         color: #f5f5f7;
       }
       button.secondary:hover { background: rgba(255, 255, 255, 0.16); }
+      .admin-tabs { border-bottom-color: rgba(255, 255, 255, 0.12); }
+      .admin-tabs .nav-link { background: transparent; color: #aeaeb2; }
+      .admin-tabs .nav-link.active { color: #f5f5f7; border-bottom-color: #0a84ff; }
+      .admin-tabs .nav-link:hover { background: rgba(255, 255, 255, 0.06); }
       button.secondary:active { background: rgba(255, 255, 255, 0.2); }
       button.danger { background: #ff453a; }
       button.danger:hover { background: #ff6961; }
@@ -5018,7 +5339,25 @@ function page(title, body, layout = "narrow") {
 </head>
 <body class="${bodyClass}">
   <main class="${mainClass}">${renderedBody}</main>
+  <p id="clipboard-status" class="clipboard-status" role="status" aria-live="polite"></p>
   <script nonce="${nonce}">
+    const clipboardStatus = document.getElementById("clipboard-status");
+    window.copyAdminValue = async (button, value) => {
+      const previous = button.textContent;
+      try {
+        await navigator.clipboard.writeText(value);
+        button.textContent = "Copied";
+        clipboardStatus?.setAttribute("role", "status");
+        if (clipboardStatus) clipboardStatus.textContent = "Copied to clipboard.";
+      } catch {
+        button.textContent = "Copy failed";
+        clipboardStatus?.setAttribute("role", "alert");
+        if (clipboardStatus) {
+          clipboardStatus.textContent = "Copy failed. Select the value and copy it manually.";
+        }
+      }
+      window.setTimeout(() => { button.textContent = previous; }, 1400);
+    };
     document.querySelectorAll("form[data-confirm]").forEach((form) => {
       form.addEventListener("submit", (event) => {
         if (!window.confirm(form.dataset.confirm || "Confirm this action?")) event.preventDefault();
@@ -5026,14 +5365,7 @@ function page(title, body, layout = "narrow") {
     });
     document.querySelectorAll(".copy-value").forEach((button) => {
       button.addEventListener("click", async () => {
-        try {
-          await navigator.clipboard.writeText(button.dataset.copy || "");
-          const previous = button.textContent;
-          button.textContent = "Copied";
-          window.setTimeout(() => { button.textContent = previous; }, 1400);
-        } catch {
-          button.textContent = "Copy failed";
-        }
+        await window.copyAdminValue(button, button.dataset.copy || "");
       });
     });
   </script>
@@ -5443,11 +5775,13 @@ export const __test = Object.freeze({
   parseUsageIdentifier,
   getAdminDashboard,
   parseAdminPageNumber,
+  parseAdminInvitePostContext,
   renderAdminPagination,
   ADMIN_PAGE_SIZE,
   ADMIN_RECORD_PAYLOAD_MAX_BYTES,
   exceedsUtf8ByteLimit,
   SUB2API_SYNC_TIMEOUT_MS,
+  sub2apiSyncTimeoutForAction,
   totp,
   verifyTotp,
   createInvite,

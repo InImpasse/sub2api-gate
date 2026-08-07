@@ -139,6 +139,24 @@ docker run --rm --pull never --network none --read-only \
 python3 -m unittest discover -s sub2api-sync/tests -v
 ```
 
+### Local verification gate
+
+The complete local verification gate uses no production credentials or private
+Worker configuration. It runs Worker and sync coverage ratchets, guarded
+release-tool coverage, isolated PostgreSQL/Redis dependency tests, browser UI
+contracts, release-policy consistency, and whitespace validation. Docker is
+required for the isolated dependency tests.
+
+```bash
+(cd worker-allow-ip && npm ci && npx playwright install chromium)
+bash deploy/verify-local.sh
+```
+
+GitHub Actions runs the same gate for pull requests and pushes. The temporary
+PostgreSQL and Redis containers use fixed image digests, loopback-only Redis,
+test-only credentials, and exact-name cleanup. A live administrator recovery
+proof remains a private-TTY production gate and is intentionally not automated.
+
 ### 4. Deploy the Cloudflare Worker
 
 ```bash

@@ -111,6 +111,305 @@ test("admin GET policy uses cached invite state", () => {
   assert.equal(__test.shouldRefreshInvitesOnAdminGet(), false);
 });
 
+test("admin routes reject unknown paths, unsupported methods, and non-form posts", async () => {
+  const env = adminEnv({
+    async get() { return null; },
+    async put() {},
+    async delete() {},
+  });
+
+  const unknown = await handleAdmin(new Request(
+    "https://api.example.test/allow-ip/admin/unknown",
+  ), env);
+  assert.equal(unknown.status, 404);
+
+  const wrongBaseMethod = await handleAdmin(new Request(
+    "https://api.example.test/allow-ip/admin",
+    { method: "PUT" },
+  ), env);
+  assert.equal(wrongBaseMethod.status, 405);
+  assert.equal(wrongBaseMethod.headers.get("allow"), "GET, POST");
+
+  const wrongUsageMethod = await handleAdmin(new Request(
+    "https://api.example.test/allow-ip/admin/requests",
+    { method: "POST" },
+  ), env);
+  assert.equal(wrongUsageMethod.status, 405);
+  assert.equal(wrongUsageMethod.headers.get("allow"), "GET");
+
+  const unsupported = await handleAdmin(new Request(
+    "https://api.example.test/allow-ip/admin",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "login" }),
+    },
+  ), env);
+  assert.equal(unsupported.status, 415);
+
+  const malformed = await handleAdmin(new Request(
+    "https://api.example.test/allow-ip/admin",
+    {
+      method: "POST",
+      headers: { "content-type": "multipart/form-data" },
+      body: "not-a-multipart-body",
+    },
+  ), env);
+  assert.equal(malformed.status, 400);
+});
+
+test("authenticated admin posts reject unknown actions instead of redirecting", async () => {
+  const token = "unknown-admin-action-session";
+  const sessionHash = await sha256Hex(token);
+  const csrf = "unknown-admin-action-csrf";
+  const values = new Map([
+    [`session:${sessionHash}`, JSON.stringify(await boundAdminSession(csrf, Date.now() + 60_000))],
+    ["invites", "[]"],
+    ["trash", "[]"],
+  ]);
+  const env = adminEnv({
+    async get(key) { return values.get(key) ?? null; },
+    async put(key, value) { values.set(key, value); },
+    async delete(key) { values.delete(key); },
+  });
+
+  const response = await handleAdmin(new Request(
+    "https://api.example.test/allow-ip/admin",
+    {
+      method: "POST",
+      headers: {
+        cookie: `sub2api_allow_admin=${token}`,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ action: "unknown_action", csrf }),
+    },
+  ), env);
+  const body = await response.text();
+
+  assert.equal(response.status, 400);
+  assert.match(body, /Unknown admin action/);
+  assert.equal(response.headers.get("location"), null);
+});
+
+test("invalid admin cookies are expired and one request reuses one AuthState store", async () => {
+  const missingToken = "revoked-admin-session";
+  const missing = await handleAdmin(new Request(
+    "https://api.example.test/allow-ip/admin",
+    { headers: { cookie: `sub2api_allow_admin=${missingToken}` } },
+  ), adminEnv({
+    async get() { return null; },
+    async put() {},
+    async delete() {},
+  }));
+  assert.equal(missing.status, 200);
+  assert.match(missing.headers.get("set-cookie") || "", /Max-Age=0/);
+
+  const token = "request-scoped-auth-state-session";
+  const sessionHash = await sha256Hex(token);
+  const session = await boundAdminSession("request-scoped-csrf", Date.now() + 60_000);
+  let bindingLookups = 0;
+  let statusCalls = 0;
+  const stub = {
+    async status() {
+      statusCalls += 1;
+      return { migrated: true, legacyCleanupComplete: true };
+    },
+    async getAdminSession(hash) {
+      assert.equal(hash, sessionHash);
+      return session;
+    },
+    async getAdminPage() {
+      return {
+        inviteCount: 0,
+        trashCount: 0,
+        unmigratedInviteCount: 0,
+        invites: [],
+        trash: [],
+      };
+    },
+  };
+  const env = {
+    ...adminEnv({ async get() { return null; }, async put() {}, async delete() {} }),
+    AUTH_STATE: {
+      getByName() {
+        bindingLookups += 1;
+        return stub;
+      },
+    },
+  };
+
+  const response = await handleAdmin(new Request(
+    "https://api.example.test/allow-ip/admin",
+    { headers: { cookie: `sub2api_allow_admin=${token}` } },
+  ), env);
+  assert.equal(response.status, 200);
+  assert.equal(bindingLookups, 1);
+  assert.equal(statusCalls, 1);
+});
+
+test("one admin allowlist mutation reuses the request AuthState readiness check", async () => {
+  const uuid = "7c484f74-6d93-43d1-9441-00c7d8d4ab11";
+  const token = "request-scoped-cloudflare-mutation-session";
+  const csrf = "request-scoped-cloudflare-mutation-csrf";
+  const sessionHash = await sha256Hex(token);
+  const session = await boundAdminSession(csrf, Date.now() + 60_000);
+  let bindingLookups = 0;
+  let statusCalls = 0;
+  let createdItem = null;
+  const markers = new Map();
+  const records = new Map();
+  const stub = {
+    async status() {
+      statusCalls += 1;
+      return { migrated: true, legacyCleanupComplete: true };
+    },
+    async getAdminSession(hash) {
+      assert.equal(hash, sessionHash);
+      return session;
+    },
+    async getInvites() {
+      return {
+        revision: 1,
+        items: [{ uuid, username: "admin-test", apiConfigs: [], sub2apiSync: {} }],
+      };
+    },
+    async claimRecordLease(_uuid, _ownerToken, now, leaseMs) {
+      return { claimed: true, leaseUntil: now + leaseMs };
+    },
+    async releaseRecordLease() {
+      return { released: true };
+    },
+    async registerCloudflareMutation(marker) {
+      markers.set(marker.mutationId, structuredClone(marker));
+      return { ok: true, created: true };
+    },
+    async updateCloudflareMutationItems(mutationId, itemIds) {
+      const marker = markers.get(mutationId);
+      markers.set(mutationId, { ...marker, itemIds: structuredClone(itemIds) });
+      return { ok: true, updated: true };
+    },
+    async resolveCloudflareMutation(mutationId) {
+      return { ok: true, resolved: markers.delete(mutationId) };
+    },
+  };
+  const env = {
+    ...adminEnv({
+      async get(key) { return records.get(key) ?? null; },
+      async put(key, value) { records.set(key, value); },
+      async delete(key) { records.delete(key); },
+    }),
+    AUTH_STATE: {
+      getByName() {
+        bindingLookups += 1;
+        return stub;
+      },
+    },
+    AUTH_RATE_LIMITER: {
+      getByName() {
+        return {
+          async consume() {
+            return { allowed: true, retryAfterSeconds: 0, resetAt: Date.now() + 60_000 };
+          },
+          async reset() { return { ok: true }; },
+        };
+      },
+    },
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init = {}) => {
+    if (init.method === "POST") {
+      const [item] = JSON.parse(init.body);
+      createdItem = { id: "request-scoped-created-item", ...item };
+      return Response.json({ success: true, result: {} });
+    }
+    return Response.json({
+      success: true,
+      result: createdItem ? [createdItem] : [],
+      result_info: { cursors: { after: "" } },
+    });
+  };
+
+  try {
+    const stepUpToken = await __test.totp(
+      env.ADMIN_TOTP_SECRET,
+      Math.floor(Date.now() / 1000 / 30),
+    );
+    const response = await handleAdmin(new Request(
+      "https://api.example.test/allow-ip/admin",
+      {
+        method: "POST",
+        headers: {
+          cookie: `sub2api_allow_admin=${token}`,
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          action: "add_ip_group",
+          csrf,
+          step_up_token: stepUpToken,
+          uuid,
+          ip_value: "198.51.100.8",
+          expires_in_days: "7",
+          expiration_mode: "days",
+          admin_context: "p=2&t=3&i=4&v=e",
+        }),
+      },
+    ), env);
+
+    assert.equal(response.status, 303);
+    assert.equal(
+      response.headers.get("location"),
+      `/allow-ip/admin?page=2&trashPage=3&edit=${uuid}&ipPage=4`,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(bindingLookups, 1);
+  assert.equal(statusCalls, 1);
+});
+
+test("admin preserves stable sync failures without exposing upstream detail", async () => {
+  const token = "stable-sync-error-session";
+  const sessionHash = await sha256Hex(token);
+  const values = new Map([[
+    `session:${sessionHash}`,
+    JSON.stringify(await boundAdminSession("sync-error-csrf", Date.now() + 60_000)),
+  ]]);
+  const env = adminEnv({
+    async get(key) { return values.get(key) ?? null; },
+    async put(key, value) { values.set(key, value); },
+    async delete(key) { values.delete(key); },
+  });
+  const originalFetch = globalThis.fetch;
+  const privateDetail = "private-origin-detail-must-not-escape";
+  globalThis.fetch = async () => Response.json({
+    ok: false,
+    error: "dependency_unavailable",
+    retryable: true,
+    requestId: "sync-admin-503",
+    action: "usage_logs_list",
+    detail: privateDetail,
+  }, {
+    status: 503,
+    headers: { "x-request-id": "sync-admin-503" },
+  });
+  try {
+    const response = await handleAdmin(new Request(
+      "https://api.example.test/allow-ip/admin/requests",
+      { headers: { cookie: `sub2api_allow_admin=${token}` } },
+    ), env);
+    const body = await response.text();
+    assert.equal(response.status, 503);
+    assert.equal(response.headers.get("x-request-id"), "sync-admin-503");
+    assert.equal(response.headers.get("retry-after"), "1");
+    assert.match(body, /dependency_unavailable/);
+    assert.match(body, /sync-admin-503/);
+    assert.doesNotMatch(body, new RegExp(privateDetail));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("Cloudflare deletion resolves current IDs instead of stale stored IDs", () => {
   const ids = __test.resolveCurrentCloudflareDeleteIds(
     [{ listItemId: "stale", listValue: "198.51.100.0/24" }],
@@ -257,7 +556,7 @@ test("admin dashboard list returns at most 25 summaries without reading IP recor
     env,
     new URL("https://api.example.test/allow-ip/admin?page=2&trashPage=3"),
   );
-  assert.deepEqual(calls, [[25, 25, 50, 25]]);
+  assert.deepEqual(calls, [[25, 25, 0, 1]]);
   assert.equal(dashboard.inviteCount, 100);
   assert.equal(dashboard.trashCount, 75);
   assert.equal(dashboard.unmigratedInviteCount, 9);
@@ -406,7 +705,7 @@ test("removing the final saved API row clears its credential reference", () => {
   assert.match(branch, /keyInput\.dispatchEvent\(new Event\("input", \{ bubbles: true \}\)\)/);
 });
 
-test("admin list HTTP response stays within 256 KiB and renders summaries only", async () => {
+test("admin list HTTP response stays within 96 KiB and renders only the UUID view", async () => {
   const sessionToken = "admin-list-budget-session";
   const sessionHash = await sha256Hex(sessionToken);
   const oversizedLegacyText = "x".repeat(20_000);
@@ -446,10 +745,12 @@ test("admin list HTTP response stays within 256 KiB and renders summaries only",
   assert.equal((body.match(/<article class="panel invite-card/g) || []).length, 25);
   assert.doesNotMatch(body, /name="action" value="add_ip_group"/);
   assert.doesNotMatch(body, /<h3>IP groups<\/h3>/);
-  assert.ok(new TextEncoder().encode(body).byteLength <= 256 * 1024);
+  assert.doesNotMatch(body, /<h2>Create UUID<\/h2>|<h2>Access key migration<\/h2>|<h2>Recycle Bin<\/h2>/);
+  assert.match(body, /aria-current="page"[^>]*>UUIDs<\/a>/);
+  assert.ok(new TextEncoder().encode(body).byteLength <= 96 * 1024);
 });
 
-test("admin detail HTTP response stays within 512 KiB and paginates 20 IP groups", async () => {
+test("admin detail HTTP response stays within 128 KiB and paginates 20 IP groups", async () => {
   const sessionToken = "admin-detail-budget-session";
   const sessionHash = await sha256Hex(sessionToken);
   const detailUuid = "00000000-0000-4000-8000-000000000019";
@@ -485,7 +786,7 @@ test("admin detail HTTP response stays within 512 KiB and paginates 20 IP groups
       return session;
     },
     async getAdminPage(inviteOffset, inviteLimit, trashOffset, trashLimit) {
-      assert.deepEqual([inviteOffset, inviteLimit, trashOffset, trashLimit], [25, 25, 50, 25]);
+      assert.deepEqual([inviteOffset, inviteLimit, trashOffset, trashLimit], [0, 1, 0, 1]);
       return {
         inviteCount: 100,
         trashCount: 75,
@@ -525,7 +826,105 @@ test("admin detail HTTP response stays within 512 KiB and paginates 20 IP groups
   assert.equal((body.match(/<details class="ip-group"/g) || []).length, 20);
   assert.match(body, /Page 2 of 3 · 45 groups/);
   assert.match(body, new RegExp(`page=2&amp;trashPage=3&amp;detail=${detailUuid}&amp;ipPage=3`));
-  assert.ok(new TextEncoder().encode(body).byteLength <= 512 * 1024);
+  const forms = [...body.matchAll(/<form\b[^>]*>[\s\S]*?<\/form>/g)].map((match) => match[0]);
+  for (const action of [
+    "rotate_access_key",
+    "reset_sub2api_password",
+    "refresh_sub2api_status",
+    "delete",
+    "add_ip_group",
+    "delete_ip_group",
+    "update_ip_group_expiration",
+  ]) {
+    const actionForms = forms.filter((form) => form.includes(`name="action" value="${action}"`));
+    assert.ok(actionForms.length > 0, `expected a rendered ${action} form`);
+    for (const form of actionForms) {
+      assert.match(form, /name="admin_context" value="p=2&amp;t=3&amp;i=2&amp;v=d"/);
+    }
+  }
+  assert.doesNotMatch(body, /<h2>Create UUID<\/h2>|<h2>Access key migration<\/h2>|<h2>UUIDs<\/h2>|<h2>Recycle Bin<\/h2>/);
+  assert.ok(body.indexOf("<h2>Selected UUID</h2>") < body.indexOf("<strong>selected</strong>"));
+  assert.ok(new TextEncoder().encode(body).byteLength <= 128 * 1024);
+});
+
+test("create and maintenance are focused views and legacy trash bookmarks canonicalize", async () => {
+  const sessionToken = "admin-focused-view-session";
+  const sessionHash = await sha256Hex(sessionToken);
+  const trashItems = Array.from({ length: 52 }, (_, index) => index === 51
+    ? {
+        id: `trash-${index}`,
+        type: "ip_group",
+        uuid: "00000000-0000-4000-8000-000000000051",
+        deletedAt: "2026-07-01T00:00:00.000Z",
+        group: { id: "group-51", country: "US", ips: [] },
+      }
+    : {
+        id: `trash-${index}`,
+        type: "uuid",
+        deletedAt: "2026-07-01T00:00:00.000Z",
+        invite: {
+          uuid: `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
+          username: `trash-user-${index}`,
+        },
+        records: [],
+      });
+  const values = new Map([
+    [`session:${sessionHash}`, JSON.stringify(await boundAdminSession("csrf", Date.now() + 60_000))],
+    ["invites", "[]"],
+    ["trash", JSON.stringify(trashItems)],
+  ]);
+  const env = adminEnv({
+    async get(key) { return values.get(key) ?? null; },
+    async put(key, value) { values.set(key, value); },
+    async delete(key) { values.delete(key); },
+  });
+  const headers = { cookie: `sub2api_allow_admin=${sessionToken}` };
+
+  const create = await handleAdmin(new Request(
+    "https://api.example.test/allow-ip/admin?view=create",
+    { headers },
+  ), env);
+  const createBody = await create.text();
+  assert.equal(create.status, 200);
+  assert.match(createBody, /<h2>Create UUID<\/h2>/);
+  assert.doesNotMatch(createBody, /<h2>Access key migration<\/h2>|<h2>UUIDs<\/h2>|<h2>Recycle Bin<\/h2>/);
+
+  const maintenance = await handleAdmin(new Request(
+    "https://api.example.test/allow-ip/admin?view=maintenance&trashPage=3",
+    { headers },
+  ), env);
+  const maintenanceBody = await maintenance.text();
+  assert.equal(maintenance.status, 200);
+  assert.match(maintenanceBody, /<h2>Access key migration<\/h2>/);
+  assert.match(maintenanceBody, /<h2>Recycle Bin<\/h2>/);
+  assert.doesNotMatch(maintenanceBody, /<h2>Create UUID<\/h2>|<h2>UUIDs<\/h2>/);
+  const maintenanceForms = [...maintenanceBody.matchAll(/<form\b[^>]*>[\s\S]*?<\/form>/g)]
+    .map((match) => match[0])
+    .filter((form) => /name="action" value="(?:restore|purge)_(?:uuid|ip_group)"/.test(form));
+  assert.equal(maintenanceForms.length, 4);
+  for (const form of maintenanceForms) {
+    assert.match(form, /name="trashPage" value="3"/);
+  }
+
+  const legacy = await handleAdmin(new Request(
+    "https://api.example.test/allow-ip/admin?page=2&trashPage=3",
+    { headers },
+  ), env);
+  assert.equal(legacy.status, 303);
+  assert.equal(legacy.headers.get("location"), "/allow-ip/admin?view=maintenance&trashPage=3");
+
+  const unknownView = await handleAdmin(new Request(
+    "https://api.example.test/allow-ip/admin?view=unknown",
+    { headers },
+  ), env);
+  assert.equal(unknownView.status, 303);
+  assert.equal(unknownView.headers.get("location"), "/allow-ip/admin");
+
+  const invalidDetail = await handleAdmin(new Request(
+    "https://api.example.test/allow-ip/admin?detail=not-a-uuid",
+    { headers },
+  ), env);
+  assert.equal(invalidDetail.status, 404);
 });
 
 test("admin HTML budget fails closed instead of sending an oversized document", async () => {
@@ -545,12 +944,35 @@ test("admin record byte budget is UTF-8 aware and pagination preserves the other
   assert.equal(__test.parseAdminPageNumber("0", 400), 1);
   assert.equal(__test.parseAdminPageNumber("401", 400), 1);
 
+  const contextForm = new FormData();
+  contextForm.set("admin_context", "p=2&t=3&i=4&v=e");
+  assert.deepEqual(__test.parseAdminInvitePostContext(contextForm), {
+    page: 2,
+    trashPage: 3,
+    ipPage: 4,
+    edit: true,
+  });
+  for (const invalidContext of [
+    "p=2&t=3&i=4&v=e&p=5",
+    "p=2&t=3&i=4&v=e&next=https%3A%2F%2Fevil.test",
+    "p=2&t=3&i=4&v=e%",
+    "p=2&t=3&i=4",
+  ]) {
+    contextForm.set("admin_context", invalidContext);
+    assert.deepEqual(__test.parseAdminInvitePostContext(contextForm), {
+      page: 1,
+      trashPage: 1,
+      ipPage: 1,
+      edit: false,
+    });
+  }
+
   const inviteNav = __test.renderAdminPagination("invites", 2, 100, 2, 3);
-  assert.match(inviteNav, /href="\/allow-ip\/admin\?trashPage=3"[^>]*>Previous/);
-  assert.match(inviteNav, /href="\/allow-ip\/admin\?page=3&amp;trashPage=3"[^>]*>Next/);
+  assert.match(inviteNav, /href="\/allow-ip\/admin"[^>]*>Previous/);
+  assert.match(inviteNav, /href="\/allow-ip\/admin\?page=3"[^>]*>Next/);
   const trashNav = __test.renderAdminPagination("trash", 3, 100, 2, 3);
-  assert.match(trashNav, /href="\/allow-ip\/admin\?page=2&amp;trashPage=2"[^>]*>Previous/);
-  assert.match(trashNav, /href="\/allow-ip\/admin\?page=2&amp;trashPage=4"[^>]*>Next/);
+  assert.match(trashNav, /href="\/allow-ip\/admin\?view=maintenance&amp;trashPage=2"[^>]*>Previous/);
+  assert.match(trashNav, /href="\/allow-ip\/admin\?view=maintenance&amp;trashPage=4"[^>]*>Next/);
 });
 
 function adminEnv(store) {

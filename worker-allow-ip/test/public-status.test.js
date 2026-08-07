@@ -192,6 +192,35 @@ test("public session lookup uses AuthState while status still reads only records
   assert.deepEqual(reads, [`records:${UUID}`]);
 });
 
+test("a rejected AuthState public session expires the browser UUID cookie", async () => {
+  const token = "rejected-auth-state-session";
+  const sessionHash = await sha256Hex(token);
+  const stub = {
+    async status() {
+      return { migrated: true };
+    },
+    async getPublicSession(candidate) {
+      assert.equal(candidate, sessionHash);
+      return null;
+    },
+  };
+
+  const response = await worker.fetch(new Request("https://api.example.test/allow-ip", {
+    headers: { Cookie: `sub2api_allow_uuid=${token}` },
+  }), {
+    AUTH_STATE: {
+      getByName() {
+        return stub;
+      },
+    },
+    ALLOWED_HOSTNAMES: "api.example.test",
+  });
+
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /Join the allowlist/);
+  assert.match(response.headers.get("set-cookie") || "", /sub2api_allow_uuid=;[^\r\n]*Max-Age=0/);
+});
+
 test("rotating an access key invalidates sessions issued for the previous version", async () => {
   const token = "stale-session-token";
   const sessionKey = `uuid-session:${await sha256Hex(token)}`;
@@ -222,6 +251,7 @@ test("rotating an access key invalidates sessions issued for the previous versio
   });
 
   assert.match(await response.text(), /Join the allowlist/);
+  assert.match(response.headers.get("set-cookie") || "", /sub2api_allow_uuid=;[^\r\n]*Max-Age=0/);
 });
 
 test("legacy UUID sessions expire at the credential migration deadline", async () => {
@@ -253,6 +283,7 @@ test("legacy UUID sessions expire at the credential migration deadline", async (
   });
 
   assert.match(await response.text(), /Join the allowlist/);
+  assert.match(response.headers.get("set-cookie") || "", /sub2api_allow_uuid=;[^\r\n]*Max-Age=0/);
 });
 
 test("public sessions without a finite expiry are rejected", async () => {
@@ -277,6 +308,7 @@ test("public sessions without a finite expiry are rejected", async () => {
 
   assert.equal(response.status, 200);
   assert.match(await response.text(), /Join the allowlist/);
+  assert.match(response.headers.get("set-cookie") || "", /sub2api_allow_uuid=;[^\r\n]*Max-Age=0/);
 });
 
 test("Sub2API auto-login rejects a cross-origin login URL before fetching a token", async () => {

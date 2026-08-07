@@ -76,6 +76,30 @@ INSERT INTO usage_logs (
   (999,'req-expired','model-expired',NULL,1,1,0.01,0.01,10,false,0,'/v1/chat/completions',now()-interval '40 days','PRIVATE_SENTINEL');
 SQL
 
+set +e
+docker exec "$postgres_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  -c 'CREATE UNIQUE INDEX CONCURRENTLY idx_usage_logs_metadata_search_trgm ON usage_logs ((1));' \
+  >/dev/null 2>&1
+invalid_index_status=$?
+set -e
+if [ "$invalid_index_status" -eq 0 ]; then
+  echo "usage invalid-index fixture unexpectedly succeeded" >&2
+  exit 1
+fi
+if [ "$(docker exec "$postgres_name" psql -U postgres -d postgres -Atc \
+  "SELECT count(*) FROM pg_index WHERE indexrelid='idx_usage_logs_metadata_search_trgm'::regclass AND NOT indisvalid")" != "1" ]; then
+  echo "usage invalid-index fixture was not retained" >&2
+  exit 1
+fi
+
+docker exec -i "$postgres_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  < "$repo_dir/migrations/004_usage_cursor_indexes.sql" >/dev/null
+if [ "$(docker exec "$postgres_name" psql -U postgres -d postgres -Atc \
+  "SELECT count(*) FROM pg_index WHERE indexrelid IN ('idx_usage_logs_created_id_desc'::regclass,'idx_usage_logs_model_created_desc'::regclass,'idx_usage_logs_metadata_search_trgm'::regclass) AND indisvalid AND indisready")" != "3" ]; then
+  echo "usage migration left a missing or invalid index" >&2
+  exit 1
+fi
+
 docker build --quiet --tag "$sync_image" "$repo_dir/sub2api-sync" >/dev/null
 
 docker run --rm --interactive --log-driver none \
@@ -132,10 +156,45 @@ except ValueError:
 else:
     raise SystemExit("usage detail exceeded the 30-day boundary")
 
-if sync.psql("SHOW statement_timeout;") != "10s":
-    raise SystemExit("sync PostgreSQL statement_timeout is not 10 seconds")
+if sync.psql("SHOW statement_timeout;") != "3s":
+    raise SystemExit("sync PostgreSQL statement_timeout is not 3 seconds")
 if sync.psql("SHOW lock_timeout;") != "2s":
     raise SystemExit("sync PostgreSQL lock_timeout is not 2 seconds")
+PY
+
+docker exec "$postgres_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 -c "
+INSERT INTO usage_logs (
+  id,request_id,model,requested_model,input_tokens,output_tokens,
+  total_cost,actual_cost,duration_ms,stream,request_type,inbound_endpoint,created_at,prompt
+)
+SELECT 1000+item,'perf-request-'||item,'perf-model-'||(item%20),
+  'requested-'||(item%10),1,1,0.01,0.01,10,false,1,
+  '/v1/responses',now()-interval '2 days','PRIVATE_SENTINEL'
+FROM generate_series(1,200000) AS item;
+ANALYZE usage_logs;
+" >/dev/null
+
+performance_plan="$(docker exec "$postgres_name" psql -U postgres -d postgres -Atc "
+EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+SELECT id FROM usage_logs
+WHERE (
+  COALESCE(request_id, '') || ' ' || COALESCE(model, '') || ' ' ||
+  COALESCE(requested_model, '') || ' ' || COALESCE(inbound_endpoint, '')
+) ILIKE '%definitely-no-such-usage-record%'
+  AND created_at >= now() - interval '30 days'
+ORDER BY created_at DESC,id DESC LIMIT 26;
+")"
+PERFORMANCE_PLAN="$performance_plan" python3 - <<'PY'
+import json
+import os
+
+plan = json.loads(os.environ["PERFORMANCE_PLAN"])[0]
+encoded = json.dumps(plan)
+if "idx_usage_logs_metadata_search_trgm" not in encoded:
+    raise SystemExit("usage no-match query did not use the trigram index")
+execution_ms = float(plan["Execution Time"])
+if execution_ms > 25:
+    raise SystemExit(f"usage no-match query exceeded 25ms: {execution_ms:.3f}ms")
 PY
 
 echo "PostgreSQL 18 usage metadata integration test passed"

@@ -749,9 +749,11 @@ test("Sub2API sync accepts only explicit matching success and never forwards ups
   const upstreamSentinel = "upstream-private-error-sentinel";
   let responseFactory;
   let requestBody;
+  let requestHeaders;
   globalThis.fetch = async (_url, init) => {
     assert.equal(init.redirect, "manual");
     requestBody = JSON.parse(init.body);
+    requestHeaders = new Headers(init.headers);
     return responseFactory();
   };
   try {
@@ -763,6 +765,7 @@ test("Sub2API sync accepts only explicit matching success and never forwards ups
     );
     assert.equal(accepted.exists, true);
     assert.equal(requestBody.action, "status");
+    assert.match(requestHeaders.get("x-request-id") || "", /^worker-[a-f0-9]{32}$/);
 
     const failures = [
       () => Response.json({ action: "status" }),
@@ -795,8 +798,38 @@ test("Sub2API sync accepts only explicit matching success and never forwards ups
         },
       );
     }
+
+    responseFactory = () => Response.json({
+      ok: false,
+      error: "dependency_unavailable",
+      retryable: true,
+      requestId: "sync-request-503",
+      action: "status",
+    }, {
+      status: 503,
+      headers: { "x-request-id": "sync-request-503" },
+    });
+    await assert.rejects(
+      adminTest.callSub2ApiSync(env, "status", {}),
+      (error) => {
+        assert.equal(error.message, "Sub2API sync request failed");
+        assert.equal(error.status, 503);
+        assert.equal(error.code, "dependency_unavailable");
+        assert.equal(error.retryable, true);
+        assert.equal(error.requestId, "sync-request-503");
+        assert.equal(error.action, "status");
+        return true;
+      },
+    );
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("Sub2API sync budgets leave the origin time to terminate timed-out work", () => {
+  assert.equal(adminTest.sub2apiSyncTimeoutForAction("login"), 10_000);
+  for (const action of ["provision", "status", "deprovision", "purge", "usage_logs_list", "usage_log_detail"]) {
+    assert.equal(adminTest.sub2apiSyncTimeoutForAction(action), 5_000);
   }
 });
 
@@ -1391,6 +1424,7 @@ test("Sub2API login reset is routed through TOTP and stores only encrypted crede
       csrf: "password-reset-csrf",
       uuid,
       step_up_token: stepUpToken,
+      admin_context: "p=1&t=1&i=1&v=e",
     });
     const response = await worker.fetch(new Request("https://api.example.test/allow-ip/admin", {
       method: "POST",
@@ -1490,6 +1524,7 @@ test("Sub2API status refresh is explicit, CSRF protected, and limited to one inv
       action: "refresh_sub2api_status",
       csrf: "status-refresh-csrf",
       uuid,
+      admin_context: "p=1&t=1&i=1&v=e",
     });
     const response = await worker.fetch(new Request("https://api.example.test/allow-ip/admin", {
       method: "POST",
@@ -1734,9 +1769,9 @@ test("routine admin listing never decrypts stored credential envelopes", async (
 
   assert.equal(response.status, 200);
   const body = await response.text();
-  assert.match(body, /OpenAI/);
+  assert.match(body, /1 endpoint/);
   assert.doesNotMatch(body, /A256GCM|invalid/);
-  assert.match(body, /Migration complete/);
+  assert.doesNotMatch(body, /Access key migration/);
   assert.match(body, /Access key only/);
 });
 

@@ -1,0 +1,31 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker-allow-ip/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci
+        working-directory: worker-allow-ip
+      - run: npx playwright install --with-deps chromium
+        working-directory: worker-allow-ip
+      - run: bash deploy/verify-local.sh
+      - run: bash deploy/check-release-candidate.sh

@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { expect, test } from "@playwright/test";
 import { Miniflare } from "miniflare";
+import { __test as adminTest } from "../src/admin.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_ROOT = path.resolve(HERE, "..");
@@ -229,7 +230,35 @@ async function turnstileRoute(route) {
           return "browser-ui-widget";
         }
       };
-      window.onTurnstileLoad?.();
+      const callbackName = new URL(document.currentScript.src).searchParams.get("onload");
+      window[callbackName]?.();
+    `,
+  });
+}
+
+async function controlledTurnstileRoute(route) {
+  await route.fulfill({
+    status: 200,
+    contentType: "application/javascript; charset=utf-8",
+    body: `
+      window.turnstile = {
+        render(selector, options) {
+          window.__turnstileOptions = options;
+          const target = document.querySelector(selector);
+          target.dataset.renderedSize = options.size;
+          const fixture = document.createElement("div");
+          fixture.setAttribute("role", "group");
+          fixture.setAttribute("aria-label", "Turnstile controlled fixture");
+          fixture.style.cssText = "width:100%;height:70px;max-width:100%;background:#e5e5ea;border:1px solid #8e8e93";
+          target.replaceChildren(fixture);
+          return "controlled-widget";
+        },
+        reset(widgetId) {
+          window.__turnstileResetId = widgetId;
+        }
+      };
+      const callbackName = new URL(document.currentScript.src).searchParams.get("onload");
+      window[callbackName]?.();
     `,
   });
 }
@@ -291,6 +320,12 @@ async function pageGeometry(page) {
           overlaps.push({
             left: `${left.element.tagName}.${String(left.element.className || "").slice(0, 50)}`,
             right: `${right.element.tagName}.${String(right.element.className || "").slice(0, 50)}`,
+            leftName: String(left.element.getAttribute("name") || ""),
+            rightName: String(right.element.getAttribute("name") || ""),
+            leftParent: String(left.element.parentElement?.className || "").slice(0, 50),
+            rightParent: String(right.element.parentElement?.className || "").slice(0, 50),
+            leftForm: String(left.element.closest("form")?.className || "").slice(0, 50),
+            rightForm: String(right.element.closest("form")?.className || "").slice(0, 50),
             leftText: String(left.element.textContent || "").trim().slice(0, 60),
             rightText: String(right.element.textContent || "").trim().slice(0, 60),
             leftTop: Math.round(left.rect.top),
@@ -436,6 +471,11 @@ async function collectVitals(page) {
       observedEventCount: eventDurations.length,
       maxObservedEventDurationMs: eventDurations.length ? Math.max(...eventDurations) : null,
       eventTimingUpperBoundMs: eventDurations.length ? Math.max(...eventDurations) : 16,
+      observedEvents: (values.events || []).slice(-16).map((entry) => ({
+        name: String(entry.name || "").slice(0, 32),
+        duration: Number(entry.duration || 0),
+        interactionId: Number(entry.interactionId || 0),
+      })),
     };
   });
 }
@@ -579,15 +619,58 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
   expect(response?.status()).toBeLessThan(400);
   await expect(page.locator("main")).toBeVisible();
   const htmlBytes = Buffer.byteLength(await page.content(), "utf8");
-  if (scenario === "admin-list") expect(htmlBytes).toBeLessThanOrEqual(256 * 1024);
-  if (scenario === "admin-detail") expect(htmlBytes).toBeLessThanOrEqual(512 * 1024);
+  if (scenario === "admin-list") expect(htmlBytes).toBeLessThanOrEqual(96 * 1024);
+  if (["admin-detail", "admin-create", "admin-maintenance"].includes(scenario)) {
+    expect(htmlBytes).toBeLessThanOrEqual(128 * 1024);
+  }
 
   if (scenario === "public-form") {
     await validateTurnstile(page, viewport.width < 372 ? "compact" : "flexible");
+    if (viewport.width === 320 && viewport.height === 568) {
+      const primaryActionBounds = await page.locator("#submit-button").boundingBox();
+      expect(primaryActionBounds).not.toBeNull();
+      expect(primaryActionBounds.y).toBeLessThan(viewport.height);
+    }
   }
   if (scenario === "public-dashboard") {
     await expect(page.getByText("Current network authorization is active", { exact: false })).toBeVisible();
     expect(requests.some((value) => value.startsWith("https://challenges.cloudflare.com/"))).toBe(false);
+  }
+  if (scenario === "admin-list") {
+    await expect(page.locator('.admin-tabs [aria-current="page"]')).toHaveText("UUIDs");
+    await expect(page.locator(".invite-list")).toBeVisible();
+    await expect(page.locator(".selected-invite-detail, .create-panel, .trash-list")).toHaveCount(0);
+  }
+  if (scenario === "admin-create") {
+    await expect(page.locator('.admin-tabs [aria-current="page"]')).toHaveText("Create");
+    await expect(page.locator('form.create input[name="username"]')).toBeVisible();
+    await expect(page.locator(".invite-list, .selected-invite-detail, .trash-list")).toHaveCount(0);
+  }
+  if (scenario === "admin-maintenance") {
+    await expect(page.locator('.admin-tabs [aria-current="page"]')).toHaveText("Maintenance");
+    await expect(page.getByRole("heading", { name: "Access key migration" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Recycle Bin" })).toBeVisible();
+    await expect(page.locator(".invite-list, .selected-invite-detail, form.create")).toHaveCount(0);
+  }
+  if (scenario === "admin-detail") {
+    await expect(page.locator(".selected-invite-detail")).toBeVisible();
+    await expect(page.locator(".invite-list, .create-panel, .trash-list")).toHaveCount(0);
+    if (viewport.width === 240) {
+      const detailPosition = await page.evaluate(() => {
+        const tabs = document.querySelector(".admin-tabs")?.getBoundingClientRect();
+        const detail = document.querySelector(".selected-invite-detail")?.getBoundingClientRect();
+        return {
+          tabsBottom: tabs?.bottom ?? null,
+          detailTop: detail?.top ?? null,
+          scrollY,
+        };
+      });
+      expect(detailPosition.scrollY).toBe(0);
+      expect(detailPosition.tabsBottom).not.toBeNull();
+      expect(detailPosition.detailTop).not.toBeNull();
+      expect(detailPosition.detailTop - detailPosition.tabsBottom).toBeLessThanOrEqual(32);
+      expect(detailPosition.detailTop).toBeLessThan(800);
+    }
   }
   if (scenario === "usage-list" && viewport.width <= 680) {
     const columns = await page.locator(".usage-row").first().evaluate((element) => getComputedStyle(element).gridTemplateColumns);
@@ -646,7 +729,10 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
   }
   expect(vitals.playwrightObservedCls).toBeLessThan(0.1);
   expect(vitals.firstContentfulPaintMs).not.toBeNull();
-  expect(vitals.eventTimingUpperBoundMs).toBeLessThan(200);
+  expect(
+    vitals.eventTimingUpperBoundMs,
+    JSON.stringify({ scenario, observedEvents: vitals.observedEvents }, null, 2),
+  ).toBeLessThan(200);
   expect(pageErrors).toEqual([]);
   expect(consoleErrors).toEqual([]);
 
@@ -764,6 +850,377 @@ test.afterAll(async () => {
   }, null, 2)}\n`);
 });
 
+test("public Turnstile load failure is visible and retryable without shifting the form", async ({ page, context }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await context.setExtraHTTPHeaders({ "CF-Connecting-IP": CLIENT_IP });
+  let scriptAttempts = 0;
+  await page.route("https://challenges.cloudflare.com/**", async (route) => {
+    scriptAttempts += 1;
+    if (scriptAttempts === 1) {
+      await route.abort("failed");
+      return;
+    }
+    await turnstileRoute(route);
+  });
+
+  await page.goto(`${workerBaseUrl}/allow-ip`, { waitUntil: "domcontentloaded" });
+  const control = page.locator("#turnstile-control");
+  await expect(control).toHaveAttribute("data-state", "error");
+  await expect(page.locator("#turnstile-status")).toHaveAttribute("role", "alert");
+  await expect(page.locator("#turnstile-status")).toContainText("Verification could not load");
+  await expect(page.locator("#turnstile-retry")).toBeVisible();
+  await expect(page.locator("#submit-button")).toBeDisabled();
+  const failedBounds = await control.boundingBox();
+
+  await page.locator("#turnstile-retry").click();
+  await expect(control).toHaveAttribute("data-state", "verified");
+  await expect(page.locator("#turnstile-status")).toHaveAttribute("role", "status");
+  await expect(page.locator("#turnstile-status")).toContainText("Verification complete");
+  await expect(page.locator("#submit-button")).toBeEnabled();
+  const verifiedBounds = await control.boundingBox();
+
+  expect(scriptAttempts).toBe(2);
+  expect(failedBounds).not.toBeNull();
+  expect(verifiedBounds).not.toBeNull();
+  expect(Math.abs(verifiedBounds.height - failedBounds.height)).toBeLessThanOrEqual(1);
+});
+
+test("public Turnstile exposes a stable loading state while the client is delayed", async ({ page, context }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await context.setExtraHTTPHeaders({ "CF-Connecting-IP": CLIENT_IP });
+  let releaseScript;
+  let markScriptRequested;
+  const scriptGate = new Promise((resolve) => { releaseScript = resolve; });
+  const scriptRequested = new Promise((resolve) => { markScriptRequested = resolve; });
+  await page.route("https://challenges.cloudflare.com/**", async (route) => {
+    markScriptRequested();
+    await scriptGate;
+    await controlledTurnstileRoute(route);
+  });
+
+  await page.goto(`${workerBaseUrl}/allow-ip`, { waitUntil: "commit" });
+  await scriptRequested;
+  const control = page.locator("#turnstile-control");
+  await expect(control).toHaveAttribute("data-state", "loading");
+  await expect(control).toHaveAttribute("aria-busy", "true");
+  await expect(page.locator("#turnstile-status")).toHaveText("Loading verification...");
+  await expect(page.locator("#submit-button")).toBeDisabled();
+  const loadingBounds = await control.boundingBox();
+
+  releaseScript();
+  await expect(control).toHaveAttribute("data-state", "ready");
+  const readyBounds = await control.boundingBox();
+  expect(loadingBounds).not.toBeNull();
+  expect(readyBounds).not.toBeNull();
+  expect(Math.abs(readyBounds.height - loadingBounds.height)).toBeLessThanOrEqual(1);
+});
+
+test("public Turnstile load watchdog exposes recovery after eight seconds", async ({ page, context }) => {
+  await page.clock.install();
+  await context.setExtraHTTPHeaders({ "CF-Connecting-IP": CLIENT_IP });
+  let releaseScript;
+  let markScriptRequested;
+  const scriptGate = new Promise((resolve) => { releaseScript = resolve; });
+  const scriptRequested = new Promise((resolve) => { markScriptRequested = resolve; });
+  await page.route("https://challenges.cloudflare.com/**", async (route) => {
+    markScriptRequested();
+    await scriptGate;
+    await controlledTurnstileRoute(route);
+  });
+
+  await page.goto(`${workerBaseUrl}/allow-ip`, { waitUntil: "commit" });
+  await scriptRequested;
+  await expect(page.locator("#turnstile-control")).toHaveAttribute("data-state", "loading");
+  await page.clock.fastForward(8001);
+  await expect(page.locator("#turnstile-control")).toHaveAttribute("data-state", "error");
+  await expect(page.locator("#turnstile-status")).toContainText("taking too long to load");
+  await expect(page.locator("#turnstile-retry")).toBeVisible();
+  await expect(page.locator("#submit-button")).toBeDisabled();
+  releaseScript();
+});
+
+test("public Turnstile ignores a stale load callback after watchdog retry succeeds", async ({ page, context }) => {
+  await page.clock.install();
+  await context.setExtraHTTPHeaders({ "CF-Connecting-IP": CLIENT_IP });
+  let scriptAttempts = 0;
+  let retryScriptUrl = "";
+  await page.route("https://challenges.cloudflare.com/**", async (route) => {
+    scriptAttempts += 1;
+    if (scriptAttempts === 1) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/javascript; charset=utf-8",
+        body: `window.setTimeout(() => window.onTurnstileLoad?.(), 9000);`,
+      });
+      return;
+    }
+    retryScriptUrl = route.request().url();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/javascript; charset=utf-8",
+      body: `
+        window.__turnstileRenderCount = 0;
+        window.turnstile = {
+          render(selector, options) {
+            window.__turnstileRenderCount += 1;
+            if (window.__turnstileRenderCount > 1) throw new Error("duplicate Turnstile render");
+            options.callback("watchdog-retry-token");
+            return "watchdog-retry-widget";
+          },
+          reset() {}
+        };
+        const callbackName = new URL(document.currentScript.src).searchParams.get("onload");
+        window[callbackName]?.();
+      `,
+    });
+  });
+
+  await page.goto(`${workerBaseUrl}/allow-ip`, { waitUntil: "domcontentloaded" });
+  const control = page.locator("#turnstile-control");
+  await page.clock.fastForward(8001);
+  await expect(control).toHaveAttribute("data-state", "error");
+
+  await page.locator("#turnstile-retry").click();
+  await expect(control).toHaveAttribute("data-state", "verified");
+  await expect(page.locator("#submit-button")).toBeEnabled();
+  expect(scriptAttempts).toBe(2);
+  const retryUrl = new URL(retryScriptUrl);
+  expect(retryUrl.searchParams.getAll("onload")).toEqual(["onTurnstileLoadAttempt2"]);
+
+  await page.clock.fastForward(1000);
+  await expect(control).toHaveAttribute("data-state", "verified");
+  await expect(page.locator("#turnstile-status")).toContainText("Verification complete");
+  await expect(page.locator("#submit-button")).toBeEnabled();
+  expect(await page.evaluate(() => window.__turnstileRenderCount)).toBe(1);
+});
+
+test("public Turnstile lifecycle gates tokens, retries, and duplicate submissions", async ({ page, context }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await context.setExtraHTTPHeaders({ "CF-Connecting-IP": CLIENT_IP });
+  await page.route("https://challenges.cloudflare.com/**", controlledTurnstileRoute);
+  await page.goto(`${workerBaseUrl}/allow-ip`, { waitUntil: "networkidle" });
+
+  const control = page.locator("#turnstile-control");
+  const status = page.locator("#turnstile-status");
+  const retry = page.locator("#turnstile-retry");
+  const submit = page.locator("#submit-button");
+  await expect(control).toHaveAttribute("data-state", "ready");
+  await expect(status).toContainText("Complete the verification challenge");
+  await expect(submit).toBeDisabled();
+
+  await page.evaluate(() => {
+    const token = document.createElement("input");
+    token.type = "hidden";
+    token.name = "cf-turnstile-response";
+    token.value = "controlled-token";
+    document.getElementById("allow-network-form")?.appendChild(token);
+    window.__turnstileOptions.callback("controlled-token");
+  });
+  await expect(control).toHaveAttribute("data-state", "verified");
+  await expect(submit).toBeEnabled();
+
+  await page.evaluate(() => window.__turnstileOptions["expired-callback"]());
+  await expect(control).toHaveAttribute("data-state", "expired");
+  await expect(status).toHaveAttribute("role", "alert");
+  await expect(status).toContainText("Verification expired");
+  await expect(submit).toBeDisabled();
+  await expect(page.locator('[name="cf-turnstile-response"]')).toHaveValue("");
+  await expect(retry).toBeVisible();
+
+  await retry.click();
+  await expect(control).toHaveAttribute("data-state", "ready");
+  expect(await page.evaluate(() => window.__turnstileResetId)).toBe("controlled-widget");
+
+  await page.evaluate(() => window.__turnstileOptions["timeout-callback"]());
+  await expect(status).toContainText("Verification timed out");
+  await expect(control).toHaveAttribute("data-state", "error");
+  await retry.click();
+  await expect(control).toHaveAttribute("data-state", "ready");
+
+  await page.evaluate(() => window.__turnstileOptions["error-callback"]());
+  await expect(status).toContainText("Verification encountered an error");
+  await expect(control).toHaveAttribute("data-state", "error");
+  await retry.click();
+  await page.evaluate(() => window.__turnstileOptions.callback("replacement-token"));
+
+  await page.locator("#invite_key").fill("test-access-key");
+  await page.evaluate(() => {
+    document.getElementById("allow-network-form")?.addEventListener("submit", (event) => {
+      window.__submissionDefaultPrevented = [
+        ...(window.__submissionDefaultPrevented || []),
+        event.defaultPrevented,
+      ];
+      event.preventDefault();
+    });
+  });
+  await submit.click();
+  await expect(control).toHaveAttribute("data-state", "submitting");
+  await expect(status).toContainText("Authorization request in progress");
+  await expect(submit).toBeDisabled();
+  await expect(submit).toHaveText("Authorizing...");
+  await page.evaluate(() => document.getElementById("allow-network-form")?.requestSubmit());
+  expect(await page.evaluate(() => window.__submissionDefaultPrevented)).toEqual([false, true]);
+});
+
+test("public error pages announce and focus the error heading", async ({ page, context }) => {
+  await context.setExtraHTTPHeaders({ "CF-Connecting-IP": CLIENT_IP });
+  await page.route("https://challenges.cloudflare.com/**", turnstileRoute);
+  await page.goto(`${workerBaseUrl}/allow-ip`, { waitUntil: "networkidle" });
+
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: "domcontentloaded" }),
+    page.evaluate(() => {
+      const form = document.createElement("form");
+      form.method = "post";
+      form.action = "/allow-ip";
+      form.enctype = "text/plain";
+      const field = document.createElement("input");
+      field.name = "unsupported";
+      field.value = "value";
+      form.appendChild(field);
+      document.body.appendChild(form);
+      form.submit();
+    }),
+  ]);
+
+  await expect(page.locator(".message")).toHaveAttribute("role", "alert");
+  await expect(page.locator("#message-title")).toHaveText("Unsupported form format");
+  await expect(page.locator("#message-title")).toBeFocused();
+});
+
+test("dashboard reports clipboard rejection without an unhandled page error", async ({ page, context }) => {
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: async () => { throw new Error("clipboard denied by test"); },
+      },
+    });
+  });
+  await context.setExtraHTTPHeaders({ "CF-Connecting-IP": CLIENT_IP });
+  await context.addCookies([{
+    name: "sub2api_allow_uuid",
+    value: PUBLIC_SESSION_TOKEN,
+    domain: "api.example.test",
+    path: "/allow-ip",
+    httpOnly: true,
+    secure: false,
+    sameSite: "Strict",
+  }]);
+  await page.goto(`${workerBaseUrl}/allow-ip`, { waitUntil: "networkidle" });
+
+  const copyButton = page.locator(".copy-value").first();
+  await copyButton.click();
+  await expect(copyButton).toHaveText("Copy failed");
+  await expect(page.locator("#copy-status")).toHaveAttribute("role", "alert");
+  await expect(page.locator("#copy-status")).toContainText("Select the value and copy it manually");
+  expect(pageErrors).toEqual([]);
+});
+
+test("admin copy actions report clipboard rejection without unhandled errors", async ({ page, context }) => {
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: async () => { throw new Error("admin clipboard denied by test"); },
+      },
+    });
+  });
+  await context.addCookies([{
+    name: "sub2api_allow_admin",
+    value: ADMIN_SESSION_TOKEN,
+    domain: "api.example.test",
+    path: "/allow-ip/admin",
+    httpOnly: true,
+    secure: false,
+    sameSite: "Strict",
+  }]);
+
+  await page.goto(`${workerBaseUrl}/allow-ip/admin?view=create`, { waitUntil: "networkidle" });
+  const clipboardStatus = page.locator("#clipboard-status");
+  const copyUuid = page.locator("#copy-uuid");
+  await copyUuid.click();
+  await expect(copyUuid).toHaveText("Copy failed");
+  await expect(clipboardStatus).toHaveAttribute("role", "alert");
+
+  await page.locator(".generate-key").click();
+  const copyApiKey = page.locator(".copy-api-key:not([disabled])").last();
+  await copyApiKey.click();
+  await expect(copyApiKey).toHaveText("Copy failed");
+  await expect(clipboardStatus).toContainText("Copy failed");
+
+  const editResponse = await page.goto(
+    `${workerBaseUrl}/allow-ip/admin?edit=${PUBLIC_UUID}`,
+    { waitUntil: "networkidle" },
+  );
+  expect(editResponse?.status(), await page.locator("body").innerText()).toBe(200);
+  await expect(page.locator('input[name="admin_context"][value$="v=e"]')).not.toHaveCount(0);
+  const copyRow = page.locator(".copy-row").first();
+  await copyRow.click();
+  await expect(copyRow).toHaveText("Copy failed");
+
+  const stepUpToken = await adminTest.totp(
+    TOTP_SECRET,
+    Math.floor(Date.now() / 1000 / 30),
+  );
+  const rotateForm = page.locator('form:has(input[name="action"][value="rotate_access_key"])');
+  await rotateForm.locator('input[name="step_up_token"]').fill(stepUpToken);
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: "networkidle" }),
+    rotateForm.getByRole("button", { name: "Rotate key" }).click(),
+  ]);
+  const issuedKeyCopy = page.locator(".copy-value").first();
+  await issuedKeyCopy.click();
+  await expect(issuedKeyCopy).toHaveText("Copy failed");
+  await expect(page.locator("#clipboard-status")).toHaveAttribute("role", "alert");
+  expect(pageErrors).toEqual([]);
+  await seedWorker();
+});
+
+test("static demo mirrors verification, focused errors, and clipboard recovery", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: async () => { throw new Error("demo clipboard denied by test"); },
+      },
+    });
+  });
+  await page.goto(`${demoBaseUrl}/demo/`, { waitUntil: "networkidle" });
+
+  const check = page.locator("#turnstileCheck");
+  const status = page.locator("#turnstileStatus");
+  const submit = page.locator("#submitBtn");
+  await check.check();
+  await expect(status).toHaveText("Verification complete.");
+  await expect(submit).toBeEnabled();
+  await check.uncheck();
+  await expect(status).toHaveAttribute("role", "alert");
+  await expect(status).toContainText("Verification expired");
+  await expect(submit).toBeDisabled();
+  await page.locator("#turnstileRetry").click();
+  await expect(check).toBeFocused();
+
+  await check.check();
+  await page.locator("#invite_key").fill("invalid-demo-key");
+  await submit.click();
+  await expect(page.locator("#allowFormStatus")).toBeVisible();
+  await expect(page.locator("#allowFormStatus")).toBeFocused();
+  await page.locator("#invite_key").fill("demo-key-001");
+  await submit.click();
+  await expect(page.getByRole("heading", { name: "Northwind Lab" })).toBeVisible();
+
+  const copyButton = page.locator(".copy-value").first();
+  await copyButton.click();
+  await expect(copyButton).toHaveText("Copy failed");
+  await expect(page.locator("#copyStatus")).toHaveAttribute("role", "alert");
+  await expect(page.locator("#copyStatus")).toContainText("Select the value and copy it manually");
+});
+
 for (const viewport of VIEWPORTS) {
   for (const theme of THEMES) {
     test(`${viewport.name} ${theme} responsive matrix`, async ({ page, context }) => {
@@ -795,6 +1252,8 @@ for (const viewport of VIEWPORTS) {
       }]);
       await captureScenario(page, decoderPage, viewport, theme, "public-dashboard", `${workerBaseUrl}/allow-ip`);
       await captureScenario(page, decoderPage, viewport, theme, "admin-list", `${workerBaseUrl}/allow-ip/admin`);
+      await captureScenario(page, decoderPage, viewport, theme, "admin-create", `${workerBaseUrl}/allow-ip/admin?view=create`);
+      await captureScenario(page, decoderPage, viewport, theme, "admin-maintenance", `${workerBaseUrl}/allow-ip/admin?view=maintenance`);
       await captureScenario(page, decoderPage, viewport, theme, "admin-detail", `${workerBaseUrl}/allow-ip/admin?detail=${PUBLIC_UUID}`);
       await captureScenario(page, decoderPage, viewport, theme, "usage-list", `${workerBaseUrl}/allow-ip/admin/requests`);
       await captureScenario(page, decoderPage, viewport, theme, "usage-detail", `${workerBaseUrl}/allow-ip/admin/requests/detail?id=9000`);
@@ -821,7 +1280,20 @@ test("200 percent zoom equivalent reflows at 240 CSS px", async ({ page, context
     sameSite: "Strict",
   }]);
   const decoderPage = await context.newPage();
+  await captureScenario(page, decoderPage, viewport, "light", "public-form", `${workerBaseUrl}/allow-ip`);
+  await context.addCookies([{
+    name: "sub2api_allow_uuid",
+    value: PUBLIC_SESSION_TOKEN,
+    domain: "api.example.test",
+    path: "/allow-ip",
+    httpOnly: true,
+    secure: false,
+    sameSite: "Strict",
+  }]);
+  await captureScenario(page, decoderPage, viewport, "light", "public-dashboard", `${workerBaseUrl}/allow-ip`);
   await captureScenario(page, decoderPage, viewport, "light", "admin-detail", `${workerBaseUrl}/allow-ip/admin?detail=${PUBLIC_UUID}`);
+  await captureScenario(page, decoderPage, viewport, "light", "admin-create", `${workerBaseUrl}/allow-ip/admin?view=create`);
+  await captureScenario(page, decoderPage, viewport, "light", "admin-maintenance", `${workerBaseUrl}/allow-ip/admin?view=maintenance`);
   await captureScenario(page, decoderPage, viewport, "light", "usage-list", `${workerBaseUrl}/allow-ip/admin/requests`);
   await captureScenario(page, decoderPage, viewport, "light", "demo", `${demoBaseUrl}/demo/`);
   await decoderPage.close();

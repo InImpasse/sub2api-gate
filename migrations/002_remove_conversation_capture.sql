@@ -45,7 +45,10 @@ AS $function$
             'completion', NULL,
             'image_size_breakdown', NULL,
             'user_agent', NULL,
-            'ip_address', NULL
+            'ip_address', NULL,
+            -- Sub2API 0.1.171 stores an unconstrained session reference.
+            -- Usage accounting does not require it after recording the row.
+            'session_id', NULL
         ),
         'audit_logs', jsonb_build_object(
             'actor_email', '',
@@ -167,7 +170,11 @@ AS $function$
             'request_hash', NULL,
             'manifest_hash', NULL,
             'idempotency_key', NULL,
-            'last_error_message', NULL
+            'last_error_message', NULL,
+            -- Sub2API 0.1.171 stores an unconstrained user-session reference.
+            -- It is not required for completed job accounting and must not
+            -- survive as an identifier or a possible bearer/session value.
+            'session_id', NULL
         ),
         'batch_image_items', jsonb_build_object(
             'request_hash', NULL,

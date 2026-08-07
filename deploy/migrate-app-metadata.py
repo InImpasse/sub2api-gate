@@ -125,7 +125,7 @@ def _validate_pricing_record(record):
                 raise ValueError("model pricing capability must be boolean")
             continue
         if not isinstance(value, str) or value not in PRICING_ENUM_FIELDS[field]:
-            raise ValueError("model pricing enum is not approved for Sub2API 0.1.162")
+            raise ValueError("model pricing enum is not approved for Sub2API 0.1.171")
 
 
 def validate_model_pricing(raw):

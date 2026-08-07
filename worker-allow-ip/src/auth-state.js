@@ -28,7 +28,7 @@ export const LEGACY_CLEANUP_LEASE_MS = 60 * 1000;
 export const LEGACY_CLEANUP_RECHECK_DELAY_MS = 5 * 60 * 1000;
 export const LEGACY_CLEANUP_RETRY_DELAY_MS = 60 * 1000;
 export const LEGACY_CLEANUP_RECHECKS = 2;
-const LEGACY_CLEANUP_SCHEDULER_VERSION = 1;
+const LEGACY_CLEANUP_SCHEDULER_VERSION = 2;
 const UTF8_ENCODER = new TextEncoder();
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
@@ -177,6 +177,7 @@ export function authStateStatus(storage, now = Date.now()) {
     schemaVersion: AUTH_STATE_SCHEMA_VERSION,
     migrated: migrationState === "complete",
     legacyCleanupComplete: legacyCleanupState === "complete",
+    legacyCleanupVerificationPending: legacyCleanupState === "verifying",
     legacyCleanupSchedulerReady:
       legacyCleanupSchedulerVersion === LEGACY_CLEANUP_SCHEDULER_VERSION,
     legacyCleanupRechecksRemaining,
@@ -216,6 +217,8 @@ export function authStateImportLegacy(storage, snapshot, importedAt = new Date()
     setMeta(sql, "trash_revision", normalized.trash.length ? "1" : "0");
     setMeta(sql, "migration_state", "complete");
     setMeta(sql, "legacy_cleanup_state", "pending");
+    setMeta(sql, "legacy_cleanup_scheduler_version", "0");
+    setMeta(sql, "legacy_cleanup_rechecks_remaining", "0");
     setMeta(sql, "migrated_at", String(importedAt));
     return {
       imported: true,
@@ -713,19 +716,10 @@ export function authStatePurgeExpiredSessions(storage, now = Date.now()) {
 }
 
 export function authStateMarkLegacyCleanupComplete(
-  storage,
-  completedAt = new Date().toISOString(),
+  _storage,
+  _completedAt = new Date().toISOString(),
 ) {
-  const sql = requireSql(storage);
-  if (readMeta(sql, "migration_state") !== "complete") {
-    fail("auth_state_migration_incomplete");
-  }
-  return storage.transactionSync(() => {
-    setMeta(sql, "legacy_cleanup_state", "complete");
-    setMeta(sql, "legacy_cleanup_completed_at", String(completedAt));
-    setMeta(sql, "legacy_cleanup_lease_until", "0");
-    return { ok: true, legacyCleanupComplete: true };
-  });
+  fail("auth_state_legacy_cleanup_verification_required");
 }
 
 export function authStateClaimLegacyCleanup(
@@ -769,19 +763,50 @@ export function authStateArmLegacyCleanupRechecks(storage) {
     if (currentVersion === LEGACY_CLEANUP_SCHEDULER_VERSION) {
       return { armed: false, remaining: currentRemaining };
     }
+    setMeta(sql, "legacy_cleanup_state", "verifying");
+    setMeta(sql, "legacy_cleanup_completed_at", "");
     setMeta(sql, "legacy_cleanup_scheduler_version", LEGACY_CLEANUP_SCHEDULER_VERSION);
     setMeta(sql, "legacy_cleanup_rechecks_remaining", LEGACY_CLEANUP_RECHECKS);
     return { armed: true, remaining: LEGACY_CLEANUP_RECHECKS };
   });
 }
 
-export function authStateConsumeLegacyCleanupRecheck(storage) {
+export function authStateBeginLegacyCleanupVerification(storage) {
+  const sql = requireSql(storage);
+  if (readMeta(sql, "migration_state") !== "complete") {
+    fail("auth_state_migration_incomplete");
+  }
+  return storage.transactionSync(() => {
+    setMeta(sql, "legacy_cleanup_state", "verifying");
+    setMeta(sql, "legacy_cleanup_completed_at", "");
+    setMeta(sql, "legacy_cleanup_lease_until", "0");
+    setMeta(sql, "legacy_cleanup_scheduler_version", LEGACY_CLEANUP_SCHEDULER_VERSION);
+    setMeta(sql, "legacy_cleanup_rechecks_remaining", LEGACY_CLEANUP_RECHECKS);
+    return { armed: true, remaining: LEGACY_CLEANUP_RECHECKS };
+  });
+}
+
+export function authStateConsumeLegacyCleanupRecheck(
+  storage,
+  completedAt = new Date().toISOString(),
+) {
   const sql = requireSql(storage);
   return storage.transactionSync(() => {
+    if (
+      readMeta(sql, "legacy_cleanup_state") !== "verifying"
+      || readLegacyCleanupSchedulerVersion(sql) !== LEGACY_CLEANUP_SCHEDULER_VERSION
+    ) {
+      fail("auth_state_legacy_cleanup_verification_inactive");
+    }
     const current = readLegacyCleanupRechecks(sql);
+    if (current < 1) fail("auth_state_legacy_cleanup_verification_inactive");
     const remaining = Math.max(0, current - 1);
     setMeta(sql, "legacy_cleanup_rechecks_remaining", remaining);
-    return { consumed: current > 0, remaining };
+    if (remaining === 0) {
+      setMeta(sql, "legacy_cleanup_state", "complete");
+      setMeta(sql, "legacy_cleanup_completed_at", String(completedAt));
+    }
+    return { consumed: true, remaining, complete: remaining === 0 };
   });
 }
 
@@ -2127,6 +2152,24 @@ export async function cleanupLegacySourceKeys(kv) {
   }
 }
 
+export async function inspectLegacySourceKeys(kv) {
+  if (!kv || typeof kv.get !== "function" || typeof kv.list !== "function") {
+    throw new AuthStateUnavailableError("auth_state_migration_source_unavailable");
+  }
+  let residualScopes = 0;
+  for (const key of ["invites", "trash"]) {
+    if (await kv.get(key) !== null) residualScopes += 1;
+  }
+  for (const prefix of ["session:", "uuid-session:"]) {
+    const result = await kv.list({ prefix, limit: 1 });
+    if (!result || !Array.isArray(result.keys)) {
+      throw new AuthStateUnavailableError("auth_state_legacy_cleanup_list_invalid");
+    }
+    if (result.keys.length > 0) residualScopes += 1;
+  }
+  return { empty: residualScopes === 0, residualScopes };
+}
+
 async function readLegacyArray(kv, key) {
   const raw = await kv.get(key);
   if (raw === null || raw === undefined || raw === "") return [];
@@ -2184,4 +2227,5 @@ export const __test = Object.freeze({
   recordsKey,
   normalizeCloudflareMutation,
   cleanupLegacySourceKeys,
+  inspectLegacySourceKeys,
 });

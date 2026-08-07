@@ -753,6 +753,12 @@ test("legacy rollback state is deleted only by an explicit cleanup operation", {
   assert.equal((await kv.list({ prefix: "session:" })).keys.length, 1);
   assert.equal((await kv.list({ prefix: "uuid-session:" })).keys.length, 1);
 
+  const bypass = await postRaw(miniflare, "/legacy-cleanup-complete", {
+    completedAt: new Date().toISOString(),
+  });
+  assert.equal(bypass.response.status, 500);
+  assert.equal(bypass.value.error, "auth_state_legacy_cleanup_verification_required");
+
   const early = await postRaw(miniflare, "/legacy-cleanup-run", { reason: "explicit" });
   assert.equal(early.response.status, 500);
   assert.equal(early.value.error, "auth_state_legacy_cleanup_deadline_active");
@@ -768,10 +774,46 @@ test("legacy rollback state is deleted only by an explicit cleanup operation", {
 
   const explicit = await post(miniflare, "/legacy-cleanup-run", { reason: "explicit" });
   assert.equal(explicit.cleaned, true);
+  assert.equal(explicit.verificationPending, true);
+  assert.equal(explicit.remaining, 2);
   assert.equal(await kv.get("invites"), null);
   assert.equal(await kv.get("trash"), null);
   assert.equal((await kv.list({ prefix: "session:" })).keys.length, 0);
   assert.equal((await kv.list({ prefix: "uuid-session:" })).keys.length, 0);
+
+  const pending = await (await miniflare.dispatchFetch("http://worker.test/status")).json();
+  assert.equal(pending.legacyCleanupComplete, false);
+  assert.equal(pending.legacyCleanupVerificationPending, true);
+  assert.equal(pending.legacyCleanupRechecksRemaining, 2);
+
+  await kv.put("trash", "late-residual-must-not-be-deleted-by-alarm");
+  const residual = await post(miniflare, "/legacy-cleanup-alarm", {});
+  assert.equal(residual.verified, false);
+  assert.equal(residual.residual, true);
+  assert.equal(residual.remaining, 2);
+  assert.notEqual(await kv.get("trash"), null);
+
+  await kv.delete("trash");
+  const firstZero = await post(miniflare, "/legacy-cleanup-alarm", {});
+  assert.equal(firstZero.verified, true);
+  assert.equal(firstZero.complete, false);
+  assert.equal(firstZero.remaining, 1);
+
+  await kv.put(`session:${"3".repeat(64)}`, "late-between-zero-checks");
+  const reset = await post(miniflare, "/legacy-cleanup-alarm", {});
+  assert.equal(reset.residual, true);
+  assert.equal(reset.remaining, 2);
+  assert.equal((await kv.list({ prefix: "session:" })).keys.length, 1);
+
+  await kv.delete(`session:${"3".repeat(64)}`);
+  assert.equal((await post(miniflare, "/legacy-cleanup-alarm", {})).remaining, 1);
+  const secondZero = await post(miniflare, "/legacy-cleanup-alarm", {});
+  assert.equal(secondZero.verified, true);
+  assert.equal(secondZero.complete, true);
+  assert.equal(secondZero.remaining, 0);
+  const complete = await (await miniflare.dispatchFetch("http://worker.test/status")).json();
+  assert.equal(complete.legacyCleanupComplete, true);
+  assert.equal(complete.legacyCleanupVerificationPending, false);
 });
 
 test("legacy invite migration rejects a UTF-8 collection above the byte limit", { timeout: 30_000 }, async (t) => {

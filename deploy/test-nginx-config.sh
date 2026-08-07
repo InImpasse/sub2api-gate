@@ -246,6 +246,61 @@ sync_status() {
     "${correct_client[@]}" \
     "https://api.example.com:$https_port/_sub2api-sync/provision" 2>/dev/null
 }
+sync_contract_response() {
+  visitor_ip="$1"
+  request_id="$2"
+  failure="${3:-0}"
+  app_error="${4:-0}"
+  headers_file="$temp_dir/sync-contract-headers"
+  body_file="$temp_dir/sync-contract-body"
+  status="$(curl "${curl_common[@]}" \
+    --output "$body_file" \
+    --dump-header "$headers_file" \
+    --write-out '%{http_code}' \
+    --resolve "api.example.com:$https_port:127.0.0.1" \
+    -H "CF-Connecting-IP: $visitor_ip" \
+    -H 'Content-Type: application/json' \
+    -H "X-Request-ID: $request_id" \
+    -H "X-Test-Sync-Failure: $failure" \
+    -H "X-Test-Sync-App-Error: $app_error" \
+    -X POST --data '{}' \
+    "${correct_client[@]}" \
+    "https://api.example.com:$https_port/_sub2api-sync/provision" 2>/dev/null)"
+}
+
+sync_contract_response 198.51.100.40 bounded-sync-request
+[ "$status" = "200" ] || fail "sync request-id propagation probe failed"
+case "$(cat "$body_file")" in
+  *'"requestId":"bounded-sync-request"'*) ;;
+  *) fail "sync request ID was not propagated to the origin" ;;
+esac
+
+sync_contract_response 198.51.100.41 bounded-sync-failure 1
+[ "$status" = "502" ] || fail "sync upstream failure did not produce 502"
+case "$(cat "$body_file")" in
+  *'"error":"upstream_unavailable"'*'"retryable":true'*) ;;
+  *) fail "sync upstream failure was not a bounded JSON envelope" ;;
+esac
+grep -Eiq '^content-security-policy: ' "$headers_file" \
+  || fail "sync upstream failure missed CSP"
+grep -Eiq '^x-request-id: [0-9a-f]+[[:space:]]*$' "$headers_file" \
+  || fail "sync upstream failure missed a bounded request ID"
+
+for app_status in 429 502 504; do
+  case "$app_status" in
+    429) expected_app_error="upstream_rate_limited" ;;
+    502) expected_app_error="upstream_invalid_response" ;;
+    504) expected_app_error="dependency_timeout" ;;
+  esac
+  sync_contract_response 198.51.100.39 "bounded-sync-app-$app_status" 0 "$app_status"
+  [ "$status" = "$app_status" ] \
+    || fail "sync application $app_status status was not preserved"
+  case "$(cat "$body_file")" in
+    *"\"error\":\"$expected_app_error\""*"\"requestId\":\"bounded-sync-app-$app_status\""*) ;;
+    *) fail "sync application $app_status envelope was not preserved" ;;
+  esac
+done
+
 same_ip_limited=0
 for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   if [ "$(sync_status 198.51.100.42)" = "429" ]; then
@@ -254,6 +309,14 @@ for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   fi
 done
 [ "$same_ip_limited" -eq 1 ] || fail "sync endpoint did not rate-limit the restored visitor IP"
+sync_contract_response 198.51.100.42 bounded-sync-rate-limit
+[ "$status" = "429" ] || fail "sync rate limit did not remain active"
+case "$(cat "$body_file")" in
+  *'"error":"rate_limited"'*'"retryable":true'*) ;;
+  *) fail "sync rate limit was not a bounded JSON envelope" ;;
+esac
+grep -Eiq '^retry-after: 1[[:space:]]*$' "$headers_file" \
+  || fail "sync rate limit missed Retry-After"
 if [ "$(sync_status 198.51.100.43)" = "429" ]; then
   fail "sync endpoint incorrectly shared a Cloudflare-edge rate-limit bucket"
 fi

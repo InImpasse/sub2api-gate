@@ -177,7 +177,7 @@ $$;
 SQL
 
 # The only runtime DDL accepted is the exact fixed statement emitted by
-# Sub2API 0.1.162 for an already-existing owner-created relation.
+# Sub2API 0.1.171 for an already-existing owner-created relation.
 docker exec -i "$container_name" psql -U sub2api_app -d app_role_test -v ON_ERROR_STOP=1 \
   -c $'CREATE TABLE IF NOT EXISTS schema_migrations (\n\tfilename   TEXT PRIMARY KEY,\n\tchecksum   TEXT NOT NULL,\n\tapplied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n);' \
   >/dev/null

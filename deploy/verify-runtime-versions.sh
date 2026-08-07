@@ -18,9 +18,9 @@ require_compose_text() {
   fi
 }
 
-require_compose_text "weishaw/sub2api@sha256:469790e0389bf31379978687149280a4e135393ad98a9a401951b6be9b1df444"
+require_compose_text "weishaw/sub2api@sha256:8469b859dbc0fb299ffa01d4cc8890dfce671b1ae9fa9cb54651bd258a3577d2"
 require_compose_text "redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005"
-require_compose_text "Sub2API 0.1.162"
+require_compose_text "Sub2API 0.1.171"
 require_compose_text "v=8.8.0"
 require_compose_text "postgres --version"
 
@@ -49,8 +49,8 @@ sub2api_version="$(docker exec "$sub2api_container" /app/sub2api --version 2>&1)
   exit 1
 }
 case "$sub2api_version" in
-  "Sub2API 0.1.162"|"Sub2API 0.1.162 "*) ;;
-  *) echo "running Sub2API binary is not 0.1.162" >&2; exit 1 ;;
+  "Sub2API 0.1.171"|"Sub2API 0.1.171 "*) ;;
+  *) echo "running Sub2API binary is not 0.1.171" >&2; exit 1 ;;
 esac
 
 redis_version="$(docker exec "$redis_container" redis-server --version 2>&1)" || {
@@ -71,4 +71,4 @@ case "$postgres_version" in
   *) echo "running PostgreSQL binary is not major version 18" >&2; exit 1 ;;
 esac
 
-echo "running Sub2API 0.1.162, Redis 8.8.0, and PostgreSQL 18 binaries verified"
+echo "running Sub2API 0.1.171, Redis 8.8.0, and PostgreSQL 18 binaries verified"

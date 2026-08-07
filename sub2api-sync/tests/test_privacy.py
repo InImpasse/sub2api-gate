@@ -45,7 +45,9 @@ class PrivacyContractTests(unittest.TestCase):
             "bodyText": SENTINEL,
             "responsePreview": SENTINEL,
         }
-        with mock.patch.object(SYNC, "query_json_value", return_value=[row]):
+        with mock.patch.object(
+            SYNC, "database_transaction", return_value=nullcontext()
+        ), mock.patch.object(SYNC, "query_json_value", return_value=[row]):
             result = SYNC.list_usage_logs({"pageSize": 25})
         encoded = json.dumps(result)
         self.assertNotIn(SENTINEL, encoded)
@@ -335,7 +337,10 @@ class PrivacyContractTests(unittest.TestCase):
              mock.patch("sys.stdout", output):
             handler.do_POST()
 
-        self.assertEqual(responses, [(500, {"ok": False, "error": "sync_action_failed"})])
+        self.assertEqual(responses[0][0], 400)
+        self.assertEqual(responses[0][1]["error"], "invalid_action")
+        self.assertFalse(responses[0][1]["retryable"])
+        self.assertRegex(responses[0][1]["requestId"], r"^[0-9a-f]{16}$")
         self.assertNotIn(sentinel, output.getvalue())
         self.assertIn('"action": "invalid"', output.getvalue())
 
@@ -352,7 +357,10 @@ class PrivacyContractTests(unittest.TestCase):
 
         handler.do_POST()
 
-        self.assertEqual(responses, [(400, {"ok": False, "error": "invalid content length"})])
+        self.assertEqual(responses[0][0], 400)
+        self.assertEqual(responses[0][1]["error"], "invalid_content_length")
+        self.assertFalse(responses[0][1]["retryable"])
+        self.assertRegex(responses[0][1]["requestId"], r"^[0-9a-f]{16}$")
 
     def test_server_thread_errors_log_only_a_stable_code(self):
         server = object.__new__(SYNC.SafeThreadingHTTPServer)
@@ -364,7 +372,35 @@ class PrivacyContractTests(unittest.TestCase):
             {"level": "error", "error_code": "sync_request_failed"},
         )
 
-    def test_server_sets_five_second_connection_timeout(self):
+    def test_response_observability_contains_only_bounded_metadata(self):
+        handler = object.__new__(SYNC.Handler)
+        handler.path = "/provision"
+        handler.request_id = "bounded-request-id"
+        handler.request_started_at = 10.0
+        handler.action = "status"
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock()
+        handler.wfile = io.BytesIO()
+        output = io.StringIO()
+
+        with mock.patch.object(SYNC.time, "monotonic", return_value=10.125), \
+             mock.patch("sys.stdout", output):
+            handler.respond(200, {"ok": True, "private": SENTINEL})
+
+        event = json.loads(output.getvalue())
+        self.assertEqual(event, {
+            "level": "info",
+            "event": "sync_response",
+            "route": "provision",
+            "action": "status",
+            "status": 200,
+            "latency_ms": 125,
+            "request_id": "bounded-request-id",
+        })
+        self.assertNotIn(SENTINEL, output.getvalue())
+
+    def test_server_caps_slow_request_reads_below_the_worker_timeout(self):
         server = object.__new__(SYNC.SafeThreadingHTTPServer)
         connection = mock.Mock()
         address = ("127.0.0.1", 1234)
@@ -374,14 +410,14 @@ class PrivacyContractTests(unittest.TestCase):
             return_value=(connection, address),
         ):
             self.assertEqual(server.get_request(), (connection, address))
-        connection.settimeout.assert_called_once_with(5)
+        connection.settimeout.assert_called_once_with(4)
 
     def test_server_rejects_connections_above_the_thread_limit_with_stable_code(self):
         server = object.__new__(SYNC.SafeThreadingHTTPServer)
         server._request_slots = threading.BoundedSemaphore(1)
         server._request_slots.acquire()
         server.shutdown_request = mock.Mock()
-        request = object()
+        request = mock.Mock()
         output = io.StringIO()
 
         with mock.patch("sys.stdout", output), mock.patch.object(
@@ -391,6 +427,10 @@ class PrivacyContractTests(unittest.TestCase):
             server.process_request(request, ("127.0.0.1", 1234))
 
         process_request.assert_not_called()
+        request.settimeout.assert_called_once_with(0.1)
+        sent = request.sendall.call_args.args[0]
+        self.assertTrue(sent.startswith(b"HTTP/1.1 503 Service Unavailable\r\n"))
+        self.assertIn(b'"error":"capacity_exceeded"', sent)
         server.shutdown_request.assert_called_once_with(request)
         self.assertEqual(
             json.loads(output.getvalue()),
@@ -414,10 +454,10 @@ class PrivacyContractTests(unittest.TestCase):
                 raise TimeoutError("sk-private-timeout-detail")
 
         cases = (
-            (TimedOutBody(), 408, "request timeout", "sync_request_read_timeout"),
-            (io.BytesIO(b"short"), 400, "incomplete request body", "sync_request_body_incomplete"),
+            (TimedOutBody(), 408, "request_timeout", True, "sync_request_read_timeout"),
+            (io.BytesIO(b"short"), 400, "incomplete_body", False, "sync_request_body_incomplete"),
         )
-        for body_stream, status, error, error_code in cases:
+        for body_stream, status, error, retryable, error_code in cases:
             with self.subTest(error_code=error_code):
                 handler = object.__new__(SYNC.Handler)
                 handler.path = "/provision"
@@ -440,7 +480,12 @@ class PrivacyContractTests(unittest.TestCase):
                     handler.do_POST()
 
                 self.assertTrue(handler.close_connection)
-                self.assertEqual(responses, [(status, {"ok": False, "error": error})])
+                self.assertEqual(responses, [(status, {
+                    "ok": False,
+                    "error": error,
+                    "retryable": retryable,
+                    "requestId": "bounded-request-id",
+                })])
                 verify.assert_not_called()
                 self.assertEqual(
                     json.loads(output.getvalue()),

@@ -1,3 +1,4 @@
+import gzip
 import pathlib
 import re
 import unittest
@@ -21,6 +22,11 @@ def relative_luminance(color):
 
 
 class DemoContractTests(unittest.TestCase):
+    def test_static_demo_stays_within_the_resource_budget(self):
+        encoded = DEMO.encode()
+        self.assertLessEqual(len(encoded), 56 * 1024)
+        self.assertLessEqual(len(gzip.compress(encoded, mtime=0)), 14 * 1024)
+
     def test_stylesheet_blocks_are_structurally_balanced(self):
         styles = re.findall(r"<style>(.*?)</style>", DEMO, re.DOTALL)
         self.assertTrue(styles)
@@ -79,6 +85,20 @@ class DemoContractTests(unittest.TestCase):
         self.assertIn("Access key or legacy UUID", DEMO)
         self.assertIn("accepted only during its migration window", DEMO)
         self.assertNotIn("Access key or UUID", DEMO)
+
+    def test_demo_verification_lifecycle_has_accessible_status_and_retry(self):
+        self.assertIn('id="turnstileStatus"', DEMO)
+        self.assertIn('role="status" aria-live="polite"', DEMO)
+        self.assertIn('id="turnstileRetry"', DEMO)
+        self.assertIn("Verification complete.", DEMO)
+        self.assertIn("Verification expired. Complete it again.", DEMO)
+        self.assertIn('turnstileStatus.setAttribute("role", alert ? "alert" : "status")', DEMO)
+
+    def test_demo_reports_form_and_clipboard_errors_without_window_alert(self):
+        self.assertIn('id="allowFormStatus"', DEMO)
+        self.assertIn('id="copyStatus"', DEMO)
+        self.assertIn("Select the value and copy it manually.", DEMO)
+        self.assertNotIn('alert("Invalid key.', DEMO)
 
     def test_faint_text_meets_aa_contrast_on_the_page_background(self):
         light_theme = DEMO.split("@media (prefers-color-scheme: dark)", 1)[0]

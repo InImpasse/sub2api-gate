@@ -661,7 +661,9 @@ class Sub2ApiCompatibilityTests(unittest.TestCase):
         handler.headers = {}
         handler.rfile = io.BytesIO()
         responses = []
-        handler.respond = lambda status, payload: responses.append((status, payload))
+        handler.respond = lambda status, payload, extra_headers=None: responses.append(
+            (status, payload, extra_headers)
+        )
 
         with mock.patch.object(
             SYNC, "psql", side_effect=RuntimeError("database_command_failed")
@@ -670,7 +672,12 @@ class Sub2ApiCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(
             responses,
-            [(503, {"ok": False, "error": "dependency_unavailable"})],
+            [(503, {
+                "ok": False,
+                "error": "dependency_unavailable",
+                "retryable": True,
+                "requestId": handler.request_id,
+            }, {"retry-after": "1"})],
         )
         self.assertIn("sub2api_sync_invite_owners", query.call_args.args[0])
         redis.assert_not_called()
@@ -784,10 +791,13 @@ class Sub2ApiCompatibilityTests(unittest.TestCase):
                 statement_timeout_ms=SYNC.USAGE_DB_STATEMENT_TIMEOUT_MS,
             )
             usage_call = run.call_args
-        self.assertEqual(provision_call.kwargs["timeout"], 12)
+        self.assertEqual(
+            provision_call.kwargs["timeout"],
+            SYNC.DEFAULT_DB_CLIENT_TIMEOUT_SECONDS,
+        )
         self.assertEqual(
             provision_call.kwargs["env"]["PGOPTIONS"],
-            "-c statement_timeout=10000 -c lock_timeout=2000",
+            "-c statement_timeout=3000 -c lock_timeout=2000",
         )
         self.assertEqual(
             usage_call.kwargs["timeout"],
@@ -882,7 +892,17 @@ class Sub2ApiCompatibilityTests(unittest.TestCase):
         self.assertIn("100!%!_done!!", where)
         self.assertIn("req!_!%", where)
         self.assertIn("gpt!_!%", where)
-        self.assertGreaterEqual(where.count("ESCAPE '!'"), 7)
+        self.assertEqual(where.count("ESCAPE '!'"), 4)
+
+    def test_usage_general_search_matches_the_trigram_index_expression(self):
+        _query, _failed, where = USAGE.usage_log_filters({"query": "no-match"})
+        expression = (
+            "(COALESCE(request_id, '') || ' ' || COALESCE(model, '') || ' ' || "
+            "COALESCE(requested_model, '') || ' ' || "
+            "COALESCE(inbound_endpoint, ''))"
+        )
+        self.assertIn(expression + " ILIKE", where)
+        self.assertNotIn(" OR ", where)
 
     def test_usage_model_options_are_cached_for_five_minutes(self):
         USAGE._MODEL_CACHE.update({"expires_at": 0.0, "items": []})

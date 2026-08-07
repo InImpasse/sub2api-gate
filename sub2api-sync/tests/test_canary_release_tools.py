@@ -440,7 +440,7 @@ class CanaryComposeTests(unittest.TestCase):
             "\nnetworks:\n", 1
         )[0]
         self.assertIn(
-            "weishaw/sub2api@sha256:469790e0389bf31379978687149280a4e135393ad98a9a401951b6be9b1df444",
+            "weishaw/sub2api@sha256:8469b859dbc0fb299ffa01d4cc8890dfce671b1ae9fa9cb54651bd258a3577d2",
             service,
         )
         self.assertIn('"127.0.0.1:18081:8080"', service)
@@ -455,7 +455,7 @@ class CanaryComposeTests(unittest.TestCase):
         self.assertIn("/app/data:rw,noexec,nosuid,nodev", service)
         self.assertIn("/tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=1000,gid=1000", service)
         self.assertNotIn("/mnt/data", service)
-        self.assertIn("Sub2API 0.1.162", service)
+        self.assertIn("Sub2API 0.1.171", service)
         self.assertIn('AUTO_SETUP: "true"', service)
         self.assertIn("DATABASE_HOST: canary-postgres", service)
         self.assertIn("REDIS_HOST: canary-redis", service)

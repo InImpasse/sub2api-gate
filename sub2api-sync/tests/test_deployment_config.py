@@ -38,6 +38,7 @@ PREPARE_SYNC_ROLE = ROOT / "deploy" / "prepare-sync-role.sh"
 PREPARE_SYNC_ROLE_SQL = ROOT / "migrations" / "000_prepare_sync_role.sql"
 PREPARE_APP_ROLE = ROOT / "deploy" / "prepare-app-role.sh"
 APP_ROLE_SQL = ROOT / "migrations" / "005_app_least_privilege.sql"
+USAGE_INDEXES = ROOT / "migrations" / "004_usage_cursor_indexes.sql"
 
 
 class DeploymentConfigTests(unittest.TestCase):
@@ -1023,6 +1024,16 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("SHOW statement_timeout", script)
         self.assertIn("PRIVATE_SENTINEL", script)
 
+    def test_usage_index_migration_repairs_invalid_concurrent_indexes(self):
+        migration = USAGE_INDEXES.read_text()
+        self.assertIn("idx_usage_logs_metadata_search_trgm", migration)
+        self.assertIn("gin_trgm_ops", migration)
+        self.assertIn("NOT index_state.indisvalid", migration)
+        self.assertIn("NOT index_state.indisready", migration)
+        self.assertIn("DROP INDEX CONCURRENTLY", migration)
+        self.assertIn("\\gexec", migration)
+        self.assertIn("pg_get_indexdef", migration)
+
     def test_postgres_18_group_gate_covers_success_replay_and_rollbacks(self):
         self.assertTrue(PG18_GROUP_TEST.exists())
         script = PG18_GROUP_TEST.read_text()
@@ -1098,7 +1109,11 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_sub2api_startup_gate_checks_file_logs_and_export_schema(self):
         self.assertTrue(SUB2API_LOG_TEST.exists())
         script = SUB2API_LOG_TEST.read_text()
-        self.assertIn("Sub2API 0.1.162", script)
+        self.assertIn(
+            'sub2api_expected_version="${SUB2API_TEST_EXPECTED_VERSION:-0.1.171}"',
+            script,
+        )
+        self.assertIn('"Sub2API $sub2api_expected_version"', script)
         self.assertIn("v=8.8.0", script)
         self.assertIn("--log-driver none", script)
         self.assertIn("LOG_OUTPUT_TO_FILE=false", script)

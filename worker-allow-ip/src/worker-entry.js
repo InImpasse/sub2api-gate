@@ -3,7 +3,9 @@ import { DurableObject } from "cloudflare:workers";
 import worker from "./index.js";
 import {
   authStateArmLegacyCleanupRechecks,
+  authStateBeginLegacyCleanupVerification,
   authStateClaimLegacyCleanup,
+  authStateConsumeLegacyCleanupRecheck,
   authStateDeleteSession,
   authStateFindInviteByAccessKeyHmac,
   authStateGetCredentialMigrationBatch,
@@ -41,9 +43,11 @@ import {
   authStateUpdateCloudflareMutationItems,
   cleanupLegacySourceKeys,
   initializeAuthStateStorage,
+  inspectLegacySourceKeys,
   isAuthStateBindingConfigured,
   LEGACY_CLEANUP_LEASE_MS,
   LEGACY_CLEANUP_RECHECK_DELAY_MS,
+  LEGACY_CLEANUP_RETRY_DELAY_MS,
 } from "./auth-state.js";
 import {
   consumeRateLimitAttempt,
@@ -75,7 +79,12 @@ export class AuthState extends DurableObject {
   }
 
   async status() {
-    return authStateStatus(this.ctx.storage);
+    let status = authStateStatus(this.ctx.storage);
+    if (status.legacyCleanupComplete && !status.legacyCleanupSchedulerReady) {
+      await this.armLegacyCleanupRechecks();
+      status = authStateStatus(this.ctx.storage);
+    }
+    return status;
   }
 
   async importLegacy(snapshot, importedAt) {
@@ -83,9 +92,7 @@ export class AuthState extends DurableObject {
   }
 
   async markLegacyCleanupComplete(completedAt) {
-    const result = authStateMarkLegacyCleanupComplete(this.ctx.storage, completedAt);
-    await this.armLegacyCleanupRechecks();
-    return result;
+    return authStateMarkLegacyCleanupComplete(this.ctx.storage, completedAt);
   }
 
   async armLegacyCleanupRechecks() {
@@ -124,12 +131,52 @@ export class AuthState extends DurableObject {
       throw new Error("auth_state_legacy_cleanup_failed");
     }
 
-    authStateMarkLegacyCleanupComplete(this.ctx.storage, new Date().toISOString());
-    return { ok: true, cleaned: true, busy: false, remaining: 0 };
+    const verification = authStateBeginLegacyCleanupVerification(this.ctx.storage);
+    await this.#scheduleLegacyCleanupAt(Date.now() + LEGACY_CLEANUP_RECHECK_DELAY_MS);
+    return {
+      ok: true,
+      cleaned: true,
+      busy: false,
+      verificationPending: true,
+      remaining: verification.remaining,
+    };
   }
 
   async alarm() {
-    return { ok: true, cleaned: false };
+    const status = authStateStatus(this.ctx.storage);
+    if (!status.legacyCleanupVerificationPending) {
+      return { ok: true, verified: false, residual: false, complete: status.legacyCleanupComplete };
+    }
+
+    let inspection;
+    try {
+      inspection = await inspectLegacySourceKeys(this.env?.INVITE_STORE);
+    } catch {
+      const reset = authStateBeginLegacyCleanupVerification(this.ctx.storage);
+      await this.#scheduleLegacyCleanupAt(Date.now() + LEGACY_CLEANUP_RETRY_DELAY_MS);
+      return { ok: false, verified: false, residual: false, complete: false, remaining: reset.remaining };
+    }
+
+    if (!inspection.empty) {
+      const reset = authStateBeginLegacyCleanupVerification(this.ctx.storage);
+      await this.#scheduleLegacyCleanupAt(Date.now() + LEGACY_CLEANUP_RETRY_DELAY_MS);
+      return { ok: true, verified: false, residual: true, complete: false, remaining: reset.remaining };
+    }
+
+    const verification = authStateConsumeLegacyCleanupRecheck(
+      this.ctx.storage,
+      new Date().toISOString(),
+    );
+    if (!verification.complete) {
+      await this.#scheduleLegacyCleanupAt(Date.now() + LEGACY_CLEANUP_RECHECK_DELAY_MS);
+    }
+    return {
+      ok: true,
+      verified: true,
+      residual: false,
+      complete: verification.complete,
+      remaining: verification.remaining,
+    };
   }
 
   async #scheduleLegacyCleanupAt(scheduledAt) {

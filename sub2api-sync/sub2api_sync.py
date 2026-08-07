@@ -13,6 +13,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from usage_metadata import (
     get_usage_log_detail as metadata_usage_log_detail,
     list_usage_logs as metadata_usage_logs,
@@ -28,15 +29,22 @@ MAX_LOGIN_AUTH_RESPONSE_BYTES = 14 * 1024
 MAX_LOGIN_USER_FIELD_BYTES = 512
 MAX_SAFE_IDENTIFIER = 9_007_199_254_740_991
 MAX_USER_API_KEYS = 100
-HTTP_CONNECTION_TIMEOUT_SECONDS = 5
+HTTP_CONNECTION_TIMEOUT_SECONDS = 4
 MAX_REQUEST_THREADS = 16
+MAX_REQUEST_BACKLOG = 32
 DEFAULT_KEY_NAME = "Sub2API"
 DEFAULT_BASE_URL = "https://api.example.com/v1"
 DEFAULT_USER_BALANCE = "100"
 DEFAULT_SUBSCRIPTION_DAYS = 36500
 SIGNATURE_MAX_SKEW_SECONDS = 300
 NONCE_TTL_SECONDS = SIGNATURE_MAX_SKEW_SECONDS * 2 + 1
-DEFAULT_DB_STATEMENT_TIMEOUT_MS = 10_000
+DEFAULT_ACTION_TIMEOUT_SECONDS = 4
+LOGIN_ACTION_TIMEOUT_SECONDS = 8
+LOGIN_UPSTREAM_TIMEOUT_SECONDS = 5
+HEALTH_ACTION_TIMEOUT_SECONDS = 2
+HEALTH_DEPENDENCY_TIMEOUT_SECONDS = 1
+DEFAULT_DB_CLIENT_TIMEOUT_SECONDS = 4
+DEFAULT_DB_STATEMENT_TIMEOUT_MS = 3_000
 USAGE_DB_STATEMENT_TIMEOUT_MS = 2_000
 USAGE_DB_CLIENT_TIMEOUT_SECONDS = 3
 TOKEN_ID_FIELDS = (
@@ -71,6 +79,7 @@ LOGIN_USER_FIELDS = (
     "updated_at",
 )
 _DATABASE_TRANSACTION = threading.local()
+_REQUEST_CONTEXT = threading.local()
 
 
 def env_int(name, default):
@@ -78,6 +87,44 @@ def env_int(name, default):
         return int(os.environ.get(name, str(default)))
     except ValueError:
         return default
+
+
+@contextmanager
+def action_deadline(action, started_at=None):
+    timeout = (
+        LOGIN_ACTION_TIMEOUT_SECONDS
+        if action == "login"
+        else HEALTH_ACTION_TIMEOUT_SECONDS
+        if action == "health"
+        else DEFAULT_ACTION_TIMEOUT_SECONDS
+    )
+    previous = getattr(_REQUEST_CONTEXT, "deadline", None)
+    start = time.monotonic() if started_at is None else float(started_at)
+    deadline = start + timeout
+    if previous is not None:
+        deadline = min(deadline, previous)
+    _REQUEST_CONTEXT.deadline = deadline
+    try:
+        yield deadline
+    finally:
+        if previous is None:
+            try:
+                del _REQUEST_CONTEXT.deadline
+            except AttributeError:
+                pass
+        else:
+            _REQUEST_CONTEXT.deadline = previous
+
+
+def remaining_timeout(maximum):
+    maximum = float(maximum)
+    deadline = getattr(_REQUEST_CONTEXT, "deadline", None)
+    if deadline is None:
+        return maximum
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired("sync_deadline", maximum)
+    return min(maximum, remaining)
 
 
 def get_secret():
@@ -151,10 +198,15 @@ def _validated_statement_timeout(statement_timeout_ms):
 
 
 class DatabaseTransaction:
-    def __init__(self, timeout=12, statement_timeout_ms=DEFAULT_DB_STATEMENT_TIMEOUT_MS):
-        self.timeout = timeout
+    def __init__(
+        self,
+        timeout=DEFAULT_DB_CLIENT_TIMEOUT_SECONDS,
+        statement_timeout_ms=DEFAULT_DB_STATEMENT_TIMEOUT_MS,
+    ):
+        self.timeout = float(timeout)
         self.statement_timeout_ms = _validated_statement_timeout(statement_timeout_ms)
         self.process = None
+        self.deadline = None
 
     def __enter__(self):
         if getattr(_DATABASE_TRANSACTION, "session", None) is not None:
@@ -169,6 +221,10 @@ class DatabaseTransaction:
             env=process_env,
         )
         self.output_buffer = b""
+        self.deadline = time.monotonic() + self.timeout
+        request_deadline = getattr(_REQUEST_CONTEXT, "deadline", None)
+        if request_deadline is not None:
+            self.deadline = min(self.deadline, request_deadline)
         _DATABASE_TRANSACTION.session = self
         try:
             self.execute("BEGIN;")
@@ -201,12 +257,18 @@ class DatabaseTransaction:
             self.process.stdin.write(f"\\echo {marker}\n".encode())
             self.process.stdin.flush()
             lines = []
-            deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
+            command_timeout = self.timeout if timeout is None else float(timeout)
+            deadline = time.monotonic() + command_timeout
+            if self.deadline is not None:
+                deadline = min(deadline, self.deadline)
             while True:
-                line = self._readline(deadline, timeout or self.timeout)
+                line = self._readline(deadline, command_timeout)
                 if line == marker:
                     return "\n".join(lines).strip()
                 lines.append(line)
+        except subprocess.TimeoutExpired:
+            self._abort()
+            raise
         except (BrokenPipeError, OSError):
             raise RuntimeError("database_command_failed") from None
 
@@ -237,6 +299,16 @@ class DatabaseTransaction:
         line, self.output_buffer = self.output_buffer.split(b"\n", 1)
         return line.rstrip(b"\r").decode("utf-8", errors="replace")
 
+    def _abort(self):
+        if self.process is None or self.process.poll() is not None:
+            return
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=1)
+
     def _close(self):
         if self.process is None:
             return
@@ -261,12 +333,18 @@ class DatabaseTransaction:
             self.process.wait(timeout=2)
 
 
-def database_transaction(timeout=12, statement_timeout_ms=DEFAULT_DB_STATEMENT_TIMEOUT_MS):
+def database_transaction(
+    timeout=DEFAULT_DB_CLIENT_TIMEOUT_SECONDS,
+    statement_timeout_ms=DEFAULT_DB_STATEMENT_TIMEOUT_MS,
+):
     return DatabaseTransaction(timeout, statement_timeout_ms)
 
 
-def psql(sql, timeout=12, statement_timeout_ms=DEFAULT_DB_STATEMENT_TIMEOUT_MS):
+def psql(sql, timeout=None, statement_timeout_ms=DEFAULT_DB_STATEMENT_TIMEOUT_MS):
     statement_timeout_ms = _validated_statement_timeout(statement_timeout_ms)
+    timeout = remaining_timeout(
+        DEFAULT_DB_CLIENT_TIMEOUT_SECONDS if timeout is None else timeout
+    )
     transaction = getattr(_DATABASE_TRANSACTION, "session", None)
     if transaction is not None:
         if statement_timeout_ms != transaction.statement_timeout_ms:
@@ -557,7 +635,11 @@ def login_password():
 
 
 def list_usage_logs(payload):
-    return metadata_usage_logs(query_json_value, payload)
+    with database_transaction(
+        timeout=USAGE_DB_CLIENT_TIMEOUT_SECONDS,
+        statement_timeout_ms=USAGE_DB_STATEMENT_TIMEOUT_MS,
+    ):
+        return metadata_usage_logs(query_json_value, payload)
 
 
 def get_usage_log_detail(payload):
@@ -916,7 +998,9 @@ def login(payload):
         headers={"content-type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(
+            request, timeout=remaining_timeout(LOGIN_UPSTREAM_TIMEOUT_SECONDS)
+        ) as response:
             declared_length = response.headers.get("content-length", "")
             if declared_length:
                 try:
@@ -929,6 +1013,8 @@ def login(payload):
                 raise RuntimeError("sub2api_login_response_too_large")
             payload = json.loads(response_body.decode())
     except urllib.error.HTTPError as error:
+        if error.code == 429:
+            raise RuntimeError("sub2api_login_rate_limited") from error
         raise RuntimeError("sub2api_login_rejected") from error
     if not isinstance(payload, dict) or payload.get("code") != 0:
         raise RuntimeError("sub2api login failed")
@@ -1101,6 +1187,7 @@ def password_hash_fingerprint(value):
 
 
 def redis_command(*parts, timeout=2):
+    timeout = remaining_timeout(timeout)
     host = os.environ.get("SUB2API_SYNC_REDIS_HOST", "redis")
     port = env_int("SUB2API_SYNC_REDIS_PORT", 6379)
     username = os.environ.get("SUB2API_SYNC_REDIS_USERNAME", "")
@@ -1181,15 +1268,30 @@ def verify_request(headers, body):
     ).hexdigest()
     if not hmac.compare_digest(expected, signature):
         return False
-    try:
-        return claim_nonce(nonce)
-    except (OSError, RuntimeError):
-        return False
+    return claim_nonce(nonce)
+
+
+def dispatch_action(action, payload):
+    if action == "provision":
+        return provision(payload)
+    if action == "status":
+        return status(payload)
+    if action == "login":
+        return login(payload)
+    if action == "deprovision":
+        return deprovision(payload)
+    if action == "purge":
+        return purge(payload)
+    if action == "usage_logs_list":
+        return list_usage_logs(payload)
+    if action == "usage_log_detail":
+        return get_usage_log_detail(payload)
+    raise ValueError("invalid action")
 
 
 class SafeThreadingHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
-    request_queue_size = MAX_REQUEST_THREADS
+    request_queue_size = MAX_REQUEST_BACKLOG
 
     def __init__(self, *args, **kwargs):
         self._request_slots = threading.BoundedSemaphore(MAX_REQUEST_THREADS)
@@ -1206,6 +1308,31 @@ class SafeThreadingHTTPServer(ThreadingHTTPServer):
                 "level": "warning",
                 "error_code": "sync_request_capacity_rejected",
             }), flush=True)
+            response_request_id = secrets.token_hex(8)
+            body = json.dumps({
+                "ok": False,
+                "error": "capacity_exceeded",
+                "retryable": True,
+                "requestId": response_request_id,
+            }, separators=(",", ":")).encode()
+            response = (
+                b"HTTP/1.1 503 Service Unavailable\r\n"
+                b"content-type: application/json; charset=utf-8\r\n"
+                b"cache-control: no-store\r\n"
+                b"x-content-type-options: nosniff\r\n"
+                b"referrer-policy: no-referrer\r\n"
+                b"content-security-policy: default-src 'none'; frame-ancestors 'none'; base-uri 'none'\r\n"
+                + f"x-request-id: {response_request_id}\r\n".encode()
+                + b"retry-after: 1\r\n"
+                + f"content-length: {len(body)}\r\n".encode()
+                + b"connection: close\r\n\r\n"
+                + body
+            )
+            try:
+                request.settimeout(0.1)
+                request.sendall(response)
+            except OSError:
+                pass
             self.shutdown_request(request)
             return
         try:
@@ -1231,37 +1358,76 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "sub2api-sync/1.0"
 
     def do_GET(self):
+        self.request_started_at = time.monotonic()
         self.request_id = request_id(self.headers)
         if self.path in ("/health", "/healthz"):
             try:
-                psql(
-                    "SELECT user_id,invite_fingerprint,created_at,updated_at "
-                    "FROM sub2api_sync_invite_owners LIMIT 0;",
-                    timeout=3,
-                )
-                redis_command("PING", timeout=2)
+                with action_deadline("health", self.request_started_at):
+                    psql(
+                        "SELECT user_id,invite_fingerprint,created_at,updated_at "
+                        "FROM sub2api_sync_invite_owners LIMIT 0;",
+                        timeout=remaining_timeout(
+                            HEALTH_DEPENDENCY_TIMEOUT_SECONDS
+                        ),
+                        statement_timeout_ms=1_000,
+                    )
+                    redis_command(
+                        "PING",
+                        timeout=remaining_timeout(
+                            HEALTH_DEPENDENCY_TIMEOUT_SECONDS
+                        ),
+                    )
                 self.respond(200, {"ok": True})
             except (OSError, RuntimeError, subprocess.TimeoutExpired):
-                self.respond(503, {"ok": False, "error": "dependency_unavailable"})
+                self.respond_error(
+                    503,
+                    "dependency_unavailable",
+                    retryable=True,
+                    retry_after=1,
+                )
             return
-        self.respond(404, {"ok": False, "error": "not found"})
+        if self.path == "/provision":
+            self.respond_error(
+                405,
+                "method_not_allowed",
+                retryable=False,
+                extra_headers={"allow": "POST"},
+            )
+            return
+        self.respond_error(404, "not_found", retryable=False)
 
     def do_POST(self):
+        self.request_started_at = time.monotonic()
         self.request_id = request_id(self.headers)
         if self.path != "/provision":
-            self.respond(404, {"ok": False, "error": "not found"})
+            if self.path in ("/health", "/healthz"):
+                self.respond_error(
+                    405,
+                    "method_not_allowed",
+                    retryable=False,
+                    extra_headers={"allow": "GET"},
+                )
+                return
+            self.respond_error(404, "not_found", retryable=False)
             return
         content_type = self.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
-            self.respond(415, {"ok": False, "error": "unsupported media type"})
+            self.respond_error(415, "unsupported_media_type", retryable=False)
+            return
+        raw_length = self.headers.get("content-length")
+        if raw_length is None:
+            self.respond_error(411, "length_required", retryable=False)
             return
         try:
-            length = int(self.headers.get("content-length", "0") or "0")
+            length = int(raw_length)
         except (TypeError, ValueError):
-            self.respond(400, {"ok": False, "error": "invalid content length"})
+            self.respond_error(400, "invalid_content_length", retryable=False)
             return
-        if length <= 0 or length > MAX_BODY_BYTES:
-            self.respond(413, {"ok": False, "error": "invalid body size"})
+        if length <= 0:
+            self.respond_error(400, "invalid_body_size", retryable=False)
+            return
+        if length > MAX_BODY_BYTES:
+            self.respond_error(413, "payload_too_large", retryable=False)
             return
         try:
             body = self.rfile.read(length)
@@ -1272,7 +1438,7 @@ class Handler(BaseHTTPRequestHandler):
                 "error_code": "sync_request_read_timeout",
                 "request_id": self.request_id,
             }), flush=True)
-            self.respond(408, {"ok": False, "error": "request timeout"})
+            self.respond_error(408, "request_timeout", retryable=True)
             return
         if len(body) != length:
             self.close_connection = True
@@ -1281,46 +1447,235 @@ class Handler(BaseHTTPRequestHandler):
                 "error_code": "sync_request_body_incomplete",
                 "request_id": self.request_id,
             }), flush=True)
-            self.respond(400, {"ok": False, "error": "incomplete request body"})
+            self.respond_error(400, "incomplete_body", retryable=False)
             return
-        if not verify_request(self.headers, body):
-            self.respond(401, {"ok": False, "error": "unauthorized"})
+        try:
+            with action_deadline("pre_request", self.request_started_at):
+                verified = verify_request(self.headers, body)
+        except (TimeoutError, socket.timeout, subprocess.TimeoutExpired):
+            self.respond_error(
+                504, "dependency_timeout", retryable=True, retry_after=1
+            )
+            return
+        except (OSError, RuntimeError):
+            self.respond_error(
+                503, "dependency_unavailable", retryable=True, retry_after=1
+            )
+            return
+        if not verified:
+            self.respond_error(401, "unauthorized", retryable=False)
             return
         action = "unknown"
         try:
             payload = json.loads(body.decode())
+            if not isinstance(payload, dict):
+                raise ValueError("invalid payload")
             requested_action = str(payload.get("action") or "")
             action = requested_action if requested_action in SYNC_ACTIONS else "invalid"
-            if action == "provision":
-                result = provision(payload)
-            elif action == "status":
-                result = status(payload)
-            elif action == "login":
-                result = login(payload)
-            elif action == "deprovision":
-                result = deprovision(payload)
-            elif action == "purge":
-                result = purge(payload)
-            elif action == "usage_logs_list":
-                result = list_usage_logs(payload)
-            elif action == "usage_log_detail":
-                result = get_usage_log_detail(payload)
-            else:
-                raise ValueError("invalid action")
+            self.action = action if action in SYNC_ACTIONS else "invalid"
+            if action == "invalid":
+                print(json.dumps({
+                    "level": "warning",
+                    "error_code": "sync_request_invalid_action",
+                    "action": action,
+                    "request_id": self.request_id,
+                }), flush=True)
+                self.respond_error(400, "invalid_action", retryable=False)
+                return
+            with action_deadline(action, self.request_started_at):
+                result = dispatch_action(action, payload)
             self.respond(200, result)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            print(json.dumps({
+                "level": "warning",
+                "error_code": "sync_request_json_invalid",
+                "request_id": self.request_id,
+            }), flush=True)
+            self.respond_error(400, "invalid_json", retryable=False)
+        except ValueError as error:
+            if error.args and error.args[0] == "usage log not found":
+                print(json.dumps({
+                    "level": "warning",
+                    "error_code": "sync_resource_not_found",
+                    "action": action,
+                    "request_id": self.request_id,
+                }), flush=True)
+                self.respond_error(
+                    404, "not_found", retryable=False, action=action
+                )
+                return
+            print(json.dumps({
+                "level": "warning",
+                "error_code": "sync_request_invalid",
+                "action": action,
+                "request_id": self.request_id,
+            }), flush=True)
+            self.respond_error(
+                400, "invalid_request", retryable=False, action=action
+            )
+        except (TimeoutError, socket.timeout, subprocess.TimeoutExpired):
+            print(json.dumps({
+                "level": "warning",
+                "error_code": "sync_dependency_timeout",
+                "action": action,
+                "request_id": self.request_id,
+            }), flush=True)
+            self.respond_error(
+                504,
+                "dependency_timeout",
+                retryable=True,
+                action=action,
+                retry_after=1,
+            )
+        except urllib.error.URLError as error:
+            timed_out = isinstance(error.reason, (TimeoutError, socket.timeout))
+            error_code = (
+                "sync_dependency_timeout"
+                if timed_out
+                else "sync_upstream_unavailable"
+            )
+            print(json.dumps({
+                "level": "warning",
+                "error_code": error_code,
+                "action": action,
+                "request_id": self.request_id,
+            }), flush=True)
+            self.respond_error(
+                504 if timed_out else 502,
+                "dependency_timeout" if timed_out else "upstream_unavailable",
+                retryable=True,
+                action=action,
+                retry_after=1 if timed_out else None,
+            )
+        except RuntimeError as error:
+            runtime_code = error.args[0] if error.args else ""
+            if runtime_code == "invite_identity_mismatch":
+                print(json.dumps({
+                    "level": "warning",
+                    "error_code": "sync_identity_conflict",
+                    "action": action,
+                    "request_id": self.request_id,
+                }), flush=True)
+                self.respond_error(
+                    409, "identity_conflict", retryable=False, action=action
+                )
+                return
+            if runtime_code in {
+                "database_command_failed",
+                "database_configuration_invalid",
+            }:
+                print(json.dumps({
+                    "level": "error",
+                    "error_code": "sync_dependency_unavailable",
+                    "action": action,
+                    "request_id": self.request_id,
+                }), flush=True)
+                self.respond_error(
+                    503,
+                    "dependency_unavailable",
+                    retryable=True,
+                    action=action,
+                    retry_after=1,
+                )
+                return
+            if runtime_code == "sub2api_login_rate_limited":
+                print(json.dumps({
+                    "level": "warning",
+                    "error_code": "sync_upstream_rate_limited",
+                    "action": action,
+                    "request_id": self.request_id,
+                }), flush=True)
+                self.respond_error(
+                    429,
+                    "upstream_rate_limited",
+                    retryable=True,
+                    action=action,
+                    retry_after=1,
+                )
+                return
+            if isinstance(runtime_code, str) and runtime_code.startswith(
+                "sub2api_login_"
+            ):
+                print(json.dumps({
+                    "level": "warning",
+                    "error_code": "sync_upstream_invalid_response",
+                    "action": action,
+                    "request_id": self.request_id,
+                }), flush=True)
+                self.respond_error(
+                    502,
+                    "upstream_invalid_response",
+                    retryable=runtime_code != "sub2api_login_rejected",
+                    action=action,
+                )
+                return
+            self._respond_action_failure(action)
         except Exception:
+            self._respond_action_failure(action)
+
+    def _respond_action_failure(self, action):
             print(json.dumps({
                 "level": "error",
                 "error_code": "sync_action_failed",
                 "action": str(action)[:40],
                 "request_id": self.request_id,
             }), flush=True)
-            self.respond(500, {"ok": False, "error": "sync_action_failed"})
+            self.respond_error(
+                500, "internal_error", retryable=False, action=action
+            )
 
     def log_message(self, fmt, *args):
         return
 
-    def respond(self, status, payload):
+    def _other_method(self):
+        self.request_id = request_id(self.headers)
+        if self.path == "/provision":
+            allow = "POST"
+        elif self.path in ("/health", "/healthz"):
+            allow = "GET"
+        else:
+            self.respond_error(404, "not_found", retryable=False)
+            return
+        self.respond_error(
+            405,
+            "method_not_allowed",
+            retryable=False,
+            extra_headers={"allow": allow},
+        )
+
+    do_DELETE = _other_method
+    do_HEAD = _other_method
+    do_OPTIONS = _other_method
+    do_PATCH = _other_method
+    do_PUT = _other_method
+
+    def respond_error(
+        self,
+        status,
+        error,
+        *,
+        retryable,
+        action=None,
+        retry_after=None,
+        extra_headers=None,
+    ):
+        payload = {
+            "ok": False,
+            "error": error,
+            "retryable": bool(retryable),
+            "requestId": getattr(self, "request_id", ""),
+        }
+        if action in SYNC_ACTIONS:
+            payload["action"] = action
+        headers = dict(extra_headers or {})
+        if retry_after is not None:
+            headers["retry-after"] = str(retry_after)
+        if not headers:
+            self.respond(status, payload)
+        else:
+            self.respond(status, payload, extra_headers=headers)
+
+    def respond(self, status, payload, extra_headers=None):
         data = json.dumps(payload, separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("content-type", "application/json; charset=utf-8")
@@ -1329,9 +1684,34 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("referrer-policy", "no-referrer")
         self.send_header("x-request-id", getattr(self, "request_id", ""))
         self.send_header("content-security-policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.send_header("content-length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        if getattr(self, "command", "") != "HEAD":
+            self.wfile.write(data)
+        started_at = getattr(self, "request_started_at", None)
+        elapsed_ms = 0
+        if isinstance(started_at, (int, float)):
+            elapsed_ms = int(max(0, min(600_000, (time.monotonic() - started_at) * 1000)))
+        path = getattr(self, "path", "")
+        route = (
+            "provision"
+            if path == "/provision"
+            else "health"
+            if path in ("/health", "/healthz")
+            else "not_found"
+        )
+        action = getattr(self, "action", "")
+        print(json.dumps({
+            "level": "info",
+            "event": "sync_response",
+            "route": route,
+            "action": action if action in SYNC_ACTIONS else "none",
+            "status": int(status),
+            "latency_ms": elapsed_ms,
+            "request_id": getattr(self, "request_id", ""),
+        }), flush=True)
 
 
 def request_id(headers):

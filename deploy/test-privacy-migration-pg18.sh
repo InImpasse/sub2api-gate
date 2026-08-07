@@ -246,7 +246,7 @@ if ! run_file privacy_locked_history migrations/verify_no_conversation_content.s
   exit 1
 fi
 
-# Main fixture mirrors the conversation-capable fields in Sub2API 0.1.162,
+# Main fixture mirrors the conversation-capable fields in Sub2API 0.1.171,
 # while retaining legacy optional capture fields for upgrade compatibility.
 docker exec -i "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 <<'SQL'
 CREATE TABLE request_logs (
@@ -430,7 +430,8 @@ CREATE TABLE batch_image_jobs (
   manifest_hash varchar(128),
   idempotency_key varchar(255),
   last_error_code varchar(128),
-  last_error_message text
+  last_error_message text,
+  session_id varchar(255)
 );
 CREATE TABLE batch_image_items (
   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -476,7 +477,8 @@ CREATE TABLE usage_logs (
   messages jsonb,
   image_size_breakdown jsonb,
   user_agent varchar,
-  ip_address varchar
+  ip_address varchar,
+  session_id varchar(255)
 );
 
 INSERT INTO request_logs (
@@ -576,13 +578,13 @@ INSERT INTO batch_image_jobs (
   status, provider, provider_job_name, task_name,
   provider_input_ref, provider_output_ref, gcs_input_uri, gcs_output_uri,
   request_hash, manifest_hash, idempotency_key,
-  last_error_code, last_error_message
+  last_error_code, last_error_message, session_id
 ) VALUES (
   'completed', 'vertex', 'provider-task-safe-id', 'private task label',
   'private/input/object', 'private/output/object',
   'gs://private/input', 'gs://private/output',
   'private-request-hash', 'private-manifest-hash', 'private-idempotency-key',
-  'STABLE_CODE', 'private batch error'
+  'STABLE_CODE', 'private batch error', 'private-session-reference'
 );
 INSERT INTO batch_image_items (
   custom_id, request_hash, prompt_preview, provider_source_object,
@@ -615,11 +617,11 @@ VALUES
    now());
 INSERT INTO usage_logs (
   input_tokens, prompt_tokens, output_tokens, actual_cost, model, duration_ms,
-  prompt, messages, image_size_breakdown, user_agent, ip_address
+  prompt, messages, image_size_breakdown, user_agent, ip_address, session_id
 ) VALUES (
   9, 9, 4, 0.1, 'model-test', 120, 'prompt', '[{"role":"user"}]',
   '{"private-size-detail":"1024x1024"}', 'conversation in user agent',
-  '192.0.2.20'
+  '192.0.2.20', 'private-usage-session-reference'
 );
 INSERT INTO usage_logs (
   input_tokens, prompt_tokens, output_tokens, actual_cost, model, duration_ms,
@@ -639,10 +641,10 @@ run_file postgres migrations/verify_conversation_guards.sql >/dev/null
 docker exec -i "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 <<'SQL'
 INSERT INTO usage_logs (
   input_tokens, prompt_tokens, output_tokens, actual_cost, model, duration_ms,
-  prompt, messages, image_size_breakdown
+  prompt, messages, image_size_breakdown, session_id
 ) VALUES (
   3, 3, 2, 0.03, 'guard-gap', 80, 'new prompt',
-  '[{"role":"user"}]', '{"private":"size"}'
+  '[{"role":"user"}]', '{"private":"size"}', 'new-usage-session-reference'
 );
 INSERT INTO prompt_audit_events (
   prompt_hash, full_prompt, redacted_preview, categories,
@@ -660,12 +662,13 @@ VALUES ('failed', 95, 'new monitor response detail');
 INSERT INTO batch_image_jobs (
   status, provider, provider_job_name, task_name,
   provider_input_ref, provider_output_ref, gcs_input_uri, gcs_output_uri,
-  request_hash, manifest_hash, last_error_code, last_error_message
+  request_hash, manifest_hash, last_error_code, last_error_message, session_id
 ) VALUES (
   'failed', 'vertex', 'provider-task-new-safe-id', 'new private task label',
   'new private input', 'new private output', 'gs://new/private-input',
   'gs://new/private-output', 'new-private-request-hash',
-  'new-private-manifest-hash', 'STABLE_NEW_CODE', 'new private error'
+  'new-private-manifest-hash', 'STABLE_NEW_CODE', 'new private error',
+  'new-private-session-reference'
 );
 INSERT INTO batch_image_items (
   custom_id, request_hash, prompt_preview, provider_source_object,
@@ -725,7 +728,7 @@ BEGIN
       AND gcs_input_uri IS NULL AND gcs_output_uri IS NULL
       AND request_hash IS NULL AND manifest_hash IS NULL
       AND last_error_code = 'STABLE_NEW_CODE'
-      AND last_error_message IS NULL
+      AND last_error_message IS NULL AND session_id IS NULL
   ) OR NOT EXISTS (
     SELECT 1 FROM batch_image_items
     WHERE id = 2 AND custom_id = 'new-request-item-safe-id'
@@ -872,7 +875,7 @@ BEGIN
   IF EXISTS (
     SELECT 1 FROM usage_logs
     WHERE prompt IS NOT NULL OR messages IS NOT NULL
-      OR image_size_breakdown IS NOT NULL
+      OR image_size_breakdown IS NOT NULL OR session_id IS NOT NULL
   ) THEN
     RAISE EXCEPTION 'usage content history was not scrubbed';
   END IF;
@@ -888,7 +891,7 @@ BEGIN
     SELECT 1 FROM prompt_audit_jobs
     WHERE prompt_hash <> '' OR redacted_preview <> '' OR last_error_message <> ''
   ) THEN
-    RAISE EXCEPTION 'Sub2API 0.1.162 prompt audit content was not scrubbed';
+    RAISE EXCEPTION 'Sub2API 0.1.171 prompt audit content was not scrubbed';
   END IF;
   IF (SELECT last_error_code FROM prompt_audit_jobs WHERE id = 1) <> 'stable_code' THEN
     RAISE EXCEPTION 'stable prompt audit error code was altered';
@@ -944,6 +947,7 @@ BEGIN
       OR provider_output_ref IS NOT NULL OR gcs_input_uri IS NOT NULL
       OR gcs_output_uri IS NOT NULL OR request_hash IS NOT NULL
       OR manifest_hash IS NOT NULL OR last_error_message IS NOT NULL
+      OR session_id IS NOT NULL
   ) OR EXISTS (
     SELECT 1 FROM batch_image_items
     WHERE request_hash IS NOT NULL OR prompt_preview IS NOT NULL
@@ -1367,16 +1371,17 @@ INSERT INTO ops_error_logs (
 );
 INSERT INTO usage_logs (
   input_tokens, prompt_tokens, output_tokens, actual_cost, model, duration_ms,
-  prompt, messages, image_size_breakdown
+  prompt, messages, image_size_breakdown, session_id
 ) VALUES (
   5, 5, 2, 0.05, 'model-trigger', 90, 'new prompt',
-  '[{"role":"user"}]', '{"private":"size"}'
+  '[{"role":"user"}]', '{"private":"size"}', 'trigger-usage-session-reference'
 );
 UPDATE usage_logs
 SET prompt_tokens = 10,
     prompt = 'updated prompt',
     messages = '[{"role":"user","content":"updated prompt"}]',
-    image_size_breakdown = '{"private":"updated size"}'
+    image_size_breakdown = '{"private":"updated size"}',
+    session_id = 'updated-usage-session-reference'
 WHERE model = 'model-test';
 
 DO $$
@@ -1385,13 +1390,13 @@ BEGIN
     SELECT 1 FROM usage_logs
     WHERE model = 'model-test' AND prompt_tokens = 10
       AND prompt IS NULL AND messages IS NULL
-      AND image_size_breakdown IS NULL
+      AND image_size_breakdown IS NULL AND session_id IS NULL
   ) OR NOT EXISTS (
     SELECT 1 FROM usage_logs
     WHERE model = 'model-trigger' AND input_tokens = 5
       AND prompt_tokens = 5 AND output_tokens = 2
       AND prompt IS NULL AND messages IS NULL
-      AND image_size_breakdown IS NULL
+      AND image_size_breakdown IS NULL AND session_id IS NULL
   ) THEN
     RAISE EXCEPTION 'usage content trigger did not clear writes';
   END IF;

@@ -108,7 +108,7 @@ $$;
 
 GRANT USAGE, CREATE ON SCHEMA public TO sub2api_app;
 
--- Sub2API 0.1.162 unconditionally executes one CREATE TABLE IF NOT EXISTS
+-- Sub2API 0.1.171 unconditionally executes one CREATE TABLE IF NOT EXISTS
 -- statement for its already-owner-created schema_migrations table on every
 -- startup. PostgreSQL checks CREATE even when the relation already exists.
 -- Keep that compatibility without giving the runtime a general DDL primitive:

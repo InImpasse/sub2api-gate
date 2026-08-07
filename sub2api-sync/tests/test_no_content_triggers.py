@@ -70,7 +70,7 @@ class NoConversationContentMigrationTests(unittest.TestCase):
             for field in fields:
                 self.assertIn(f"'{field}'", MIGRATION)
 
-    def test_sub2api_0162_functional_content_tables_are_guarded(self):
+    def test_sub2api_batch_content_tables_are_guarded(self):
         expected = {
             "batch_image_jobs": (
                 "task_name",
@@ -81,6 +81,7 @@ class NoConversationContentMigrationTests(unittest.TestCase):
                 "request_hash",
                 "manifest_hash",
                 "last_error_message",
+                "session_id",
             ),
             "batch_image_items": (
                 "request_hash",
@@ -112,6 +113,26 @@ class NoConversationContentMigrationTests(unittest.TestCase):
             "custom_id",
         ):
             self.assertNotIn(f"'{stable_field}', NULL", MIGRATION)
+
+    def test_unbounded_batch_session_references_are_scrubbed(self):
+        batch_policy = MIGRATION.split(
+            "'batch_image_jobs', jsonb_build_object(", 1
+        )[1].split("'batch_image_items', jsonb_build_object(", 1)[0]
+        self.assertIn("'session_id', NULL", batch_policy)
+        reviewed_metadata = MIGRATION.split(
+            "WHEN 'batch_image_jobs' THEN target_column = ANY", 1
+        )[1].split("WHEN 'channel_monitor_histories'", 1)[0]
+        self.assertNotIn("'session_id'", reviewed_metadata)
+
+    def test_unbounded_usage_session_references_are_scrubbed(self):
+        usage_policy = MIGRATION.split(
+            "'usage_logs', jsonb_build_object(", 1
+        )[1].split("'audit_logs', jsonb_build_object(", 1)[0]
+        self.assertIn("'session_id', NULL", usage_policy)
+        reviewed_metadata = MIGRATION.split(
+            "WHEN 'usage_logs' THEN target_column = ANY", 1
+        )[1].split("ELSE false", 1)[0]
+        self.assertNotIn("'session_id'", reviewed_metadata)
 
     def test_active_content_jobs_fail_closed_before_guard_installation(self):
         self.assertIn("public.assert_no_active_conversation_jobs()", MIGRATION)

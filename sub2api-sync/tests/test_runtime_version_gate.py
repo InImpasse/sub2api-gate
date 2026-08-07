@@ -27,7 +27,7 @@ class RuntimeVersionGateTests(unittest.TestCase):
             fake_docker.write_text(
                 "#!/bin/sh\n"
                 "case \"$2:$3\" in\n"
-                "  sub2api:/app/sub2api) echo 'Sub2API 0.1.162 (commit: test)' ;;\n"
+                "  sub2api:/app/sub2api) echo 'Sub2API 0.1.171 (commit: test)' ;;\n"
                 "  sub2api-redis:redis-server) echo 'Redis server v=8.8.0 sha=0' ;;\n"
                 "  sub2api-postgres:postgres) echo 'postgres (PostgreSQL) 18.1' ;;\n"
                 "  *) exit 9 ;;\n"
@@ -69,7 +69,7 @@ class RuntimeVersionGateTests(unittest.TestCase):
                 text=True,
             )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("not 0.1.162", result.stderr)
+        self.assertIn("not 0.1.171", result.stderr)
 
 
 if __name__ == "__main__":

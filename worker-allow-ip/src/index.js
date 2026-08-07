@@ -29,26 +29,49 @@ export default {
         return await handleAdmin(request, env);
       }
 
+      if (url.pathname !== "/allow-ip" && url.pathname !== "/allow-ip/sub2api-login") {
+        return text("Not found", 404);
+      }
+
+      if (url.pathname === "/allow-ip/sub2api-login" && request.method !== "GET") {
+        return text("Method not allowed", 405, { allow: "GET" });
+      }
+      if (url.pathname === "/allow-ip" && request.method !== "GET" && request.method !== "POST") {
+        return text("Method not allowed", 405, { allow: "GET, POST" });
+      }
+      if (request.method === "POST" && !hasSupportedFormContentType(request)) {
+        return html(renderMessage(
+          "Unsupported form format",
+          "Submit this form using URL-encoded or multipart form data.",
+        ), 415);
+      }
+
+      const uuidCookiePresent = hasUuidSessionCookie(request);
       const uuidSession = await getUuidSession(request, env);
+      const clearInvalidUuidCookie = uuidCookiePresent && !uuidSession;
 
       if (request.method === "GET") {
         if (url.pathname === "/allow-ip/sub2api-login") {
           if (!uuidSession) {
-            return redirect("/allow-ip");
+            return redirect("/allow-ip", clearInvalidUuidCookie ? clearUuidCookie() : "");
           }
           return html(await renderSub2ApiAutoLogin(env, uuidSession.invite, url));
         }
 
         const refreshedSession = uuidSession;
         const currentStatus = refreshedSession ? await getCurrentAllowStatus(env, request, refreshedSession.invite) : null;
-        return html(renderForm(env, url, refreshedSession, request, "", currentStatus));
+        return html(
+          renderForm(env, url, refreshedSession, request, "", currentStatus),
+          200,
+          clearInvalidUuidCookie ? { "set-cookie": clearUuidCookie() } : {},
+        );
       }
 
       if (request.method === "POST") {
-        return await handleSubmit(request, env, uuidSession);
+        const response = await handleSubmit(request, env, uuidSession);
+        return clearInvalidUuidCookie ? withClearedUuidCookie(response) : response;
       }
-
-      return text("Method not allowed", 405, { allow: "GET, POST" });
+      return text("Not found", 404);
     } catch (error) {
       if (isRequestBodyTooLarge(error)) {
         return html(renderMessage("Request too large", "Form submissions are limited to 32 KiB."), 413);
@@ -71,8 +94,49 @@ export default {
   },
 };
 
+function hasSupportedFormContentType(request) {
+  const contentType = String(request.headers.get("content-type") || "")
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+  return contentType === "application/x-www-form-urlencoded"
+    || contentType === "multipart/form-data";
+}
+
+function hasUuidSessionCookie(request) {
+  return Boolean(parseCookies(request.headers.get("Cookie") || "")[UUID_COOKIE_NAME]);
+}
+
+function withClearedUuidCookie(response) {
+  if (response.headers.has("set-cookie")) return response;
+  const headers = new Headers(response.headers);
+  headers.set("set-cookie", clearUuidCookie());
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 async function handleSubmit(request, env, uuidSession) {
-  const form = await parseBoundedFormData(request);
+  let form;
+  try {
+    form = await parseBoundedFormData(request);
+  } catch (error) {
+    if (isRequestBodyTooLarge(error)) throw error;
+    return html(renderMessage(
+      "Invalid form submission",
+      "Refresh the page and submit the form again.",
+    ), 400);
+  }
+  const action = String(form.get("action") || "");
+  if (action !== "" && action !== "logout_uuid") {
+    return html(renderMessage(
+      "Unknown form action",
+      "Refresh the page and use one of the available actions.",
+    ), 400);
+  }
+
   requireEnv({
     ACCOUNT_ID: env.ACCOUNT_ID,
     IP_LIST_ID: env.IP_LIST_ID,
@@ -82,7 +146,6 @@ async function handleSubmit(request, env, uuidSession) {
     INVITE_ACCESS_HMAC_KEY: env.INVITE_ACCESS_HMAC_KEY,
   });
 
-  const action = String(form.get("action") || "");
   if (action === "logout_uuid") {
     if (uuidSession && !(await timingSafeEqual(String(form.get("csrf") || ""), uuidSession.csrf))) {
       return html(renderMessage("Invalid request", "Refresh the page and try again."), 403);
@@ -216,20 +279,20 @@ function renderForm(env, url, uuidSession, request, notice = "", currentStatus =
       <h1>Join the allowlist</h1>
       <p class="lede">Verify your key, then authorize the current network. IPv4 authorizes the entire /24 network; IPv6 authorizes one /128 address.</p>
     </section>
-    <form class="panel" method="post" action="${escapeHtml(url.pathname)}">
+    <form id="allow-network-form" class="panel" method="post" action="${escapeHtml(url.pathname)}">
       <label for="invite_key">Access key or legacy UUID</label>
       <div class="secret-field">
         <input id="invite_key" name="invite_key" type="password" autocomplete="one-time-code" required autofocus />
         <button class="ghost toggle-secret" type="button" aria-controls="invite_key" aria-pressed="false">Show</button>
       </div>
-      <div id="turnstile-widget" class="turnstile-widget"></div>
+      ${turnstileControl()}
       <button id="submit-button" type="submit" disabled>Authorize current network</button>
       <p class="hint">UUID sign-in is temporary migration compatibility; use the one-time access key for ongoing access.</p>
     </form>
+    ${turnstileClientScript(nonce)}
     <script nonce="${nonce}">
       const toggle = document.querySelector(".toggle-secret");
       const input = document.getElementById("invite_key");
-      const submitButton = document.getElementById("submit-button");
       ${turnstileInitializer(env.TURNSTILE_SITE_KEY)}
       toggle.addEventListener("click", () => {
         const shouldShow = input.type === "password";
@@ -238,7 +301,6 @@ function renderForm(env, url, uuidSession, request, notice = "", currentStatus =
         toggle.setAttribute("aria-pressed", String(shouldShow));
       });
     </script>
-    ${turnstileClientScript(nonce)}
   `);
 }
 
@@ -256,30 +318,45 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
     <section class="panel dashboard">
       ${notice ? `<p class="success">${notice}</p>` : ""}
       ${statusText}
-      ${shouldShowAddIp ? `<form method="post" action="${escapeHtml(url.pathname)}">
+      ${shouldShowAddIp ? `<form id="allow-network-form" method="post" action="${escapeHtml(url.pathname)}">
         <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
-        <div id="turnstile-widget" class="turnstile-widget"></div>
+        ${turnstileControl()}
         <button id="submit-button" type="submit" disabled>Authorize current network</button>
       </form>` : ""}
       <div class="api-list">
         ${renderSub2ApiLogin(invite)}
         ${configs.length ? configs.map(renderApiConfig).join("") : `<p class="lede">No OpenAI API link has been configured for this UUID.</p>`}
       </div>
+      <p id="copy-status" class="copy-status" role="status" aria-live="polite"></p>
       <form method="post" action="${escapeHtml(url.pathname)}">
         <input type="hidden" name="action" value="logout_uuid" />
         <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
         <button class="ghost-wide" type="submit">Log out</button>
       </form>
     </section>
+    ${shouldShowAddIp ? turnstileClientScript(nonce) : ""}
     <script nonce="${nonce}">
-      const submitButton = document.getElementById("submit-button");
       ${shouldShowAddIp ? turnstileInitializer(env.TURNSTILE_SITE_KEY) : ""}
+      const copyStatus = document.getElementById("copy-status");
       document.querySelectorAll(".copy-value").forEach((button) => {
         button.addEventListener("click", async () => {
-          await navigator.clipboard.writeText(button.dataset.copy);
-          button.textContent = "Copied";
+          const originalLabel = button.textContent;
+          try {
+            await navigator.clipboard.writeText(button.dataset.copy);
+            button.textContent = "Copied";
+            if (copyStatus) {
+              copyStatus.setAttribute("role", "status");
+              copyStatus.textContent = "Copied to clipboard.";
+            }
+          } catch (error) {
+            button.textContent = "Copy failed";
+            if (copyStatus) {
+              copyStatus.setAttribute("role", "alert");
+              copyStatus.textContent = "Copy failed. Select the value and copy it manually.";
+            }
+          }
           window.setTimeout(() => {
-            button.textContent = "Copy";
+            button.textContent = originalLabel;
           }, 1400);
         });
       });
@@ -298,31 +375,167 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
         });
       });
     </script>
-    ${shouldShowAddIp ? turnstileClientScript(nonce) : ""}
   `);
 }
 
+function turnstileControl() {
+  return `<div id="turnstile-control" class="turnstile-control" data-state="loading" aria-busy="true">
+    <div id="turnstile-widget" class="turnstile-widget" aria-label="Human verification"></div>
+    <div class="turnstile-feedback">
+      <p id="turnstile-status" class="turnstile-status" role="status" aria-live="polite">Loading verification...</p>
+      <button id="turnstile-retry" class="ghost turnstile-retry" type="button" hidden>Retry verification</button>
+    </div>
+  </div>`;
+}
+
 function turnstileInitializer(siteKey) {
-  return `window.onTurnstileLoad = () => {
-    if (!submitButton || !window.turnstile) return;
-    window.turnstile.render("#turnstile-widget", {
-      sitekey: ${jsString(siteKey || "")},
-      size: window.innerWidth < 372 ? "compact" : "flexible",
-      callback: () => {
-        submitButton.disabled = false;
-      },
-      "expired-callback": () => {
-        submitButton.disabled = true;
-      },
-      "error-callback": () => {
-        submitButton.disabled = true;
-      },
+  const clientUrl = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+  return `const turnstileControl = document.getElementById("turnstile-control");
+    const turnstileStatus = document.getElementById("turnstile-status");
+    const turnstileRetry = document.getElementById("turnstile-retry");
+    const turnstileForm = document.getElementById("allow-network-form");
+    const turnstileSubmit = document.getElementById("submit-button");
+    const turnstileClientUrl = ${jsString(clientUrl)};
+    const turnstileNonce = document.currentScript?.nonce || "";
+    const turnstileSubmitLabel = turnstileSubmit?.textContent || "Authorize current network";
+    let turnstileWidgetId = null;
+    let turnstileLoadTimer = 0;
+    let turnstileSubmitting = false;
+    let turnstileAttempt = 1;
+    let renderedTurnstileAttempt = 0;
+
+    const clearTurnstileLoadTimer = () => {
+      if (turnstileLoadTimer) window.clearTimeout(turnstileLoadTimer);
+      turnstileLoadTimer = 0;
+    };
+    const clearTurnstileToken = () => {
+      const token = turnstileForm?.querySelector('[name="cf-turnstile-response"]');
+      if (token) token.value = "";
+    };
+    const setTurnstileState = (state, message, options = {}) => {
+      if (!turnstileControl || !turnstileStatus || !turnstileRetry || !turnstileSubmit) return;
+      turnstileControl.dataset.state = state;
+      turnstileControl.setAttribute("aria-busy", String(state === "loading" || state === "submitting"));
+      turnstileStatus.setAttribute("role", options.alert ? "alert" : "status");
+      turnstileStatus.textContent = message;
+      turnstileRetry.hidden = !options.retry;
+      turnstileSubmit.disabled = state !== "verified" || turnstileSubmitting;
+      turnstileSubmit.textContent = state === "submitting" ? "Authorizing..." : turnstileSubmitLabel;
+    };
+    const isCurrentTurnstileAttempt = (attempt) => attempt === turnstileAttempt;
+    const failTurnstile = (message, attempt = turnstileAttempt) => {
+      if (!isCurrentTurnstileAttempt(attempt)) return;
+      clearTurnstileLoadTimer();
+      clearTurnstileToken();
+      setTurnstileState("error", message, { alert: true, retry: true });
+    };
+    const scheduleTurnstileLoadTimeout = (attempt) => {
+      clearTurnstileLoadTimer();
+      turnstileLoadTimer = window.setTimeout(() => {
+        failTurnstile("Verification is taking too long to load.", attempt);
+      }, 8000);
+    };
+    const attachTurnstileScriptHandlers = (script, attempt) => {
+      if (!script) return;
+      script.addEventListener("error", () => {
+        failTurnstile("Verification could not load.", attempt);
+      }, { once: true });
+    };
+    const renderTurnstile = (attempt) => {
+      if (!isCurrentTurnstileAttempt(attempt) || renderedTurnstileAttempt === attempt) return;
+      clearTurnstileLoadTimer();
+      if (!window.turnstile || typeof window.turnstile.render !== "function") {
+        failTurnstile("Verification could not start.", attempt);
+        return;
+      }
+      renderedTurnstileAttempt = attempt;
+      try {
+        setTurnstileState("ready", "Complete the verification challenge.");
+        turnstileWidgetId = window.turnstile.render("#turnstile-widget", {
+          sitekey: ${jsString(siteKey || "")},
+          size: window.innerWidth < 372 ? "compact" : "flexible",
+          callback: () => {
+            if (!isCurrentTurnstileAttempt(attempt)) return;
+            setTurnstileState("verified", "Verification complete.");
+          },
+          "expired-callback": () => {
+            if (!isCurrentTurnstileAttempt(attempt)) return;
+            clearTurnstileToken();
+            setTurnstileState("expired", "Verification expired. Complete it again.", { alert: true, retry: true });
+          },
+          "timeout-callback": () => {
+            if (!isCurrentTurnstileAttempt(attempt)) return;
+            clearTurnstileToken();
+            setTurnstileState("error", "Verification timed out.", { alert: true, retry: true });
+          },
+          "error-callback": () => {
+            if (!isCurrentTurnstileAttempt(attempt)) return;
+            clearTurnstileToken();
+            setTurnstileState("error", "Verification encountered an error.", { alert: true, retry: true });
+          },
+        });
+      } catch (error) {
+        failTurnstile("Verification could not start.", attempt);
+      }
+    };
+    const installTurnstileLoadCallback = (attempt) => {
+      const callbackName = attempt === 1
+        ? "onTurnstileLoad"
+        : "onTurnstileLoadAttempt" + attempt;
+      window[callbackName] = () => renderTurnstile(attempt);
+      return callbackName;
+    };
+
+    installTurnstileLoadCallback(turnstileAttempt);
+    const initialTurnstileScript = document.getElementById("turnstile-client");
+    attachTurnstileScriptHandlers(initialTurnstileScript, turnstileAttempt);
+    turnstileRetry?.addEventListener("click", () => {
+      clearTurnstileToken();
+      if (window.turnstile && turnstileWidgetId !== null && typeof window.turnstile.reset === "function") {
+        setTurnstileState("ready", "Complete the verification challenge.");
+        try {
+          window.turnstile.reset(turnstileWidgetId);
+          return;
+        } catch (error) {
+          turnstileWidgetId = null;
+        }
+      }
+
+      turnstileAttempt += 1;
+      renderedTurnstileAttempt = 0;
+      const retryAttempt = turnstileAttempt;
+      const callbackName = installTurnstileLoadCallback(retryAttempt);
+      setTurnstileState("loading", "Loading verification...");
+      const previousScript = document.getElementById("turnstile-client");
+      const replacementScript = document.createElement("script");
+      replacementScript.id = "turnstile-client";
+      replacementScript.src = turnstileClientUrl + "&onload=" + encodeURIComponent(callbackName);
+      replacementScript.defer = true;
+      if (turnstileNonce) replacementScript.nonce = turnstileNonce;
+      attachTurnstileScriptHandlers(replacementScript, retryAttempt);
+      previousScript?.remove();
+      document.head.appendChild(replacementScript);
+      scheduleTurnstileLoadTimeout(retryAttempt);
     });
-  };`;
+    turnstileForm?.addEventListener("submit", (event) => {
+      if (turnstileControl?.dataset.state !== "verified" || turnstileSubmitting) {
+        event.preventDefault();
+        return;
+      }
+      turnstileSubmitting = true;
+      setTurnstileState("submitting", "Authorization request in progress.");
+    });
+    setTurnstileState("loading", "Loading verification...");
+    scheduleTurnstileLoadTimeout(turnstileAttempt);
+    if (window.turnstile) {
+      const initialAttempt = turnstileAttempt;
+      queueMicrotask(() => renderTurnstile(initialAttempt));
+    }`;
 }
 
 function turnstileClientScript(nonce) {
-  return `<script nonce="${nonce}" src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&amp;onload=onTurnstileLoad" defer></script>`;
+  return `<link rel="preconnect" href="https://challenges.cloudflare.com" crossorigin />
+    <script nonce="${nonce}" id="turnstile-client" src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&amp;onload=onTurnstileLoad" defer></script>`;
 }
 
 function renderCurrentIpStatus(status) {
@@ -445,12 +658,15 @@ function hasSameOrigin(candidate, expected) {
 }
 
 function renderMessage(title, message) {
-  return page(title, `
-    <section class="message">
-      <h1>${escapeHtml(title)}</h1>
+  return page(title, (nonce) => `
+    <section class="message" role="alert" aria-labelledby="message-title">
+      <h1 id="message-title" tabindex="-1">${escapeHtml(title)}</h1>
       <p>${escapeHtml(message)}</p>
       <a href="/allow-ip">Back</a>
     </section>
+    <script nonce="${nonce}">
+      document.getElementById("message-title")?.focus();
+    </script>
   `);
 }
 
@@ -883,7 +1099,35 @@ function page(title, body) {
       border-radius: 8px;
       background: rgba(255, 255, 255, 0.8);
     }
+    [hidden] { display: none !important; }
+    .turnstile-control {
+      min-height: 116px;
+      display: grid;
+      align-content: start;
+      gap: 8px;
+    }
     .turnstile-widget { width: 100%; min-height: 65px; }
+    .turnstile-feedback {
+      min-height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .turnstile-status {
+      color: #6e6e73;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .turnstile-control[data-state="error"] .turnstile-status,
+    .turnstile-control[data-state="expired"] .turnstile-status { color: #9a5b00; }
+    button.turnstile-retry { flex: 0 0 auto; margin: 0; }
+    .copy-status {
+      min-height: 20px;
+      color: #6e6e73;
+      font-size: 13px;
+    }
+    .copy-status[role="alert"] { color: #9a5b00; }
     button:focus-visible, a:focus-visible, input:focus-visible {
       outline: 3px solid rgba(0, 113, 227, 0.32);
       outline-offset: 2px;
@@ -895,10 +1139,34 @@ function page(title, body) {
       }
     }
     @media (max-width: 560px) {
-      body { padding: 24px 16px; }
-      h1 { font-size: 32px; }
+      body {
+        place-items: start center;
+        padding: 12px 10px 24px;
+      }
+      .hero {
+        grid-template-columns: 56px minmax(0, 1fr);
+        align-items: center;
+        gap: 4px 12px;
+        margin-bottom: 16px;
+        text-align: left;
+      }
+      .hero .sub2api-icon {
+        grid-row: 1 / 3;
+        width: 56px;
+        height: 56px;
+        margin: 0;
+        border-radius: 16px;
+      }
+      .hero .lede {
+        grid-column: 1 / -1;
+        margin-top: 6px;
+        font-size: 14px;
+        line-height: 1.42;
+      }
+      form { gap: 12px; }
+      h1 { font-size: 28px; }
       .identity-title { font-size: 24px; line-height: 1.15; }
-      .panel, .message { padding: 20px; border-radius: 8px; }
+      .panel, .message { padding: 16px; border-radius: 8px; }
       .copy-line, .secret-copy-line { grid-template-columns: minmax(0, 1fr); }
       button, a { width: 100%; }
       button.ghost, button.compact { width: auto; }
@@ -907,6 +1175,7 @@ function page(title, body) {
       .copy-secret { height: 40px; }
     }
     @media (max-width: 371px) {
+      .turnstile-control { min-height: 180px; }
       .turnstile-widget { min-height: 120px; }
     }
     @media (max-width: 240px) {
@@ -933,7 +1202,10 @@ function page(title, body) {
           0 4px 12px rgba(0, 0, 0, 0.28),
           0 0 0 1px rgba(255, 255, 255, 0.12);
       }
-      .eyebrow, .lede, .hint, .api-card label { color: #a1a1a6; }
+      .eyebrow, .lede, .hint, .api-card label, .turnstile-status, .copy-status { color: #a1a1a6; }
+      .turnstile-control[data-state="error"] .turnstile-status,
+      .turnstile-control[data-state="expired"] .turnstile-status,
+      .copy-status[role="alert"] { color: #ffb340; }
       .panel, .message {
         border-color: rgba(255, 255, 255, 0.08);
         background: #1c1c1e;

@@ -18,7 +18,8 @@ redis_acl="$test_root/users.acl"
 nonce_redis_acl="$test_root/nonce-users.acl"
 postgres_image="postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15"
 redis_image="redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005"
-sub2api_image="${SUB2API_TEST_IMAGE:-weishaw/sub2api@sha256:469790e0389bf31379978687149280a4e135393ad98a9a401951b6be9b1df444}"
+sub2api_image="${SUB2API_TEST_IMAGE:-weishaw/sub2api@sha256:8469b859dbc0fb299ffa01d4cc8890dfce671b1ae9fa9cb54651bd258a3577d2}"
+sub2api_expected_version="${SUB2API_TEST_EXPECTED_VERSION:-0.1.171}"
 sync_image="sub2api-gate-sub2api-sync-test:$suffix"
 test_password="local-integration-only"
 app_database_password="local-app-database-password-only"
@@ -187,8 +188,8 @@ until docker exec "$bootstrap_name" wget -q -T 3 -O /dev/null http://127.0.0.1:8
 done
 
 if ! docker exec "$bootstrap_name" /app/sub2api --version 2>&1 \
-  | grep -Fq 'Sub2API 0.1.162'; then
-  echo "Sub2API integration requires the reviewed 0.1.162 binary" >&2
+  | grep -Fq "Sub2API $sub2api_expected_version"; then
+  echo "Sub2API integration requires the reviewed $sub2api_expected_version binary" >&2
   exit 1
 fi
 

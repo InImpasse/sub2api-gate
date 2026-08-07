@@ -1,0 +1,20 @@
+{
+  "sync": {
+    "line": 75.1,
+    "branch": 66.4
+  },
+  "worker": {
+    "src/admin.js": {
+      "line": 85.5,
+      "branch": 64.4
+    },
+    "src/auth-state.js": {
+      "line": 28.6,
+      "branch": 64.0
+    },
+    "src/index.js": {
+      "line": 87.2,
+      "branch": 71.9
+    }
+  }
+}

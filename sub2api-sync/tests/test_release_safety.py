@@ -27,9 +27,32 @@ SYNC_DOCKERFILE = (ROOT / "sub2api-sync" / "Dockerfile").read_text()
 SYNC_CANARY_COMPOSE = (ROOT / "docker-compose.sync-canary.yml").read_text()
 SYNC_CANARY_TOOL = (ROOT / "deploy" / "sync-canary.py").read_text()
 DEPLOY_README = (ROOT / "deploy" / "README.md").read_text()
+CANDIDATE_GATE = (ROOT / "deploy" / "check-release-candidate.sh").read_text()
 
 
 class ReleaseSafetyTests(unittest.TestCase):
+    def test_clean_release_candidate_gate_is_separate_from_local_verification(self):
+        self.assertIn("verify-release-policy.py", CANDIDATE_GATE)
+        self.assertIn("require-clean-worktree.sh check", CANDIDATE_GATE)
+        self.assertIn("git diff --check", CANDIDATE_GATE)
+        self.assertIn('git_binary="/usr/bin/git"', CANDIDATE_GATE)
+        self.assertIn('env_binary="/usr/bin/env"', CANDIDATE_GATE)
+        self.assertIn('PATH="$safe_command_path"', CANDIDATE_GATE)
+        self.assertIn("/usr/bin/bash deploy/require-clean-worktree.sh check", CANDIDATE_GATE)
+        self.assertIn('"/usr/bin/python3" -I', CANDIDATE_GATE)
+        self.assertIn("GIT_CONFIG_GLOBAL=/dev/null", CANDIDATE_GATE)
+        self.assertIn("clean release candidate verified", CANDIDATE_GATE)
+        for forbidden in (
+            "--apply",
+            "docker ",
+            "systemctl",
+            "wrangler deploy",
+            "wrangler secret",
+            "git commit",
+        ):
+            self.assertNotIn(forbidden, CANDIDATE_GATE)
+        self.assertIn("check-release-candidate.sh", DEPLOY_README)
+
     def test_stable_compose_isolates_data_services_from_egress(self):
         expected_networks = {
             "sub2api": ["sub2api-data", "sub2api-egress"],
@@ -73,7 +96,7 @@ class ReleaseSafetyTests(unittest.TestCase):
     def test_runtime_images_are_pinned_to_reviewed_release_manifests(self):
         sub2api_image = (
             "weishaw/sub2api@sha256:"
-            "469790e0389bf31379978687149280a4e135393ad98a9a401951b6be9b1df444"
+            "8469b859dbc0fb299ffa01d4cc8890dfce671b1ae9fa9cb54651bd258a3577d2"
         )
         redis_image = (
             "redis@sha256:"
@@ -91,7 +114,7 @@ class ReleaseSafetyTests(unittest.TestCase):
             "sha256:7aec734b2bb298a1d769fd8729f13b8514a41bf90fcdd1f38ec52267fbaa8ee6",
             NO_CONTENT_LOGGING_TEST,
         )
-        self.assertIn("Sub2API 0.1.162", COMPOSE)
+        self.assertIn("Sub2API 0.1.171", COMPOSE)
         self.assertIn("redis-server --version", COMPOSE)
         self.assertIn("v=8.8.0", COMPOSE)
         sync_image = "sub2api-gate/sub2api-sync:pg18.4-r1"

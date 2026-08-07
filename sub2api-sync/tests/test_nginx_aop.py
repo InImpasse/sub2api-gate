@@ -102,6 +102,21 @@ class NginxAopConfigTests(unittest.TestCase):
             config.index("include /etc/nginx/snippets/sub2api-sync-location.conf;"),
         )
 
+    def test_sync_proxy_enforces_deadline_and_json_gateway_contracts(self):
+        sync = SYNC_LOCATION.read_text()
+        self.assertIn("proxy_set_header X-Request-ID $http_x_request_id;", sync)
+        self.assertIn("proxy_connect_timeout 2s;", sync)
+        self.assertIn("proxy_read_timeout 9s;", sync)
+        self.assertIn("proxy_send_timeout 9s;", sync)
+        self.assertIn("proxy_next_upstream off;", sync)
+        self.assertIn("proxy_intercept_errors off;", sync)
+        for status in (429, 502, 504):
+            self.assertIn(f"error_page {status}", sync)
+        self.assertIn('"error":"rate_limited"', sync)
+        self.assertIn('"error":"upstream_unavailable"', sync)
+        self.assertIn('"error":"dependency_timeout"', sync)
+        self.assertGreaterEqual(sync.count("content-security-policy"), 3)
+
     def test_api_vhost_disables_access_logs_and_bounds_slow_clients(self):
         config = NGINX.read_text()
         tls_vhost = config.split("server_name api.example.com;", 2)[2]

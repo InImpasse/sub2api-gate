@@ -29,7 +29,7 @@ TARGET_NAMES = (TARGET_APP, TARGET_POSTGRES, TARGET_REDIS)
 
 SUB2API_IMAGE = (
     "weishaw/sub2api@sha256:"
-    "469790e0389bf31379978687149280a4e135393ad98a9a401951b6be9b1df444"
+    "8469b859dbc0fb299ffa01d4cc8890dfce671b1ae9fa9cb54651bd258a3577d2"
 )
 POSTGRES_IMAGE = (
     "postgres@sha256:"
@@ -690,8 +690,8 @@ def require_binary_versions(*, runner=run_command):
     app = decoded_stdout(
         runner(["docker", "exec", TARGET_APP, "/app/sub2api", "--version"], timeout=10)
     )
-    if not app.startswith("Sub2API 0.1.162"):
-        raise CanaryError("target Sub2API binary is not version 0.1.162")
+    if not app.startswith("Sub2API 0.1.171"):
+        raise CanaryError("target Sub2API binary is not version 0.1.171")
     postgres = decoded_stdout(
         runner(["docker", "exec", TARGET_POSTGRES, "postgres", "--version"], timeout=10)
     )

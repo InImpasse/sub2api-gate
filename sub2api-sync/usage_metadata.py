@@ -8,6 +8,11 @@ PAGE_MAX = 100
 MAX_RANGE_SECONDS = 30 * 24 * 60 * 60
 MODEL_CACHE_SECONDS = 5 * 60
 MAX_SAFE_ID = 9_007_199_254_740_991
+USAGE_SEARCH_EXPRESSION = (
+    "(COALESCE(request_id, '') || ' ' || COALESCE(model, '') || ' ' || "
+    "COALESCE(requested_model, '') || ' ' || "
+    "COALESCE(inbound_endpoint, ''))"
+)
 TEXT_FIELD_LIMITS = {
     "requestId": 128,
     "model": 128,
@@ -107,12 +112,7 @@ def usage_log_filters(payload):
     query = str(payload.get("query") or "").strip()[:120]
     if query:
         escaped = ilike_contains(query, 120)
-        clauses.append(
-            "(COALESCE(request_id, '') ILIKE " + escaped
-            + " OR model ILIKE " + escaped
-            + " OR COALESCE(requested_model, '') ILIKE " + escaped
-            + " OR COALESCE(inbound_endpoint, '') ILIKE " + escaped + ")"
-        )
+        clauses.append(f"{USAGE_SEARCH_EXPRESSION} ILIKE {escaped}")
 
     request_id = str(payload.get("requestId") or "").strip()[:64]
     if request_id:
