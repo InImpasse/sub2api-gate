@@ -1,5 +1,7 @@
 import importlib.util
+import json
 import pathlib
+import shutil
 import tempfile
 import unittest
 
@@ -13,6 +15,36 @@ SPEC.loader.exec_module(POLICY)
 
 
 class ReleasePolicyTests(unittest.TestCase):
+    RELEASE_CONSUMERS = (
+        "deploy/release-policy.json",
+        "deploy/README.md",
+        "deploy/configure-redis-acl.py",
+        "deploy/migrate-app-metadata.py",
+        "deploy/migrate-redis-allowlist.py",
+        "deploy/security-preflight.sh",
+        "deploy/test-app-role-least-privilege-pg18.sh",
+        "deploy/test-redis-runtime-acl.sh",
+        "deploy/test-sub2api-no-content-logging.sh",
+        "deploy/traffic-canary.py",
+        "deploy/verify-runtime-versions.sh",
+        "deploy/redis-key-prefixes.json",
+        "docker-compose.yml",
+        "docker-compose.canary.yml",
+        "docker-compose.sync-canary.yml",
+        "docker-compose.traffic-canary.yml",
+        "migrations/002_remove_conversation_capture.sql",
+        "migrations/005_app_least_privilege.sql",
+        "sub2api-sync/Dockerfile",
+    )
+
+    def _copy_release_fixture(self, directory):
+        directory = pathlib.Path(directory)
+        for relative in self.RELEASE_CONSUMERS:
+            source = ROOT / relative
+            target = directory / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+
     def test_reviewed_policy_matches_all_active_consumers(self):
         policy = POLICY.read_policy()
         self.assertTrue(POLICY.verify(policy))
@@ -64,6 +96,41 @@ class ReleasePolicyTests(unittest.TestCase):
     def test_local_gate_invokes_policy_before_runtime_tests(self):
         gate = (ROOT / "deploy" / "verify-local.sh").read_text(encoding="utf-8")
         self.assertIn("python3 -I deploy/verify-release-policy.py", gate)
+        self.assertIn(
+            "npm --prefix worker-allow-ip audit --audit-level=high "
+            "--package-lock-only --ignore-scripts",
+            gate,
+        )
+
+    def test_verifier_reads_every_release_consumer_from_the_supplied_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = pathlib.Path(directory)
+            self._copy_release_fixture(fixture)
+            self.assertTrue(POLICY.verify(root=fixture))
+
+            (fixture / "docker-compose.canary.yml").unlink()
+            with self.assertRaisesRegex(
+                POLICY.ReleasePolicyError,
+                "release consumer is unavailable",
+            ):
+                POLICY.verify(root=fixture)
+
+    def test_verifier_reads_the_release_policy_from_the_supplied_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = pathlib.Path(directory)
+            self._copy_release_fixture(fixture)
+            policy_path = fixture / "deploy" / "release-policy.json"
+            policy = json.loads(policy_path.read_text(encoding="ascii"))
+            policy["schema"] = 2
+            policy_path.write_text(
+                json.dumps(policy, separators=(",", ":")),
+                encoding="ascii",
+            )
+            with self.assertRaisesRegex(
+                POLICY.ReleasePolicyError,
+                "schema is unsupported",
+            ):
+                POLICY.verify(root=fixture)
 
 
 if __name__ == "__main__":

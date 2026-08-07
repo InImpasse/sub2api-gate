@@ -135,6 +135,18 @@ docker run --rm --pull never --network none --read-only \
 python3 -m unittest discover -s sub2api-sync/tests -v
 ```
 
+### 本地验证门禁
+
+完整门禁不使用生产凭据或 Worker 私有配置，会统一执行高危依赖审计、Worker
+和 sync 覆盖率递增门槛、发布工具覆盖率、隔离的 PostgreSQL/Redis 真实依赖测试、
+浏览器 UI 合同测试、发布策略一致性和空白检查。隔离依赖测试需要 Docker；GitHub
+Actions 对 Pull Request 和 push 执行同一入口。
+
+```bash
+(cd worker-allow-ip && npm ci && npx playwright install chromium)
+bash deploy/verify-local.sh
+```
+
 ### 4. 部署 Cloudflare Worker
 
 ```bash

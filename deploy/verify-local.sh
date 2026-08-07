@@ -5,6 +5,7 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
 
 python3 -I deploy/verify-release-policy.py
+npm --prefix worker-allow-ip audit --audit-level=high --package-lock-only --ignore-scripts
 bash deploy/check-core-coverage.sh
 bash deploy/check-release-tool-coverage.sh
 bash deploy/run-sync-dependency-integration.sh

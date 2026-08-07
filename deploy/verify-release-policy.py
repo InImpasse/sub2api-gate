@@ -11,15 +11,17 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 POLICY_PATH = ROOT / "deploy" / "release-policy.json"
-COMPOSE_FILES = (
-    ROOT / "docker-compose.yml",
-    ROOT / "docker-compose.canary.yml",
-    ROOT / "docker-compose.traffic-canary.yml",
+COMPOSE_RELATIVE = (
+    pathlib.Path("docker-compose.yml"),
+    pathlib.Path("docker-compose.canary.yml"),
+    pathlib.Path("docker-compose.traffic-canary.yml"),
 )
-SYNC_COMPOSE_FILES = (
-    ROOT / "docker-compose.yml",
-    ROOT / "docker-compose.sync-canary.yml",
+SYNC_COMPOSE_RELATIVE = (
+    pathlib.Path("docker-compose.yml"),
+    pathlib.Path("docker-compose.sync-canary.yml"),
 )
+COMPOSE_FILES = tuple(ROOT / relative for relative in COMPOSE_RELATIVE)
+SYNC_COMPOSE_FILES = tuple(ROOT / relative for relative in SYNC_COMPOSE_RELATIVE)
 SUB2API_IMAGE_RE = re.compile(r"weishaw/sub2api@sha256:[0-9a-f]{64}")
 POSTGRES_IMAGE_RE = re.compile(r"postgres@sha256:[0-9a-f]{64}")
 REDIS_IMAGE_RE = re.compile(r"redis@sha256:[0-9a-f]{64}")
@@ -30,9 +32,14 @@ class ReleasePolicyError(ValueError):
     """Raised when a release policy or its consumers are inconsistent."""
 
 
-def read_policy(path=POLICY_PATH):
+def read_policy(path=None, *, root=ROOT):
+    policy_path = (
+        pathlib.Path(root) / "deploy" / "release-policy.json"
+        if path is None
+        else pathlib.Path(path)
+    )
     try:
-        policy = json.loads(path.read_text(encoding="ascii"))
+        policy = json.loads(policy_path.read_text(encoding="ascii"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ReleasePolicyError("release policy is unavailable or invalid") from error
     validate_policy_shape(policy)
@@ -93,15 +100,30 @@ def _read(path):
 
 def _require(text, marker, path):
     if marker not in text:
-        raise ReleasePolicyError(f"{path.relative_to(ROOT)} is missing reviewed marker")
+        raise ReleasePolicyError(f"{_path_label(path)} is missing reviewed marker")
 
 
 def _require_no(text, marker, path):
     if marker in text:
-        raise ReleasePolicyError(f"{path.relative_to(ROOT)} contains stale release marker")
+        raise ReleasePolicyError(f"{_path_label(path)} contains stale release marker")
 
 
-def _check_runtime_compose(path, policy, *, require_runtime_images=None):
+def _path_label(path):
+    path = pathlib.Path(path)
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _check_runtime_compose(
+    path,
+    policy,
+    *,
+    require_runtime_images=None,
+    is_runtime_compose=False,
+    is_primary_compose=False,
+):
     text = _read(path)
     sub2api_images = sorted(set(SUB2API_IMAGE_RE.findall(text)))
     postgres_images = sorted(set(POSTGRES_IMAGE_RE.findall(text)))
@@ -109,16 +131,24 @@ def _check_runtime_compose(path, policy, *, require_runtime_images=None):
     expected_sub2api = policy["sub2api"]["image"]
     expected_postgres = policy["postgres"]["image"]
     expected_redis = policy["redis"]["image"]
-    required = path in COMPOSE_FILES if require_runtime_images is None else require_runtime_images
+    if is_runtime_compose is False and path in COMPOSE_FILES:
+        is_runtime_compose = True
+    if is_primary_compose is False and path == ROOT / "docker-compose.yml":
+        is_primary_compose = True
+    required = (
+        is_runtime_compose
+        if require_runtime_images is None
+        else require_runtime_images
+    )
     if required and sub2api_images != [expected_sub2api]:
         raise ReleasePolicyError(f"{path.name} has an unreviewed Sub2API image")
     if required and postgres_images != [expected_postgres]:
         raise ReleasePolicyError(f"{path.name} has an unreviewed PostgreSQL image")
     if required and redis_images != [expected_redis]:
         raise ReleasePolicyError(f"{path.name} has an unreviewed Redis image")
-    if path in COMPOSE_FILES:
+    if is_runtime_compose:
         _require(text, f"Sub2API {policy['sub2api']['version']}", path)
-    if path == ROOT / "docker-compose.yml":
+    if is_primary_compose:
         _require(text, f"image: {policy['sync']['image']}", path)
 
 
@@ -134,15 +164,23 @@ def _check_sync_consumer(path, policy):
 
 
 def verify(policy=None, *, root=ROOT):
-    policy = read_policy() if policy is None else policy
+    root = pathlib.Path(root).resolve()
+    policy = read_policy(root=root) if policy is None else policy
     validate_policy_shape(policy)
     sub2api = policy["sub2api"]
     redis = policy["redis"]
     sync = policy["sync"]
 
-    for path in COMPOSE_FILES:
-        _check_runtime_compose(path, policy)
-    for path in SYNC_COMPOSE_FILES:
+    compose_files = tuple(root / relative for relative in COMPOSE_RELATIVE)
+    sync_compose_files = tuple(root / relative for relative in SYNC_COMPOSE_RELATIVE)
+    for path in compose_files:
+        _check_runtime_compose(
+            path,
+            policy,
+            is_runtime_compose=True,
+            is_primary_compose=path == root / "docker-compose.yml",
+        )
+    for path in sync_compose_files:
         text = _read(path)
         _require(text, sync["image"], path)
     _check_sync_consumer(root / "sub2api-sync" / "Dockerfile", policy)

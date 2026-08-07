@@ -157,17 +157,22 @@
   `deploy/verify-release-policy.py` gate were added and wired into
   `deploy/verify-local.sh`. They cross-check the Sub2API 0.1.171 image/version,
   source revision, PostgreSQL/Redis/sync identities, Compose/canary/runtime
-  gates, migration policy, and deployment runbook; the gate has five regression
+  gates, migration policy, and deployment runbook; the gate has seven regression
   tests and passed in the unified run. The complete local gate passed 208 Worker
-  tests, 805 Python tests with four expected skips, 53 release-tool tests, two
+  tests, 808 Python tests with four expected skips, 53 release-tool tests, two
   real dependency tests, and 24 browser tests. All available check-only
   production controllers passed except the intentional clean-worktree guard;
   the tree remains dirty and no production write has occurred.
+- The release-policy verifier now resolves the policy and every consumer from
+  its supplied release root, so isolated release-tree checks cannot silently
+  validate the current checkout instead. `deploy/verify-local.sh` also enforces
+  `npm audit --audit-level=high --package-lock-only --ignore-scripts`; the
+  full local gate passed with zero high-severity dependency vulnerabilities.
 - The read-only `deploy/check-release-candidate.sh` gate now composes release
   policy, clean-worktree, diff, private-file, and canonical-HEAD checks. It is
   required by CI after `verify-local.sh`; a clean temporary Git fixture passed
   it, while the current dirty checkout correctly fails. The latest unified gate
-  passed 806 Python tests with four expected skips; its Git/Python/batch shell
+  passed 808 Python tests with four expected skips; its Git/Python/batch shell
   commands now use fixed system paths and an empty Git configuration. A clean
   fixture also passed with `PATH=/nonexistent`; no production write occurred
   before this release candidate commit.

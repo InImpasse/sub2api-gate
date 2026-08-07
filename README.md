@@ -142,10 +142,10 @@ python3 -m unittest discover -s sub2api-sync/tests -v
 ### Local verification gate
 
 The complete local verification gate uses no production credentials or private
-Worker configuration. It runs Worker and sync coverage ratchets, guarded
-release-tool coverage, isolated PostgreSQL/Redis dependency tests, browser UI
-contracts, release-policy consistency, and whitespace validation. Docker is
-required for the isolated dependency tests.
+Worker configuration. It runs the high-severity dependency audit, Worker and
+sync coverage ratchets, guarded release-tool coverage, isolated PostgreSQL/Redis
+dependency tests, browser UI contracts, release-policy consistency, and
+whitespace validation. Docker is required for the isolated dependency tests.
 
 ```bash
 (cd worker-allow-ip && npm ci && npx playwright install chromium)
