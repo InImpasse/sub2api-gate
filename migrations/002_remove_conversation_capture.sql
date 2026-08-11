@@ -271,6 +271,7 @@ AS $function$
             'request_id', 'model', 'image_size', 'reasoning_effort',
             'service_tier', 'inbound_endpoint', 'upstream_endpoint',
             'upstream_model', 'requested_model', 'model_mapping_chain',
+            'upstream_response_model',
             'billing_tier', 'billing_mode', 'image_input_size',
             'image_output_size', 'image_size_source', 'video_resolution'
         ])
