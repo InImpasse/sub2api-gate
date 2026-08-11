@@ -42,6 +42,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -m 0700 "$app_data"
+chown 1000:1000 "$app_data"
 mkdir -m 0777 "$bootstrap_data"
 mkdir -m 0777 "$nonce_redis_data"
 ACL_TOOL="$repo_dir/deploy/configure-redis-acl.py" \
