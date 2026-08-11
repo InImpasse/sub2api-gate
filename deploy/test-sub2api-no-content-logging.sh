@@ -290,7 +290,7 @@ docker exec -i "$postgres_name" psql -U sub2api -d sub2api -v ON_ERROR_STOP=1 \
   < "$repo_dir/migrations/005_app_least_privilege.sql"
 
 printf '%s\n' 'installed_by=sub2api-gate-integration' > "$app_data/.installed"
-chmod 0400 "$app_data/.installed"
+chmod 0444 "$app_data/.installed"
 
 docker run --detach --log-driver "$app_log_driver" \
   --name "$sub2api_name" --network "$network_name" \
