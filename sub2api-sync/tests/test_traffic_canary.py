@@ -96,7 +96,7 @@ class TrafficCanaryComposeTests(unittest.TestCase):
     def test_sub2api_uses_sanitized_target_and_least_privilege_runtime(self):
         app = self.service("sub2api-traffic-canary")
         self.assertIn(
-            "weishaw/sub2api@sha256:8469b859dbc0fb299ffa01d4cc8890dfce671b1ae9fa9cb54651bd258a3577d2",
+            "weishaw/sub2api@sha256:0ffc0202507c3510a696feab92e99faac28e72624ece8f40484b157ba68547b0",
             app,
         )
         self.assertIn("pull_policy: never", app)

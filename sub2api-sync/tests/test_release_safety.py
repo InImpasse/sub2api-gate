@@ -96,7 +96,7 @@ class ReleaseSafetyTests(unittest.TestCase):
     def test_runtime_images_are_pinned_to_reviewed_release_manifests(self):
         sub2api_image = (
             "weishaw/sub2api@sha256:"
-            "8469b859dbc0fb299ffa01d4cc8890dfce671b1ae9fa9cb54651bd258a3577d2"
+            "0ffc0202507c3510a696feab92e99faac28e72624ece8f40484b157ba68547b0"
         )
         redis_image = (
             "redis@sha256:"

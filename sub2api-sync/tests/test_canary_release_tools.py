@@ -440,7 +440,7 @@ class CanaryComposeTests(unittest.TestCase):
             "\nnetworks:\n", 1
         )[0]
         self.assertIn(
-            "weishaw/sub2api@sha256:8469b859dbc0fb299ffa01d4cc8890dfce671b1ae9fa9cb54651bd258a3577d2",
+            "weishaw/sub2api@sha256:0ffc0202507c3510a696feab92e99faac28e72624ece8f40484b157ba68547b0",
             service,
         )
         self.assertIn('"127.0.0.1:18081:8080"', service)

@@ -18,7 +18,7 @@ require_compose_text() {
   fi
 }
 
-require_compose_text "weishaw/sub2api@sha256:8469b859dbc0fb299ffa01d4cc8890dfce671b1ae9fa9cb54651bd258a3577d2"
+require_compose_text "weishaw/sub2api@sha256:0ffc0202507c3510a696feab92e99faac28e72624ece8f40484b157ba68547b0"
 require_compose_text "redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005"
 require_compose_text "Sub2API 0.1.171"
 require_compose_text "v=8.8.0"

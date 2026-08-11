@@ -365,7 +365,7 @@ if [[ "${values[SECURITY_URL_ALLOWLIST_UPSTREAM_HOSTS]-}" == *"your-resource"* ]
   failed=1
 fi
 
-if ! grep -Fq 'weishaw/sub2api@sha256:8469b859dbc0fb299ffa01d4cc8890dfce671b1ae9fa9cb54651bd258a3577d2' "$repo_dir/docker-compose.yml" \
+if ! grep -Fq 'weishaw/sub2api@sha256:0ffc0202507c3510a696feab92e99faac28e72624ece8f40484b157ba68547b0' "$repo_dir/docker-compose.yml" \
   || ! grep -Eq 'postgres@sha256:[0-9a-f]{64}' "$repo_dir/docker-compose.yml" \
   || ! grep -Fq 'redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005' "$repo_dir/docker-compose.yml"; then
   echo "Compose images must use the reviewed Sub2API 0.1.171, PostgreSQL 18, and Redis 8.8.0 digests" >&2
