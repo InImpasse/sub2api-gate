@@ -29,11 +29,13 @@ $$;
 DROP TABLE IF EXISTS public.request_logs;
 
 DO $$
+DECLARE
+    audit_relation regclass := to_regclass('public.audit_logs');
 BEGIN
-    IF to_regclass('public.audit_logs') IS NOT NULL
+    IF audit_relation IS NOT NULL
        AND EXISTS (
             SELECT 1 FROM pg_attribute
-            WHERE attrelid = 'public.audit_logs'::regclass
+            WHERE attrelid = audit_relation
               AND attname = 'extra'
               AND attnum > 0
               AND NOT attisdropped
