@@ -403,7 +403,10 @@ def open_state_directory(*, create=False):
 
     if created:
         try:
-            os.chmod(STATE_DIRECTORY, 0o700, follow_symlinks=False)
+            # The directory was just created and lstat-verified above.  Unlike
+            # chown, chmod's follow_symlinks argument is unavailable on some
+            # supported Linux/Python combinations.
+            os.chmod(STATE_DIRECTORY, 0o700)
             os.chown(
                 STATE_DIRECTORY,
                 STATE_UID,
