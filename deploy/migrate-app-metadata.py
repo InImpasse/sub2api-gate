@@ -390,20 +390,24 @@ def migrate_app_metadata(deadline):
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     mode = args[0] if args else "check"
-    if len(args) > 1 or mode not in {"check", "--apply"}:
-        print(f"usage: {pathlib.Path(sys.argv[0]).name} [check|--apply]", file=sys.stderr)
+    if len(args) > 1 or mode not in {"check", "--apply", "--target-only-apply"}:
+        print(
+            f"usage: {pathlib.Path(sys.argv[0]).name} "
+            "[check|--apply|--target-only-apply]",
+            file=sys.stderr,
+        )
         return 2
     print("target app data starts empty")
     print("a credential-free read-only .installed marker is always created")
     print("only an optional validated model_pricing.json can also be copied")
     print("config.yaml, logs, preview, and capture data are explicitly excluded")
-    if mode != "--apply":
+    if mode == "check":
         print("check only; no connection was opened and no file was written")
         return 0
 
     repo_dir = pathlib.Path(__file__).resolve().parents[1]
     subprocess.run([repo_dir / "deploy" / "require-clean-worktree.sh", "check"], check=True)
-    if os.environ.get("SUB2API_MIGRATION_WRITES_STOPPED") != "YES":
+    if mode == "--apply" and os.environ.get("SUB2API_MIGRATION_WRITES_STOPPED") != "YES":
         raise MigrationError(
             "set SUB2API_MIGRATION_WRITES_STOPPED=YES only after all source writers are stopped"
         )
