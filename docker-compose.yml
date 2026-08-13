@@ -21,11 +21,14 @@ services:
   # Sub2API Application
   # ===========================================================================
   sub2api:
-    image: weishaw/sub2api@sha256:0ffc0202507c3510a696feab92e99faac28e72624ece8f40484b157ba68547b0
+    # Reviewed recreate baseline: Sub2API 0.1.176
+    image: weishaw/sub2api@sha256:905baf250580334dacd902471f61da7b8b1e5da57e3c8c1769489952d51771a1
     container_name: sub2api
     restart: unless-stopped
     user: "1000:1000"
-    read_only: true
+    # Writable root lets admin online updates replace /app/sub2api. Additive
+    # goose migrations are allowed; privacy-table/trigger/function DDL stays
+    # blocked. Recreate/re-pull still returns to the reviewed digest.
     init: true
     # This upstream version has error paths that can print response bodies even
     # when body logging is disabled. Discard stdout/stderr at the Docker layer.
@@ -56,9 +59,9 @@ services:
       # Auto Setup (REQUIRED for Docker deployment)
       # =======================================================================
       - AUTO_SETUP=false
-      # Sub2API 0.1.171 probes DATA_DIR for writability and its pricing service
+      # Sub2API 0.1.176 probes DATA_DIR for writability and its pricing service
       # atomically refreshes reviewed model metadata here. The bind itself is
-      # owner-only; the container root filesystem remains read-only.
+      # owner-only.
       - DATA_DIR=/app/data
       - PRICING_DATA_DIR=/app/data
 
@@ -163,9 +166,10 @@ services:
       # =======================================================================
       # Update Configuration (在线更新配置)
       # =======================================================================
-      # Proxy for accessing GitHub (online updates + pricing data)
+      # Proxy for accessing GitHub (online updates + pricing data).
       # Examples: http://host:port, socks5://host:port
       - UPDATE_PROXY_URL=${UPDATE_PROXY_URL:-}
+      - UPDATE_GITHUB_TOKEN=${UPDATE_GITHUB_TOKEN:-}
 
       # =======================================================================
       # Image Generation Stream & Concurrency
@@ -190,11 +194,9 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test:
-        - CMD-SHELL
-        - >-
-          /app/sub2api --version 2>&1 | grep -F 'Sub2API 0.1.171' >/dev/null &&
-          wget -q -T 5 -O /dev/null http://localhost:8080/health
+      # Do not pin --version: later admin online updates change the binary while
+      # the reviewed Sub2API 0.1.176 digest remains the recreate baseline.
+      test: ["CMD", "wget", "-q", "-T", "5", "-O", "/dev/null", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3

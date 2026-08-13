@@ -51,6 +51,10 @@ CREATE TABLE usage_logs (
   output_tokens bigint NOT NULL DEFAULT 0,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE groups (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL
+);
 CREATE TABLE audit_logs (
   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   action text NOT NULL,
@@ -176,10 +180,15 @@ END
 $$;
 SQL
 
-# The only runtime DDL accepted is the exact fixed statement emitted by
-# Sub2API 0.1.171 for an already-existing owner-created relation.
+# Startup compatibility plus additive Sub2API 0.1.176 goose migrations.
 docker exec -i "$container_name" psql -U sub2api_app -d app_role_test -v ON_ERROR_STOP=1 \
   -c $'CREATE TABLE IF NOT EXISTS schema_migrations (\n\tfilename   TEXT PRIMARY KEY,\n\tchecksum   TEXT NOT NULL,\n\tapplied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n);' \
+  >/dev/null
+docker exec -i "$container_name" psql -U sub2api_app -d app_role_test -v ON_ERROR_STOP=1 \
+  -c 'CREATE TABLE IF NOT EXISTS group_model_pricing_probe(id bigint);' \
+  >/dev/null
+docker exec -i "$container_name" psql -U sub2api_app -d app_role_test -v ON_ERROR_STOP=1 \
+  -c 'ALTER TABLE groups ADD COLUMN IF NOT EXISTS long_context_pricing_enabled BOOLEAN NOT NULL DEFAULT TRUE;' \
   >/dev/null
 
 if docker exec -i "$container_name" psql -U postgres -d app_role_test -v ON_ERROR_STOP=1 \
@@ -189,11 +198,11 @@ if docker exec -i "$container_name" psql -U postgres -d app_role_test -v ON_ERRO
   exit 1
 fi
 for forbidden_sql in \
-  'CREATE TABLE bypass_content(value text);' \
-  'create table if not exists schema_migrations (filename text primary key, checksum text not null, applied_at timestamptz not null default now());' \
-  'CREATE TABLE IF NOT EXISTS schema_migrations ( filename TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW() ); /* variant */' \
+  'CREATE TABLE audit_logs (value text);' \
+  'CREATE TABLE IF NOT EXISTS audit_logs (value text);' \
   'CREATE FUNCTION bypass_content() RETURNS text LANGUAGE sql AS $$ SELECT current_user $$;' \
   'ALTER TABLE audit_logs DISABLE TRIGGER strip_conversation_content;' \
+  'ALTER TABLE audit_logs ADD COLUMN extra text;' \
   'DROP TRIGGER strip_conversation_content ON audit_logs;' \
   'DROP TABLE audit_logs;'; do
   if docker exec -i "$container_name" psql -U sub2api_app -d app_role_test \
@@ -209,7 +218,7 @@ SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
 BEGIN
-  EXECUTE 'CREATE TABLE public.security_definer_bypass(value text)';
+  EXECUTE 'ALTER TABLE public.audit_logs DISABLE TRIGGER strip_conversation_content';
 END
 $$;
 GRANT EXECUTE ON FUNCTION owner_ddl_bridge() TO sub2api_app;

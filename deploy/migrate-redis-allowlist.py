@@ -259,9 +259,9 @@ def load_prefix_policy(path):
         raise MigrationError("Redis prefix policy schema is invalid")
     if (
         policy.get("version") != 2
-        or policy.get("reviewed_sub2api_version") != "0.1.171"
+        or policy.get("reviewed_sub2api_version") != "0.1.176"
         or policy.get("reviewed_source_revision")
-        != "f0e7a9c7a23a7d02fb159b62fa809621eb0475a6"
+        != "e803e3851c0a7e222cfadeafad7b8636ab959d11"
         or set(policy.get("categories", {})) != EXPECTED_CATEGORIES
     ):
         raise MigrationError("Redis prefix policy categories are invalid")

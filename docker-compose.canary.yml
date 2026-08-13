@@ -139,7 +139,7 @@ services:
 
   sub2api-canary:
     profiles: ["preflight-canary"]
-    image: weishaw/sub2api@sha256:0ffc0202507c3510a696feab92e99faac28e72624ece8f40484b157ba68547b0
+    image: weishaw/sub2api@sha256:905baf250580334dacd902471f61da7b8b1e5da57e3c8c1769489952d51771a1
     restart: "no"
     user: "1000:1000"
     init: true
@@ -206,7 +206,7 @@ services:
       test:
         - CMD-SHELL
         - >-
-          /app/sub2api --version 2>&1 | grep -F 'Sub2API 0.1.171' >/dev/null &&
+          /app/sub2api --version 2>&1 | grep -F 'Sub2API 0.1.176' >/dev/null &&
           wget -q -T 5 -O /dev/null http://127.0.0.1:8080/health
       interval: 10s
       timeout: 5s

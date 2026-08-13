@@ -23,8 +23,8 @@ ACL_MODE = 0o400
 APPLICATION_ACL_FILENAME = "users.acl"
 NONCE_ACL_FILENAME = "nonce-users.acl"
 
-# Audited against Sub2API v0.1.171, source revision
-# f0e7a9c7a23a7d02fb159b62fa809621eb0475a6. Request-derived routing hashes and
+# Audited against Sub2API v0.1.176, source revision
+# e803e3851c0a7e222cfadeafad7b8636ab959d11. Request-derived routing hashes and
 # wait counters are allowed only because the application Redis is tmpfs-backed
 # with RDB/AOF disabled. Prompt payloads, moderation data, image jobs, and every
 # unknown namespace remain omitted.

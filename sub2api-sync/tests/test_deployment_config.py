@@ -525,6 +525,9 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("GRANT USAGE, CREATE ON SCHEMA public", sql)
         self.assertIn("sub2api_gate_guard_app_ddl", sql)
         self.assertIn("IF session_user <> 'sub2api_app' THEN", sql)
+        self.assertIn("ALTER TABLE ADD COLUMN", sql)
+        self.assertIn("disable trigger", sql)
+        self.assertIn("OWNER TO sub2api_app", sql)
         self.assertNotIn(
             "session_user <> 'sub2api_app' AND current_user <> 'sub2api_app'",
             sql,
@@ -1110,7 +1113,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertTrue(SUB2API_LOG_TEST.exists())
         script = SUB2API_LOG_TEST.read_text()
         self.assertIn(
-            'sub2api_expected_version="${SUB2API_TEST_EXPECTED_VERSION:-0.1.171}"',
+            'sub2api_expected_version="${SUB2API_TEST_EXPECTED_VERSION:-0.1.176}"',
             script,
         )
         self.assertIn('"Sub2API $sub2api_expected_version"', script)

@@ -246,7 +246,7 @@ if ! run_file privacy_locked_history migrations/verify_no_conversation_content.s
   exit 1
 fi
 
-# Main fixture mirrors the conversation-capable fields in Sub2API 0.1.171,
+# Main fixture mirrors the conversation-capable fields in Sub2API 0.1.173,
 # while retaining legacy optional capture fields for upgrade compatibility.
 docker exec -i "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 <<'SQL'
 CREATE TABLE request_logs (
@@ -891,7 +891,7 @@ BEGIN
     SELECT 1 FROM prompt_audit_jobs
     WHERE prompt_hash <> '' OR redacted_preview <> '' OR last_error_message <> ''
   ) THEN
-    RAISE EXCEPTION 'Sub2API 0.1.171 prompt audit content was not scrubbed';
+    RAISE EXCEPTION 'Sub2API 0.1.173 prompt audit content was not scrubbed';
   END IF;
   IF (SELECT last_error_code FROM prompt_audit_jobs WHERE id = 1) <> 'stable_code' THEN
     RAISE EXCEPTION 'stable prompt audit error code was altered';

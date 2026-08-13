@@ -151,7 +151,7 @@ for key_value in \
   fi
 done
 
-# Reproduce the exact runtime operation shapes used by Sub2API 0.1.171. The
+# Reproduce the exact runtime operation shapes used by Sub2API 0.1.176. The
 # wait counter uses Lua GET/INCR/EXPIRE; sticky routing uses numeric account IDs;
 # and the cyber block table stores only a one-marker behind a SHA-256 key.
 wait_result="$(app_redis eval \

@@ -172,7 +172,7 @@ database and committed only after privacy, row-count, relationship, and usage
 metadata checks pass. Before either a safe schema fingerprint or a logical
 migration, the PostgreSQL portability gate rejects every FDW, foreign server,
 user mapping, foreign table, and extension other than the exact `plpgsql`,
-`pgcrypto`, and PostgreSQL 18 trusted `pg_trgm` allowlist. Sub2API 0.1.171 uses
+`pgcrypto`, and PostgreSQL 18 trusted `pg_trgm` allowlist. Sub2API 0.1.176 uses
 `pg_trgm` only for local fuzzy-search indexes; it has no remote connection or
 credential boundary. This prevents `pg_dump` from serializing foreign
 connection options or credentials into the target cluster. The safe export
@@ -189,7 +189,7 @@ an incomplete, extra, linked, non-root-owned, or modified file is rejected.
 The current Redis migration copies only unexpired HMAC
 sync nonce markers into the dedicated Redis 8.8.0 nonce store; Sub2API session,
 OAuth, scheduler, billing, and concurrency cache is deliberately rebuilt rather
-than copied because reviewed 0.1.171 values can contain credentials or
+than copied because reviewed 0.1.176 values can contain credentials or
 request-derived identifiers. The application
 directory starts empty; only a strictly validated model pricing document may
 be projected into it. No tool copies an old PostgreSQL data directory, WAL,
@@ -211,7 +211,7 @@ cache is imported, copied, or expected to survive a container restart.
 Source-audited `wait:account:*`
 counters, `sticky_session:*` routing hashes, and `cyber_session_block:*`
 SHA-256 references are available only in that volatile instance so Sub2API
-0.1.171 can operate normally. Their values are respectively an expiring integer,
+0.1.176 can operate normally. Their values are respectively an expiring integer,
 a numeric account ID, and the marker `1`; all are discarded during migration.
 Raw prompts, requests, responses, moderation data, and image payload keyspaces
 remain denied by ACL. The integration gate verifies the required runtime
@@ -608,13 +608,25 @@ Compose and environment, starts the legacy services again, verifies health,
 removes the generated ACL, and preserves root-only recovery state only if a
 rollback itself cannot be proven complete.
 
+## Sub2API upgrades and admin online updates
+
+The reviewed recreate baseline is Sub2API 0.1.176. Stable Compose gives the
+`sub2api` service a writable root so the admin UI can replace `/app/sub2api`.
+After restart, additive goose migrations (`CREATE TABLE`/`INDEX`, `ALTER TABLE
+ADD COLUMN`, `COMMENT`) are allowed for `sub2api_app` on non-privacy tables.
+
+The event trigger still blocks trigger disable/drop, function creation, and
+DDL against conversation-bearing tables. Recreate or re-pull still returns to
+the reviewed digest until `deploy/release-policy.json` and Compose change
+together.
+
 ## Migrated-target traffic canary
 
 `docker-compose.canary.yml` is still only the empty-data preflight on `18081`.
 It cannot be promoted or passed to the Nginx switcher. The independent
 `docker-compose.traffic-canary.yml` is the only stack allowed to bind `8081`.
 It starts PostgreSQL 18 from the already logically migrated target directory,
-an empty memory-only Redis 8.8.0 application cache, and Sub2API 0.1.171 from the
+an empty memory-only Redis 8.8.0 application cache, and Sub2API 0.1.176 from the
 credential-free app metadata directory. It contains no sync service, publishes
 neither PostgreSQL nor Redis, uses no `AUTO_SETUP`, and discards every
 container's stdout/stderr. All three containers set the core-file ulimit to
@@ -1039,7 +1051,7 @@ the first failed checkpoint; never skip ahead.
    content backup.
 5. Run `docker-compose.canary.yml` only as an isolated empty-data preflight. Its
    PostgreSQL and Redis are tmpfs services on a private Compose network. Verify
-   the pinned 0.1.171 binary, startup, health, and no-file/no-Docker-log controls,
+   the pinned 0.1.176 binary, startup, health, and no-file/no-Docker-log controls,
    through loopback port `18081`, then stop it. It has no production account or
    API key and must never be used as an Nginx upstream or as a `/v1/responses`
    acceptance canary. Port `8081` remains reserved for the later migrated-target

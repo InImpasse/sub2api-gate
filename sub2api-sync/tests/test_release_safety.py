@@ -96,7 +96,7 @@ class ReleaseSafetyTests(unittest.TestCase):
     def test_runtime_images_are_pinned_to_reviewed_release_manifests(self):
         sub2api_image = (
             "weishaw/sub2api@sha256:"
-            "0ffc0202507c3510a696feab92e99faac28e72624ece8f40484b157ba68547b0"
+            "905baf250580334dacd902471f61da7b8b1e5da57e3c8c1769489952d51771a1"
         )
         redis_image = (
             "redis@sha256:"
@@ -114,7 +114,7 @@ class ReleaseSafetyTests(unittest.TestCase):
             "sha256:7aec734b2bb298a1d769fd8729f13b8514a41bf90fcdd1f38ec52267fbaa8ee6",
             NO_CONTENT_LOGGING_TEST,
         )
-        self.assertIn("Sub2API 0.1.171", COMPOSE)
+        self.assertIn("Sub2API 0.1.176", COMPOSE)
         self.assertIn("redis-server --version", COMPOSE)
         self.assertIn("v=8.8.0", COMPOSE)
         sync_image = "sub2api-gate/sub2api-sync:pg18.4-r1"
@@ -179,7 +179,7 @@ class ReleaseSafetyTests(unittest.TestCase):
         )
         self.assertNotIn("systemctl", PREFLIGHT)
 
-    def test_sub2api_runs_non_root_with_a_read_only_root_filesystem(self):
+    def test_sub2api_runs_non_root_with_online_update_writable_root(self):
         service_block = re.search(
             r"^  sub2api:\n(?P<body>.*?)(?=^  [a-z0-9-]+:|^networks:)",
             COMPOSE,
@@ -188,11 +188,15 @@ class ReleaseSafetyTests(unittest.TestCase):
         self.assertIsNotNone(service_block)
         body = service_block.group("body")
         self.assertIn('user: "1000:1000"', body)
-        self.assertIn("read_only: true", body)
+        self.assertNotRegex(body, r"(?m)^\s*read_only:\s*true\s*$")
         self.assertIn("init: true", body)
         self.assertIn("/tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700", body)
         self.assertIn("cap_drop:\n      - ALL", body)
         self.assertIn("no-new-privileges:true", body)
+        self.assertIn("UPDATE_GITHUB_TOKEN", body)
+        self.assertNotIn("grep -F 'Sub2API 0.1.176'", body)
+        self.assertIn("Sub2API 0.1.176", body)
+        self.assertIn('http://localhost:8080/health', body)
 
     def test_postgres_runs_non_root_with_a_read_only_root_filesystem(self):
         service_block = re.search(

@@ -113,7 +113,7 @@ class CleanupSafetyTests(unittest.TestCase):
         log_path.parent.rmdir()
 
     def test_default_check_is_read_only_does_not_require_or_access_docker(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="sub2api-gate-cleanup-") as directory:
             root = pathlib.Path(directory)
             data_dir, nginx_dir, _, _ = self.prepare_root(root)
             business_log = data_dir / "sub2api-response-debug.log"
@@ -134,7 +134,7 @@ class CleanupSafetyTests(unittest.TestCase):
         self.assertFalse(marker.exists())
 
     def test_apply_requires_explicit_legacy_container_name(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="sub2api-gate-cleanup-") as directory:
             root = pathlib.Path(directory)
             data_dir, nginx_dir, _, _ = self.prepare_root(root)
             result = self.run_script(
@@ -146,7 +146,7 @@ class CleanupSafetyTests(unittest.TestCase):
         self.assertIn("explicit valid legacy container name", result.stderr)
 
     def test_record_stage_cannot_write_without_explicit_apply(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="sub2api-gate-cleanup-") as directory:
             root = pathlib.Path(directory)
             data_dir, nginx_dir, _, _ = self.prepare_root(root)
             environment = self.environment(root, data_dir, nginx_dir)
@@ -170,7 +170,7 @@ class CleanupSafetyTests(unittest.TestCase):
         self.assertIn("requires explicit --apply", result.stderr)
 
     def test_apply_rejects_data_directory_without_data_basename(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="sub2api-gate-cleanup-") as directory:
             root = pathlib.Path(directory)
             _, nginx_dir, _, _ = self.prepare_root(root)
             unsafe_data = root / "etc"
@@ -186,7 +186,7 @@ class CleanupSafetyTests(unittest.TestCase):
         self.assertTrue(sentinel_survived)
 
     def test_apply_rejects_nginx_directory_without_nginx_basename(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="sub2api-gate-cleanup-") as directory:
             root = pathlib.Path(directory)
             data_dir, _, _, _ = self.prepare_root(root)
             unsafe_nginx = root / "var-log"
@@ -202,7 +202,7 @@ class CleanupSafetyTests(unittest.TestCase):
         self.assertTrue(sentinel_survived)
 
     def test_record_rejects_unvalidated_docker_log_path(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="sub2api-gate-cleanup-") as directory:
             root = pathlib.Path(directory)
             data_dir, nginx_dir, log_path, _ = self.prepare_root(root)
             log_path.rename(root / "unexpected-json.log")
@@ -214,7 +214,7 @@ class CleanupSafetyTests(unittest.TestCase):
         self.assertNotIn(str(log_path), result.stdout + result.stderr)
 
     def test_record_requires_the_legacy_container_to_be_stopped(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="sub2api-gate-cleanup-") as directory:
             root = pathlib.Path(directory)
             data_dir, nginx_dir, log_path, _ = self.prepare_root(root)
             environment = self.environment(root, data_dir, nginx_dir)
@@ -225,7 +225,7 @@ class CleanupSafetyTests(unittest.TestCase):
         self.assertNotIn(str(log_path), result.stdout + result.stderr)
 
     def test_apply_rejects_container_that_still_exists(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="sub2api-gate-cleanup-") as directory:
             root = pathlib.Path(directory)
             data_dir, nginx_dir, log_path, _ = self.prepare_root(root)
             environment = self.environment(root, data_dir, nginx_dir)
@@ -237,7 +237,7 @@ class CleanupSafetyTests(unittest.TestCase):
         self.assertNotIn(str(log_path), result.stdout + result.stderr)
 
     def test_apply_rejects_recorded_log_path_that_survived_container_removal(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="sub2api-gate-cleanup-") as directory:
             root = pathlib.Path(directory)
             data_dir, nginx_dir, log_path, present = self.prepare_root(root)
             environment = self.environment(root, data_dir, nginx_dir)
@@ -250,7 +250,7 @@ class CleanupSafetyTests(unittest.TestCase):
         self.assertNotIn(str(log_path), result.stdout + result.stderr)
 
     def test_apply_rejects_a_leftover_container_log_directory(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="sub2api-gate-cleanup-") as directory:
             root = pathlib.Path(directory)
             data_dir, nginx_dir, log_path, present = self.prepare_root(root)
             environment = self.environment(root, data_dir, nginx_dir)
@@ -264,7 +264,7 @@ class CleanupSafetyTests(unittest.TestCase):
         self.assertNotIn(str(log_path.parent), result.stdout + result.stderr)
 
     def test_record_remove_apply_and_verify_complete_without_path_disclosure(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="sub2api-gate-cleanup-") as directory:
             root = pathlib.Path(directory)
             data_dir, nginx_dir, log_path, present = self.prepare_root(root)
             data_log = data_dir / "sub2api-response-debug.log"
@@ -283,7 +283,7 @@ class CleanupSafetyTests(unittest.TestCase):
         self.assertNotIn(str(log_path), combined)
 
     def test_invalid_recheck_delay_fails_before_deleting_business_logs(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="sub2api-gate-cleanup-") as directory:
             root = pathlib.Path(directory)
             data_dir, nginx_dir, log_path, present = self.prepare_root(root)
             business_log = data_dir / "sub2api-response-debug.log"

@@ -34,6 +34,8 @@ class ReleasePolicyTests(unittest.TestCase):
         "docker-compose.traffic-canary.yml",
         "migrations/002_remove_conversation_capture.sql",
         "migrations/005_app_least_privilege.sql",
+        "migrations/006_allow_sub2api_schema_migrations.sql",
+        "migrations/221_group_model_pricing.sql",
         "sub2api-sync/Dockerfile",
     )
 
@@ -48,7 +50,7 @@ class ReleasePolicyTests(unittest.TestCase):
     def test_reviewed_policy_matches_all_active_consumers(self):
         policy = POLICY.read_policy()
         self.assertTrue(POLICY.verify(policy))
-        self.assertEqual(policy["sub2api"]["version"], "0.1.171")
+        self.assertEqual(policy["sub2api"]["version"], "0.1.176")
 
     def test_policy_rejects_a_digest_or_source_revision_drift(self):
         policy = POLICY.read_policy()
@@ -85,7 +87,7 @@ class ReleasePolicyTests(unittest.TestCase):
                         policy["postgres"]["image"],
                     )
                 )
-                + "\nSub2API 0.1.171\n",
+                + "\nSub2API 0.1.176\n",
                 encoding="ascii",
             )
             with self.assertRaisesRegex(POLICY.ReleasePolicyError, "unreviewed Redis"):
