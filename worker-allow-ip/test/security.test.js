@@ -828,7 +828,7 @@ test("Sub2API sync accepts only explicit matching success and never forwards ups
 
 test("Sub2API sync budgets leave the origin time to terminate timed-out work", () => {
   assert.equal(adminTest.sub2apiSyncTimeoutForAction("login"), 10_000);
-  for (const action of ["provision", "status", "deprovision", "purge", "usage_logs_list", "usage_log_detail"]) {
+  for (const action of ["provision", "status", "deprovision", "purge", "usage_logs_list", "usage_log_detail", "list_groups", "test_api_key"]) {
     assert.equal(adminTest.sub2apiSyncTimeoutForAction(action), 5_000);
   }
 });
@@ -1038,7 +1038,7 @@ test("every access-changing admin action requires TOTP step-up", () => {
   ]) {
     assert.equal(adminTest.requiresStepUpAction(action), true, action);
   }
-  for (const action of ["login", "logout", "refresh_sub2api_status"]) {
+  for (const action of ["login", "logout", "refresh_sub2api_status", "test_api_key"]) {
     assert.equal(adminTest.requiresStepUpAction(action), false, action);
   }
 });

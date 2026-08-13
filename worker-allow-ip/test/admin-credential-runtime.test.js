@@ -80,6 +80,16 @@ function makeMiniflare(outboundBodies) {
       observed.rawBody = rawBody;
       const body = JSON.parse(rawBody);
       Object.assign(observed, body);
+      if (body.action === "list_groups") {
+        return Response.json({
+          ok: true,
+          action: "list_groups",
+          groups: [
+            { id: 1, name: "openai-default", platform: "openai" },
+            { id: 2, name: "grok", platform: "xai" },
+          ],
+        });
+      }
       return Response.json({
         ok: true,
         action: body.action,
@@ -117,6 +127,7 @@ async function postUpdate(miniflare, apiConfigs) {
     email: "alice@example.test",
     remark: "",
     api_configs: apiConfigs,
+    key_group: "openai-default",
     step_up_token: await currentTotp(),
   });
   return await miniflare.dispatchFetch("https://api.example.test/allow-ip/admin", {
@@ -139,6 +150,7 @@ async function postCreate(miniflare, apiConfigs) {
     email: "charlie@example.test",
     remark: "",
     api_configs: apiConfigs,
+    key_group: "openai-default",
     step_up_token: await currentTotp(),
   });
   return await miniflare.dispatchFetch("https://api.example.test/allow-ip/admin", {
@@ -194,7 +206,8 @@ test("admin edit keeps encrypted credentials without exposing them and rejects i
   assert.match(hiddenValue, /existing-credential:v1/);
   const success = await postUpdate(miniflare, hiddenValue);
   assert.equal(success.status, 303, `${await success.text()}\nhidden=${hiddenValue}\noutbound=${JSON.stringify(outboundBodies)}`);
-  assert.equal(outboundBodies.length, 1);
+  assert.equal(outboundBodies.filter((body) => body.action === "list_groups").length, 1);
+  assert.equal(outboundBodies.filter((body) => body.action === "provision").length, 1);
 
   const revealed = await miniflare.dispatchFetch("http://worker.test/__test__/revealed").then((response) => response.json());
   const updated = revealed.items.find((item) => item.uuid === UUID);
@@ -214,21 +227,22 @@ test("admin edit keeps encrypted credentials without exposing them and rejects i
     const response = await postUpdate(miniflare, apiConfigs);
     assert.equal(response.status, 400, `${apiConfigs}: ${await response.text()}`);
   }
-  assert.equal(outboundBodies.length, 1);
+  assert.equal(outboundBodies.filter((body) => body.action === "provision").length, 1);
 
   const createWithMarker = await postCreate(
     miniflare,
     `Provider | ${BASE_URL} | ${marker}`,
   );
   assert.equal(createWithMarker.status, 400, await createWithMarker.text());
-  assert.equal(outboundBodies.length, 1);
+  assert.equal(outboundBodies.filter((body) => body.action === "provision").length, 1);
 
   const replacement = await postUpdate(
     miniflare,
     `Provider | ${BASE_URL} | ${REPLACEMENT_API_SECRET}`,
   );
   assert.equal(replacement.status, 303, await replacement.text());
-  assert.equal(outboundBodies.length, 2);
+  assert.equal(outboundBodies.filter((body) => body.action === "provision").length, 2);
+  assert.equal(outboundBodies.filter((body) => body.action === "list_groups").length, 1);
 
   const replaced = await miniflare.dispatchFetch("http://worker.test/__test__/revealed").then((response) => response.json());
   const replacedInvite = replaced.items.find((item) => item.uuid === UUID);

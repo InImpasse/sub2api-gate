@@ -59,7 +59,7 @@ class DemoContractTests(unittest.TestCase):
         self.assertIn("@media (max-width: 680px)", DEMO)
         self.assertNotRegex(DEMO, r"font-size:[^;]*\b(vw|vh|vmin|vmax)\b")
         self.assertNotRegex(DEMO, r"letter-spacing:\s*-")
-        self.assertIn("--radius-xl: 8px;", DEMO)
+        self.assertIn("--radius-xl: 20px;", DEMO)
 
     def test_mobile_layout_avoids_fixed_badge_and_action_overlaps(self):
         mobile = DEMO.split("@media (max-width: 680px)", 1)[1].split("</style>", 1)[0]
@@ -75,11 +75,17 @@ class DemoContractTests(unittest.TestCase):
         self.assertIn("grid-template-columns: minmax(0, 1fr);", narrow)
         self.assertIn("white-space: normal;", narrow)
 
-    def test_demo_uses_flat_backgrounds_without_decorative_orbs(self):
+    def test_demo_uses_glass_panels_without_decorative_orbs(self):
         self.assertNotIn("gradient(", DEMO)
         self.assertNotIn("ambient-orb", DEMO)
+        self.assertIn("backdrop-filter: blur(20px) saturate(180%)", DEMO)
+        self.assertIn("--surface: rgba(28, 28, 30, 0.62);", DEMO)
         self.assertIn("button:focus-visible", DEMO)
         self.assertIn("prefers-reduced-motion", DEMO)
+        self.assertIn('id="a-group"', DEMO)
+        self.assertIn("openai-default", DEMO)
+        self.assertIn("Test API key", DEMO)
+        self.assertIn("203.0.113.0/24", DEMO)
 
     def test_demo_presents_uuid_as_legacy_migration_compatibility(self):
         self.assertIn("Access key or legacy UUID", DEMO)

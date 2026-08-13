@@ -87,6 +87,10 @@ test("admin UI reflows at 200 percent zoom and keeps dark muted text readable", 
     html,
     /@media \(prefers-color-scheme: dark\)[\s\S]*?\.empty \{ color: #98989d; \}/,
   );
+  assert.match(
+    html,
+    /@media \(prefers-color-scheme: dark\)[\s\S]*?\.endpoint-summary \{[\s\S]*?background: rgba\(255, 255, 255, 0\.04\);/,
+  );
   assert.ok(contrastRatio("#98989d", "#1c1c1e") >= 4.5);
 });
 
@@ -552,17 +556,26 @@ test("admin dashboard list returns at most 25 summaries without reading IP recor
     ALLOWED_HOSTNAMES: "api.example.test",
   };
 
-  const dashboard = await __test.getAdminDashboard(
-    env,
-    new URL("https://api.example.test/allow-ip/admin?page=2&trashPage=3"),
-  );
-  assert.deepEqual(calls, [[25, 25, 0, 1]]);
-  assert.equal(dashboard.inviteCount, 100);
-  assert.equal(dashboard.trashCount, 75);
-  assert.equal(dashboard.unmigratedInviteCount, 9);
-  assert.equal(dashboard.invites.length, 25);
-  assert.equal(dashboard.selectedInvite, null);
-  assert.equal(recordReads, 0);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error("admin list must not call Sub2API sync");
+  };
+  try {
+    const dashboard = await __test.getAdminDashboard(
+      env,
+      new URL("https://api.example.test/allow-ip/admin?page=2&trashPage=3"),
+    );
+    assert.deepEqual(calls, [[25, 25, 0, 1]]);
+    assert.equal(dashboard.inviteCount, 100);
+    assert.equal(dashboard.trashCount, 75);
+    assert.equal(dashboard.unmigratedInviteCount, 9);
+    assert.equal(dashboard.invites.length, 25);
+    assert.equal(dashboard.selectedInvite, null);
+    assert.deepEqual(dashboard.keyGroups, []);
+    assert.equal(recordReads, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("selected admin detail reads one invite record and paginates IP groups by 20", async () => {
@@ -887,6 +900,8 @@ test("create and maintenance are focused views and legacy trash bookmarks canoni
   const createBody = await create.text();
   assert.equal(create.status, 200);
   assert.match(createBody, /<h2>Create UUID<\/h2>/);
+  assert.match(createBody, /name="key_group"/);
+  assert.match(createBody, /openai-default/);
   assert.doesNotMatch(createBody, /<h2>Access key migration<\/h2>|<h2>UUIDs<\/h2>|<h2>Recycle Bin<\/h2>/);
 
   const maintenance = await handleAdmin(new Request(

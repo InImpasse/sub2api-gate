@@ -18,7 +18,7 @@ const INVITE_STORAGE_FIELDS = new Set([
   "apiConfigs",
   "sub2apiSync",
 ]);
-const API_CONFIG_STORAGE_FIELDS = new Set(["id", "name", "baseUrl", "apiKeyEncrypted"]);
+const API_CONFIG_STORAGE_FIELDS = new Set(["id", "name", "baseUrl", "apiKeyEncrypted", "groupName"]);
 const SYNC_STORAGE_FIELDS = new Set([
   "userId",
   "apiKeyId",
@@ -32,12 +32,27 @@ const SYNC_STORAGE_FIELDS = new Set([
   "passwordHashFingerprint",
 ]);
 const SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/;
+const KEY_GROUP_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const FORBIDDEN_KEY_GROUP_NAMES = new Set(["default"]);
+export const DEFAULT_KEY_GROUP_NAME = "openai-default";
 const MAX_CREDENTIAL_PLAINTEXT_BYTES = 2048;
 const MAX_CREDENTIAL_CIPHERTEXT_BYTES = MAX_CREDENTIAL_PLAINTEXT_BYTES + 16;
 const MAX_CREDENTIAL_ENVELOPE_DATA_CHARS = Math.ceil(
   MAX_CREDENTIAL_CIPHERTEXT_BYTES * 4 / 3,
 );
 const MAX_CREDENTIAL_ENVELOPE_IV_CHARS = 64;
+
+export function parseKeyGroupName(value, { required = true } = {}) {
+  const name = String(value || "").trim();
+  if (!name) {
+    if (required) throw new Error("Key group is required");
+    return "";
+  }
+  if (!KEY_GROUP_NAME_PATTERN.test(name) || FORBIDDEN_KEY_GROUP_NAMES.has(name.toLowerCase())) {
+    throw new Error("Invalid key group");
+  }
+  return name;
+}
 
 export function generateAccessKey() {
   const bytes = new Uint8Array(32);
@@ -207,7 +222,7 @@ export async function protectInviteCredentials(invite, encryptionKey, hmacKey) {
         : {};
       const credentialId = String(configSource.id || "").trim() || randomCredentialId();
       return {
-        ...definedFields(configSource, ["name", "baseUrl"]),
+        ...definedFields(configSource, ["name", "baseUrl", "groupName"]),
         id: credentialId,
         apiKeyEncrypted: configSource.apiKey
           ? await encryptCredential(
@@ -273,6 +288,7 @@ export function hasInviteStorageSchema(value) {
       !isPlainObject(config)
       || !hasOnlyFields(config, API_CONFIG_STORAGE_FIELDS)
       || !isOptionalCredentialEnvelope(config.apiKeyEncrypted)
+      || !isOptionalKeyGroupName(config.groupName)
     ))) return false;
   }
   if (value.sub2apiSync === undefined) return true;
@@ -280,6 +296,16 @@ export function hasInviteStorageSchema(value) {
     && hasOnlyFields(value.sub2apiSync, SYNC_STORAGE_FIELDS)
     && isOptionalCredentialEnvelope(value.sub2apiSync.loginPasswordEncrypted)
     && isOptionalSha256Hex(value.sub2apiSync.passwordHashFingerprint);
+}
+
+function isOptionalKeyGroupName(value) {
+  if (value === undefined || value === "") return true;
+  try {
+    parseKeyGroupName(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isOptionalSha256Hex(value) {
@@ -412,6 +438,7 @@ export function sanitizeInviteForTrash(invite) {
       id: config.id || "",
       name: config.name || "",
       baseUrl: config.baseUrl || "",
+      groupName: String(config.groupName || ""),
     })),
     sub2apiSync: {
       userId: Number(sync.userId || 0),

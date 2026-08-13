@@ -5,6 +5,7 @@ const POLICIES = Object.freeze({
   admin: Object.freeze({ limit: 5, windowSeconds: 15 * 60 }),
   invite: Object.freeze({ limit: 10, windowSeconds: 15 * 60 }),
   totp: Object.freeze({ limit: 5, windowSeconds: 15 * 60 }),
+  keytest: Object.freeze({ limit: 8, windowSeconds: 15 * 60 }),
 });
 
 export async function consumeRateLimitAttempt(storage, scope, now = Date.now()) {

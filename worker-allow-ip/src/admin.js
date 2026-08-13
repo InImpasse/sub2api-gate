@@ -20,10 +20,13 @@ import { parseApprovedHostnames, parseApprovedHttpsUrl } from "./url-security.js
 import {
   accessKeyHmac,
   base64UrlDecode,
+  DEFAULT_KEY_GROUP_NAME,
   issueInviteAccessCredential,
   matchesInviteAccess,
+  parseKeyGroupName,
   passwordHashFingerprint,
   protectInviteCredentials,
+  rateLimitFingerprint,
   revealInviteCredentials,
   sanitizeInviteForTrash,
   timingSafeTextEqual as timingSafeEqual,
@@ -78,6 +81,7 @@ const MAX_ADMIN_IP_GROUP_PAGE = 400;
 const ADMIN_RECORD_PAYLOAD_MAX_BYTES = 256 * 1024;
 const ADMIN_LIST_HTML_MAX_BYTES = 96 * 1024;
 const ADMIN_DETAIL_HTML_MAX_BYTES = 128 * 1024;
+const ADMIN_EDIT_HTML_MAX_BYTES = 160 * 1024;
 const ISSUED_ACCESS_KEYS_HTML_MAX_BYTES = 256 * 1024;
 const MANAGED_CLOUDFLARE_COMMENT = /^sub2api ref [a-f0-9]{32}$/;
 const CLOUDFLARE_LIST_ITEM_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -190,7 +194,11 @@ async function handleAdminRequest(request, env) {
       request,
       env,
       dashboard,
-    ), 200, dashboard.view === "list" ? ADMIN_LIST_HTML_MAX_BYTES : ADMIN_DETAIL_HTML_MAX_BYTES);
+    ), 200, dashboard.view === "list"
+      ? ADMIN_LIST_HTML_MAX_BYTES
+      : dashboard.view === "edit"
+        ? ADMIN_EDIT_HTML_MAX_BYTES
+        : ADMIN_DETAIL_HTML_MAX_BYTES);
   }
 
   let form;
@@ -240,7 +248,8 @@ async function handleAdminRequest(request, env) {
     const email = cleanText(form.get("email"), 160);
     const remark = cleanText(form.get("remark"), 240);
     const apiConfigs = parseApiConfigs(String(form.get("api_configs") || ""), env);
-    const created = await createInvite(env, uuid, { username, email, remark, apiConfigs });
+    const keyGroup = parseKeyGroupName(form.get("key_group"));
+    const created = await createInvite(env, uuid, { username, email, remark, apiConfigs, keyGroup });
     if (created.accessKey) {
       return html(renderIssuedAccessKeys([{
         uuid,
@@ -272,6 +281,17 @@ async function handleAdminRequest(request, env) {
     return redirect(adminInvitePostHref(form, uuid));
   }
 
+  if (action === "test_api_key") {
+    const uuid = String(form.get("uuid") || "").trim();
+    const configId = String(form.get("config_id") || "").trim();
+    const attemptKey = await keyTestAttemptKey(env, session.sessionHash);
+    if (!(await consumeAuthAttempt(env, "keytest", attemptKey))) {
+      return html(renderMessage("Too many API key tests", "Try again later."), 429);
+    }
+    const result = await testInviteApiKey(env, uuid, configId);
+    return html(renderKeyTestResult(result, adminInvitePostHref(form, uuid)), result.tested ? 200 : 502);
+  }
+
   if (action === "reset_sub2api_password") {
     const uuid = String(form.get("uuid") || "").trim();
     await resetInviteSub2ApiPassword(env, uuid);
@@ -289,7 +309,8 @@ async function handleAdminRequest(request, env) {
       env,
       { allowExistingCredentialReferences: true },
     );
-    await updateInvite(env, originalUuid, { uuid, username, email, remark, apiConfigs });
+    const keyGroup = parseKeyGroupName(form.get("key_group"));
+    await updateInvite(env, originalUuid, { uuid, username, email, remark, apiConfigs, keyGroup });
     return redirect(adminInvitePostHref(form, uuid));
   }
 
@@ -858,12 +879,18 @@ async function getAdminDashboard(env, adminUrl) {
     const pageInvites = normalizeStoredInvites(Array.isArray(result.invites) ? result.invites : [])
       .slice(0, ADMIN_PAGE_SIZE);
     const invites = pageInvites.map((invite) => summarizeStoredInvite(env, invite));
+    const catalogPromise = (view === "create" || view === "edit")
+      ? loadKeyGroupCatalog(env)
+      : Promise.resolve([]);
     const selectedStoredInvite = selectedUuid
       ? await store.getInvite(selectedUuid)
       : null;
-    const selectedInvite = selectedStoredInvite
-      ? await hydrateAdminInvite(env, selectedStoredInvite, editUuid, requestedIpPage)
-      : null;
+    const [selectedInvite, keyGroups] = await Promise.all([
+      selectedStoredInvite
+        ? hydrateAdminInvite(env, selectedStoredInvite, editUuid, requestedIpPage)
+        : null,
+      catalogPromise,
+    ]);
     return {
       invites,
       trash: (Array.isArray(result.trash) ? result.trash : [])
@@ -879,6 +906,7 @@ async function getAdminDashboard(env, adminUrl) {
       view,
       page,
       trashPage,
+      keyGroups,
     };
   }
 
@@ -891,12 +919,18 @@ async function getAdminDashboard(env, adminUrl) {
     ? storedInvites.slice((page - 1) * ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE)
     : storedInvites.slice(0, 1);
   const invites = pageInvites.map((invite) => summarizeStoredInvite(env, invite));
+  const catalogPromise = (view === "create" || view === "edit")
+    ? loadKeyGroupCatalog(env)
+    : Promise.resolve([]);
   const selectedStoredInvite = selectedUuid
     ? storedInvites.find((invite) => invite.uuid === selectedUuid)
     : null;
-  const selectedInvite = selectedStoredInvite
-    ? await hydrateAdminInvite(env, selectedStoredInvite, editUuid, requestedIpPage)
-    : null;
+  const [selectedInvite, keyGroups] = await Promise.all([
+    selectedStoredInvite
+      ? hydrateAdminInvite(env, selectedStoredInvite, editUuid, requestedIpPage)
+      : null,
+    catalogPromise,
+  ]);
   return {
     invites,
     trash: storedTrash
@@ -914,6 +948,7 @@ async function getAdminDashboard(env, adminUrl) {
     view,
     page,
     trashPage,
+    keyGroups,
   };
 }
 
@@ -987,12 +1022,21 @@ async function revealStoredInvite(env, invite) {
 function summarizeStoredInvite(env, invite) {
   const sync = invite?.sub2apiSync || {};
   const apiConfigs = (Array.isArray(invite?.apiConfigs) ? invite.apiConfigs : [])
-    .map((config) => ({
-      id: boundedRecordText(config?.id, 128),
-      name: boundedRecordText(config?.name, 80),
-      baseUrl: boundedRecordText(approvedApiConfigUrl(env, config), 2048),
-      credentialConfigured: Boolean(config?.apiKeyEncrypted || config?.apiKey),
-    }))
+    .map((config) => {
+      let groupName = "";
+      try {
+        groupName = parseKeyGroupName(config?.groupName, { required: false });
+      } catch {
+        groupName = "";
+      }
+      return {
+        id: boundedRecordText(config?.id, 128),
+        name: boundedRecordText(config?.name, 80),
+        baseUrl: boundedRecordText(approvedApiConfigUrl(env, config), 2048),
+        credentialConfigured: Boolean(config?.apiKeyEncrypted || config?.apiKey),
+        ...(groupName ? { groupName } : {}),
+      };
+    })
     .filter((config) => config.baseUrl)
     .slice(0, 8);
   const storedApiConfigCount = Number(invite?.apiConfigCount);
@@ -1189,6 +1233,7 @@ async function createInvite(env, uuid, data) {
   const username = validateInviteUsername(data.username, uuid);
   assertUniqueInviteUsername(invites, username, null);
   const now = new Date().toISOString();
+  const keyGroup = parseKeyGroupName(data.keyGroup || DEFAULT_KEY_GROUP_NAME, { required: false }) || DEFAULT_KEY_GROUP_NAME;
   const syncResult = await provisionSub2ApiUser(env, {
     uuid,
     username: desiredSub2ApiUsername(username, uuid),
@@ -1197,9 +1242,13 @@ async function createInvite(env, uuid, data) {
     remark: data.remark || "",
     sub2apiUserId: 0,
     loginPassword: "",
+    keyGroup,
     tokens: desiredSub2ApiTokens(env, data.apiConfigs),
   });
-  const apiConfigs = mergeSub2ApiConfig(env, data.apiConfigs, syncResult);
+  const apiConfigs = mergeSub2ApiConfig(env, data.apiConfigs, syncResult).map((config) => ({
+    ...config,
+    groupName: config.groupName || keyGroup,
+  }));
   const sub2apiSync = await sub2apiSyncMetadata(env, syncResult);
 
   const issued = await issueInviteAccessCredential({
@@ -1389,6 +1438,7 @@ async function updateInvite(env, originalUuid, data) {
     storedInvite,
     invite,
   );
+  const keyGroup = parseKeyGroupName(data.keyGroup || DEFAULT_KEY_GROUP_NAME, { required: false }) || DEFAULT_KEY_GROUP_NAME;
 
   const syncResult = await provisionSub2ApiUser(env, {
     uuid: data.uuid,
@@ -1398,6 +1448,7 @@ async function updateInvite(env, originalUuid, data) {
     remark: data.remark || "",
     sub2apiUserId: invite.sub2apiSync?.userId || 0,
     loginPassword: invite.sub2apiSync?.loginPassword || "",
+    keyGroup,
     tokens: desiredSub2ApiTokens(env, apiConfigs),
   });
 
@@ -1407,7 +1458,10 @@ async function updateInvite(env, originalUuid, data) {
   invite.name = username;
   invite.email = data.email || "";
   invite.remark = data.remark || "";
-  invite.apiConfigs = mergeSub2ApiConfig(env, apiConfigs, syncResult);
+  invite.apiConfigs = mergeSub2ApiConfig(env, apiConfigs, syncResult).map((config) => ({
+    ...config,
+    groupName: config.groupName || keyGroup,
+  }));
   invite.sub2apiSync = await sub2apiSyncMetadata(env, syncResult);
   invite.updatedAt = now;
   invites[inviteIndex] = invite;
@@ -1509,6 +1563,7 @@ async function restoreInviteFromTrash(env, trashId, lease = null) {
     remark: invite.remark || "",
     sub2apiUserId: invite.sub2apiSync?.userId || 0,
     loginPassword: invite.sub2apiSync?.loginPassword || "",
+    keyGroup: provisionKeyGroup(invite),
     tokens: desiredSub2ApiTokens(env, invite.apiConfigs),
   });
 
@@ -2628,6 +2683,7 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
   const currentTrashPage = Number.isSafeInteger(dashboard.trashPage) ? dashboard.trashPage : 1;
   const selectedInvite = dashboard.selectedInvite || null;
   const view = String(dashboard.view || (selectedInvite ? "detail" : "list"));
+  const keyGroups = Array.isArray(dashboard.keyGroups) ? dashboard.keyGroups : [];
   const authStateStatus = dashboard.authStateStatus || null;
   const legacyCleanupComplete = authStateStatus?.legacyCleanupComplete === true;
   const legacyCleanupVerificationPending =
@@ -2738,6 +2794,7 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
               <label for="remark">Remark</label>
               <input id="remark" name="remark" type="text" maxlength="240" />
             </div>
+            ${renderKeyGroupPicker(keyGroups, DEFAULT_KEY_GROUP_NAME)}
           </div>
           ${renderApiConfigEditor("api-configs", [], defaultBaseUrl)}
           <div class="form-footer">
@@ -2767,6 +2824,7 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
             request,
             env,
             { page: currentPage, trashPage: currentTrashPage },
+            keyGroups,
           )}
         </section>
       ` : ""}
@@ -3277,7 +3335,7 @@ function renderIpGroupTrashRow(item, csrf, trashPage) {
   `;
 }
 
-function renderInviteRow(invite, csrf, request, env, pagination = {}) {
+function renderInviteRow(invite, csrf, request, env, pagination = {}, keyGroups = []) {
   const groups = invite.records || [];
   const recordCount = Number.isSafeInteger(invite.recordCount) ? invite.recordCount : groups.length;
   const ipPage = Number.isSafeInteger(invite.ipPage) ? invite.ipPage : 1;
@@ -3341,7 +3399,7 @@ function renderInviteRow(invite, csrf, request, env, pagination = {}) {
         </div>
       </div>
       <div class="invite-main">
-        ${isEditing ? renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env, pagination, ipPage) : renderInviteSummary(invite, apiConfigs, ADMIN_PATH, pagination)}
+        ${isEditing ? renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env, pagination, ipPage, keyGroups) : renderInviteSummary(invite, apiConfigs, ADMIN_PATH, pagination, csrf)}
         <section class="ip-panel">
           <div class="subhead">
             <h3>IP groups</h3>
@@ -3435,7 +3493,9 @@ function renderManualIpGroupForm(uuid, csrf, pagination, ipPage, isEditing) {
   `;
 }
 
-function renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env, pagination, ipPage) {
+function renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env, pagination, ipPage, keyGroups = []) {
+  const selectedGroup = selectedKeyGroupName(invite, keyGroups);
+  const fieldId = `key_group-${invite.uuid}`;
   return `
     <form class="invite-edit" method="post" action="${ADMIN_PATH}">
       <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
@@ -3462,6 +3522,7 @@ function renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env, 
           <label for="remark-${escapeHtml(invite.uuid)}">Remark</label>
           <input id="remark-${escapeHtml(invite.uuid)}" name="remark" type="text" maxlength="240" value="${escapeHtml(invite.remark || "")}" />
         </div>
+        ${renderKeyGroupPicker(keyGroups, selectedGroup, fieldId)}
       </div>
       ${renderApiConfigEditor(editorId, apiConfigs, defaultSub2ApiBaseUrl(env, request))}
       <div class="form-footer">
@@ -3867,7 +3928,166 @@ function validateGeoIpConfig(env) {
 }
 
 async function provisionSub2ApiUser(env, invite) {
-  return await callSub2ApiSync(env, "provision", invite);
+  const keyGroup = provisionKeyGroup(invite);
+  const tokens = Array.isArray(invite.tokens)
+    ? invite.tokens.map((token) => ({
+      ...token,
+      groupName: token.groupName || keyGroup,
+    }))
+    : invite.tokens;
+  return await callSub2ApiSync(env, "provision", {
+    ...invite,
+    allowedGroups: [keyGroup],
+    tokens,
+  });
+}
+
+function provisionKeyGroup(invite) {
+  if (invite?.keyGroup) return parseKeyGroupName(invite.keyGroup);
+  const fromTokens = (Array.isArray(invite?.tokens) ? invite.tokens : [])
+    .map((token) => String(token?.groupName || "").trim())
+    .find(Boolean);
+  if (fromTokens) return parseKeyGroupName(fromTokens);
+  const fromConfigs = (Array.isArray(invite?.apiConfigs) ? invite.apiConfigs : [])
+    .map((config) => String(config?.groupName || "").trim())
+    .find(Boolean);
+  if (fromConfigs) return parseKeyGroupName(fromConfigs);
+  return DEFAULT_KEY_GROUP_NAME;
+}
+
+function sanitizeKeyGroupCatalog(groups) {
+  if (!Array.isArray(groups)) return [];
+  const seen = new Set();
+  const catalog = [];
+  for (const group of groups.slice(0, 32)) {
+    if (!isPlainJsonObject(group)) continue;
+    let name;
+    try {
+      name = parseKeyGroupName(group.name);
+    } catch {
+      continue;
+    }
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const id = Number(group.id);
+    catalog.push({
+      id: Number.isSafeInteger(id) && id > 0 ? id : 0,
+      name,
+      platform: String(group.platform || "").slice(0, 32),
+    });
+  }
+  return catalog;
+}
+
+async function loadKeyGroupCatalog(env) {
+  try {
+    const result = await callSub2ApiSync(env, "list_groups", {});
+    return sanitizeKeyGroupCatalog(result.groups);
+  } catch {
+    return [];
+  }
+}
+
+function selectedKeyGroupName(invite, catalog) {
+  const names = new Set((Array.isArray(catalog) ? catalog : []).map((group) => group.name));
+  try {
+    const current = provisionKeyGroup(invite);
+    if (!names.size || names.has(current)) return current;
+  } catch {
+    // Fall through to a catalog default.
+  }
+  if (names.has(DEFAULT_KEY_GROUP_NAME)) return DEFAULT_KEY_GROUP_NAME;
+  return catalog[0]?.name || DEFAULT_KEY_GROUP_NAME;
+}
+
+function renderKeyGroupPicker(catalog, selected, fieldId = "key_group") {
+  const options = Array.isArray(catalog) && catalog.length
+    ? catalog
+    : [{ name: DEFAULT_KEY_GROUP_NAME, platform: "openai" }];
+  const current = options.some((group) => group.name === selected)
+    ? selected
+    : options[0].name;
+  const id = String(fieldId || "key_group");
+  return `
+    <div class="field span-2">
+      <label for="${escapeHtml(id)}">Key group</label>
+      <select id="${escapeHtml(id)}" name="key_group" required>
+        ${options.map((group) => `
+          <option value="${escapeHtml(group.name)}"${group.name === current ? " selected" : ""}>${escapeHtml(group.name)}${group.platform ? ` (${escapeHtml(group.platform)})` : ""}</option>
+        `).join("")}
+      </select>
+      <p class="hint">New keys are created in this model group. The legacy default group is not available.</p>
+    </div>
+  `;
+}
+
+function apiKeyIdFromConfig(invite, configId) {
+  const tokenMatch = /^sub2api-token-(\d+)$/.exec(String(configId || "").trim());
+  if (tokenMatch) return safePositiveIdentifier(tokenMatch[1]);
+  return safePositiveIdentifier(invite?.sub2apiSync?.apiKeyId)
+    || safePositiveIdentifier(invite?.sub2apiSync?.tokenId);
+}
+
+export async function testInviteApiKey(env, uuid, configId) {
+  if (!isUuid(uuid)) throw new Error("Invalid UUID");
+  const invite = await getInviteByUuid(env, uuid);
+  if (!invite) throw new Error("UUID not found");
+  const apiKeyId = apiKeyIdFromConfig(invite, configId);
+  if (apiKeyId <= 0) throw new Error("API key is not ready to test");
+  const sync = invite.sub2apiSync || {};
+  const result = await callSub2ApiSync(env, "test_api_key", {
+    uuid: invite.uuid,
+    username: desiredSub2ApiUsername(inviteUsername(invite), invite.uuid),
+    sub2apiUserId: safePositiveIdentifier(sync.userId),
+    apiKeyId,
+    tokenId: apiKeyId,
+  });
+  return {
+    uuid: result.uuid,
+    tested: result.tested === true,
+    httpStatus: Number.isSafeInteger(result.httpStatus) ? result.httpStatus : 0,
+    modelCount: Number.isSafeInteger(result.modelCount) ? result.modelCount : 0,
+    modelId: String(result.modelId || ""),
+    errorCode: String(result.errorCode || ""),
+    latencyMs: Number.isSafeInteger(result.latencyMs) ? result.latencyMs : 0,
+  };
+}
+
+function renderKeyTestResult(result, returnHref) {
+  const tested = result?.tested === true;
+  const details = [
+    result?.httpStatus ? `HTTP ${result.httpStatus}` : "",
+    Number.isSafeInteger(result?.modelCount) ? `${result.modelCount} model${result.modelCount === 1 ? "" : "s"}` : "",
+    result?.modelId ? `first model ${result.modelId}` : "",
+    result?.errorCode ? result.errorCode.replace(/_/g, " ") : "",
+  ].filter(Boolean).join(" · ");
+  return page(tested ? "API key works" : "API key test failed", `
+    <section class="message" role="${tested ? "status" : "alert"}">
+      <p class="eyebrow">Key test</p>
+      <h1>${tested ? "API key works" : "API key test failed"}</h1>
+      <p>${escapeHtml(details || (tested ? "The current key authenticated successfully." : "The current key did not authenticate."))}</p>
+      <a href="${escapeHtml(returnHref)}">Return</a>
+    </section>
+  `);
+}
+
+export function keyTestNotice(result) {
+  if (result?.tested) {
+    const model = result.modelId ? `; first model ${result.modelId}` : "";
+    return `API key works. HTTP ${result.httpStatus || 200}. ${result.modelCount || 0} model${result.modelCount === 1 ? "" : "s"}${model}.`;
+  }
+  const status = result?.httpStatus ? `; HTTP ${result.httpStatus}` : "";
+  const code = result?.errorCode ? ` (${result.errorCode.replace(/_/g, " ")})` : "";
+  return `API key test failed${code}${status}.`;
+}
+
+export async function keyTestAttemptKey(env, identity) {
+  const fingerprint = await rateLimitFingerprint(
+    env.INVITE_ACCESS_HMAC_KEY,
+    "keytest",
+    String(identity || ""),
+  );
+  return `keytest-attempt:${fingerprint}`;
 }
 
 async function deprovisionSub2ApiUser(env, invite) {
@@ -4072,6 +4292,16 @@ function validateSub2ApiSyncResult(result, action, requestPayload) {
     }
   }
 
+  if (action === "list_groups" || action === "test_api_key") {
+    rejectSyncContentLeak(result);
+    if (action === "list_groups") {
+      validateListGroupsResult(result);
+    } else {
+      validateKeyTestResult(result);
+    }
+    return;
+  }
+
   validateSyncApiKey(result, "apiKey");
   validateSyncApiKey(result, "tokenKey");
   validateOptionalSyncString(result, "loginPassword", 512);
@@ -4099,11 +4329,83 @@ function validateSub2ApiSyncResult(result, action, requestPayload) {
   }
 }
 
+const SYNC_CONTENT_LEAK_FIELDS = Object.freeze([
+  "body",
+  "content",
+  "choices",
+  "data",
+  "message",
+  "prompt",
+  "completion",
+  "text",
+  "authorization",
+]);
+const SYNC_CREDENTIAL_LEAK_FIELDS = Object.freeze([
+  "apiKey",
+  "tokenKey",
+  "loginPassword",
+  "auth",
+  "tokens",
+]);
+
+function rejectSyncContentLeak(result) {
+  for (const field of SYNC_CONTENT_LEAK_FIELDS) {
+    if (Object.hasOwn(result, field)) {
+      throw new Error("Sub2API sync request failed");
+    }
+  }
+}
+
+function validateListGroupsResult(result) {
+  for (const field of SYNC_CREDENTIAL_LEAK_FIELDS) {
+    if (Object.hasOwn(result, field)) {
+      throw new Error("Sub2API sync request failed");
+    }
+  }
+  if (!Array.isArray(result.groups) || result.groups.length > 32) {
+    throw new Error("Sub2API sync request failed");
+  }
+  for (const group of result.groups) {
+    if (!isPlainJsonObject(group)) throw new Error("Sub2API sync request failed");
+    try {
+      parseKeyGroupName(group.name);
+    } catch {
+      throw new Error("Sub2API sync request failed");
+    }
+  }
+}
+
+function validateKeyTestResult(result) {
+  for (const field of SYNC_CREDENTIAL_LEAK_FIELDS) {
+    if (Object.hasOwn(result, field)) {
+      throw new Error("Sub2API sync request failed");
+    }
+  }
+  if (typeof result.tested !== "boolean") {
+    throw new Error("Sub2API sync request failed");
+  }
+  for (const field of ["httpStatus", "modelCount", "latencyMs"]) {
+    if (Object.hasOwn(result, field)
+        && (!Number.isSafeInteger(result[field]) || result[field] < 0)) {
+      throw new Error("Sub2API sync request failed");
+    }
+  }
+  validateOptionalSyncString(result, "modelId", 128);
+  validateOptionalSyncString(result, "errorCode", 64);
+}
+
 function validateSyncToken(token) {
   if (!isPlainJsonObject(token)) throw new Error("Sub2API sync request failed");
   validateSyncApiKey(token, "apiKey");
   validateSyncApiKey(token, "tokenKey");
   validateOptionalSyncString(token, "name", 100);
+  if (Object.hasOwn(token, "groupName") && token.groupName) {
+    try {
+      parseKeyGroupName(token.groupName);
+    } catch {
+      throw new Error("Sub2API sync request failed");
+    }
+  }
   for (const field of ["apiKeyId", "tokenId"]) {
     if (Object.hasOwn(token, field)
         && (!Number.isSafeInteger(token[field]) || token[field] <= 0)) {
@@ -4297,6 +4599,7 @@ function desiredSub2ApiTokens(env, configs) {
       return {
         tokenKey: isSub2ApiTokenKey(key) ? key : "",
         tokenName: normalizeApiName(name) === "sub2api" ? "Sub2API" : name,
+        ...(item.groupName ? { groupName: item.groupName } : {}),
       };
     })
     .filter((item) => {
@@ -4329,6 +4632,7 @@ function sub2apiTokenConfigs(env, syncResult) {
       name: displayApiName(token.name),
       baseUrl,
       apiKey: String(token.tokenKey || "").trim(),
+      ...(token.groupName ? { groupName: String(token.groupName) } : {}),
     }));
 }
 
@@ -4511,12 +4815,21 @@ function normalizeApiConfigs(configs) {
   }
 
   return configs
-    .map((config) => ({
-      id: config.id || randomHex(8),
-      name: displayApiName(config.name).slice(0, 80),
-      baseUrl: normalizeBaseUrl(config.baseUrl),
-      apiKey: String(config.apiKey || "").trim(),
-    }))
+    .map((config) => {
+      let groupName = "";
+      try {
+        groupName = parseKeyGroupName(config.groupName, { required: false });
+      } catch {
+        groupName = "";
+      }
+      return {
+        id: config.id || randomHex(8),
+        name: displayApiName(config.name).slice(0, 80),
+        baseUrl: normalizeBaseUrl(config.baseUrl),
+        apiKey: String(config.apiKey || "").trim(),
+        ...(groupName ? { groupName } : {}),
+      };
+    })
     .filter(isUsableApiConfig)
     .slice(0, 8);
 }
@@ -4858,7 +5171,8 @@ function page(title, body, layout = "narrow") {
       border: 0;
     }
     .invite-summary, .endpoint-summary-list { display: grid; gap: 12px; min-width: 0; }
-    .endpoint-summary { display: grid; gap: 5px; padding: 12px; border: 1px solid rgba(0, 0, 0, 0.08); border-radius: 8px; }
+    .key-test-form { margin: 0; }
+    .endpoint-summary { display: grid; gap: 5px; padding: 12px; border: 0.5px solid rgba(255, 255, 255, 0.55); border-radius: 16px; background: rgba(255, 255, 255, 0.4); }
     .invite-card { content-visibility: auto; contain-intrinsic-size: auto 520px; }
     .trash-meta {
       display: flex;
@@ -4874,12 +5188,12 @@ function page(title, body, layout = "narrow") {
     .span-2 { grid-column: 1 / -1; }
     .panel, .message {
       padding: 20px;
-      border: 0.5px solid rgba(0, 0, 0, 0.06);
-      border-radius: 8px;
-      background: rgba(255, 255, 255, 0.72);
+      border: 0.5px solid rgba(255, 255, 255, 0.62);
+      border-radius: 20px;
+      background: rgba(255, 255, 255, 0.64);
       box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.06);
-      backdrop-filter: none;
-      -webkit-backdrop-filter: none;
+      backdrop-filter: blur(20px) saturate(180%);
+      -webkit-backdrop-filter: blur(20px) saturate(180%);
     }
     .topbar {
       display: flex;
@@ -5247,7 +5561,7 @@ function page(title, body, layout = "narrow") {
       .ip-preview { max-width: 100%; }
       th, td { padding: 10px 8px; }
       h1 { font-size: 28px; }
-      .panel, .message { padding: 16px; border-radius: 8px; }
+      .panel, .message { padding: 16px; border-radius: 16px; }
       .admin-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .admin-tabs .nav-link:last-child { grid-column: 1 / -1; }
     }
@@ -5281,9 +5595,11 @@ function page(title, body, layout = "narrow") {
           0 0 0 1px rgba(255, 255, 255, 0.12);
       }
       .panel, .message {
-        border-color: rgba(255, 255, 255, 0.08);
-        background: rgba(28, 28, 30, 0.72);
+        border-color: rgba(255, 255, 255, 0.14);
+        background: rgba(28, 28, 30, 0.62);
         box-shadow: 0 1px 3px rgba(0,0,0,0.2), 0 8px 24px rgba(0,0,0,0.3);
+        backdrop-filter: blur(20px) saturate(180%);
+        -webkit-backdrop-filter: blur(20px) saturate(180%);
       }
       label, input, textarea, select { color: #f5f5f7; }
       input, textarea, select {
@@ -5331,6 +5647,10 @@ function page(title, body, layout = "narrow") {
       th, td { border-color: rgba(255, 255, 255, 0.08); }
       th, .topbar p, .muted, small { color: #98989d; }
       .hint, .lede, .eyebrow, .preview-label, .expiry-field span, .time-grid span { color: #aeaeb2; }
+      .endpoint-summary {
+        border-color: rgba(255, 255, 255, 0.08);
+        background: rgba(255, 255, 255, 0.04);
+      }
       .ip-group { border-color: rgba(255, 255, 255, 0.08); background: rgba(255, 255, 255, 0.04); }
       .ip-group-body { border-color: rgba(255, 255, 255, 0.08); }
       .empty { color: #98989d; }
@@ -5366,6 +5686,14 @@ function page(title, body, layout = "narrow") {
     document.querySelectorAll(".copy-value").forEach((button) => {
       button.addEventListener("click", async () => {
         await window.copyAdminValue(button, button.dataset.copy || "");
+      });
+    });
+    document.querySelectorAll(".key-test-form").forEach((form) => {
+      form.addEventListener("submit", () => {
+        const button = form.querySelector('button[type="submit"]');
+        if (!button || button.disabled) return;
+        button.disabled = true;
+        button.textContent = "Testing...";
       });
     });
   </script>
@@ -5450,6 +5778,9 @@ function isUserFacingAdminError(error) {
     message === "Stored API credential references are only valid for invite updates" ||
     message === "Stored API credential endpoint cannot be changed without a new API key" ||
     message === "Invalid expiration timestamp" ||
+    message === "Invalid key group" ||
+    message === "Key group is required" ||
+    message === "API key is not ready to test" ||
     message.startsWith("Invalid IP address:") ||
     message === "Cloudflare allowlist update failed"
   );
@@ -5795,6 +6126,13 @@ export const __test = Object.freeze({
   rollbackRestoredIpAccess,
   callSub2ApiSync,
   deprovisionSub2ApiUser,
+  provisionKeyGroup,
+  sanitizeKeyGroupCatalog,
+  loadKeyGroupCatalog,
+  renderKeyGroupPicker,
+  testInviteApiKey,
+  keyTestNotice,
+  keyTestAttemptKey,
   purgeSub2ApiUser,
   lookupIpLocation,
   resolveGeoIpLookupUrl,

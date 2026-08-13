@@ -67,6 +67,7 @@ function makeInvite(index) {
       name: "OpenAI compatible",
       baseUrl: "https://provider.example.test/v1",
       apiKey: "sk-browser-ui-test-sentinel",
+      groupName: "openai-default",
     }] : [],
     sub2apiSync: index === 0 ? {
       userId: 11,
@@ -147,6 +148,33 @@ function syncResponse(request) {
     if (body.action === "usage_log_detail") {
       const item = usageItem(0);
       return Response.json({ ok: true, action: body.action, item, items: [item] });
+    }
+    if (body.action === "list_groups") {
+      return Response.json({
+        ok: true,
+        action: body.action,
+        groups: [
+          { id: 1, name: "openai-default", platform: "openai" },
+          { id: 2, name: "grok", platform: "openai" },
+        ],
+        syncedAt: "2026-07-21T12:30:00.000Z",
+      });
+    }
+    if (body.action === "test_api_key") {
+      return Response.json({
+        ok: true,
+        action: body.action,
+        uuid: body.uuid,
+        apiKeyId: body.apiKeyId || 21,
+        tokenId: body.tokenId || 21,
+        tested: true,
+        httpStatus: 200,
+        modelCount: 2,
+        modelId: "gpt-5.6-sol",
+        errorCode: "",
+        latencyMs: 12,
+        syncedAt: "2026-07-21T12:30:00.000Z",
+      });
     }
     return Response.json({ ok: true, action: body.action });
   });
@@ -618,10 +646,25 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
   const response = await page.goto(url, { waitUntil: "networkidle" });
   expect(response?.status()).toBeLessThan(400);
   await expect(page.locator("main")).toBeVisible();
+  if (["public-form", "admin-list", "demo"].includes(scenario)) {
+    const glassTarget = scenario === "demo" ? ".workspace, .intro-panel" : ".panel";
+    const filter = await page.locator(glassTarget).first().evaluate((element) => {
+      const style = getComputedStyle(element);
+      return `${style.backdropFilter} ${style.webkitBackdropFilter || ""}`;
+    });
+    expect(filter).toMatch(/blur\(20px\)/);
+  }
   const htmlBytes = Buffer.byteLength(await page.content(), "utf8");
   if (scenario === "admin-list") expect(htmlBytes).toBeLessThanOrEqual(96 * 1024);
   if (["admin-detail", "admin-create", "admin-maintenance"].includes(scenario)) {
     expect(htmlBytes).toBeLessThanOrEqual(128 * 1024);
+  }
+  if (scenario === "demo") {
+    const html = await page.content();
+    expect(html).toContain('id="a-group"');
+    expect(html).toContain("openai-default");
+    expect(html).toContain("Test API key");
+    expect(html).not.toMatch(/<option[^>]*value="default"/);
   }
 
   if (scenario === "public-form") {
@@ -634,6 +677,8 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
   }
   if (scenario === "public-dashboard") {
     await expect(page.getByText("Current network authorization is active", { exact: false })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Test API key" })).toBeVisible();
+    await expect(page.getByText("Key group:", { exact: false })).toBeVisible();
     expect(requests.some((value) => value.startsWith("https://challenges.cloudflare.com/"))).toBe(false);
   }
   if (scenario === "admin-list") {
@@ -644,6 +689,9 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
   if (scenario === "admin-create") {
     await expect(page.locator('.admin-tabs [aria-current="page"]')).toHaveText("Create");
     await expect(page.locator('form.create input[name="username"]')).toBeVisible();
+    await expect(page.locator('form.create select[name="key_group"]')).toBeVisible();
+    await expect(page.locator('form.create select[name="key_group"] option[value="default"]')).toHaveCount(0);
+    await expect(page.locator('form.create select[name="key_group"] option[value="openai-default"]')).toHaveCount(1);
     await expect(page.locator(".invite-list, .selected-invite-detail, .trash-list")).toHaveCount(0);
   }
   if (scenario === "admin-maintenance") {
@@ -654,6 +702,7 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
   }
   if (scenario === "admin-detail") {
     await expect(page.locator(".selected-invite-detail")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Test API key" }).first()).toBeVisible();
     await expect(page.locator(".invite-list, .create-panel, .trash-list")).toHaveCount(0);
     if (viewport.width === 240) {
       const detailPosition = await page.evaluate(() => {

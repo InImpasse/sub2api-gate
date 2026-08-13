@@ -1,4 +1,4 @@
-import { authorizeVisitorIps, cleanupExpiredIpGroups, findInvite, getInviteApiConfigs, getInviteByUuid, getInviteIpRecords, handleAdmin, loginInviteToSub2Api, sanitizeInviteForPublic } from "./admin.js";
+import { authorizeVisitorIps, cleanupExpiredIpGroups, findInvite, getInviteApiConfigs, getInviteByUuid, getInviteIpRecords, handleAdmin, keyTestAttemptKey, keyTestNotice, loginInviteToSub2Api, sanitizeInviteForPublic, testInviteApiKey } from "./admin.js";
 import { createAuthStateStore, isAuthStateBindingConfigured } from "./auth-state.js";
 import {
   rateLimitFingerprint,
@@ -130,7 +130,7 @@ async function handleSubmit(request, env, uuidSession) {
     ), 400);
   }
   const action = String(form.get("action") || "");
-  if (action !== "" && action !== "logout_uuid") {
+  if (action !== "" && action !== "logout_uuid" && action !== "test_api_key") {
     return html(renderMessage(
       "Unknown form action",
       "Refresh the page and use one of the available actions.",
@@ -152,6 +152,51 @@ async function handleSubmit(request, env, uuidSession) {
     }
     await deleteUuidSession(env, request);
     return redirect("/allow-ip", clearUuidCookie());
+  }
+
+  if (action === "test_api_key") {
+    if (!uuidSession?.invite) {
+      return html(renderMessage(
+        "Sign in required",
+        "Sign in with an access key before testing an API key.",
+      ), 403);
+    }
+    if (!(await timingSafeEqual(String(form.get("csrf") || ""), uuidSession.csrf))) {
+      return html(renderMessage("Invalid request", "Refresh the page and try again."), 403);
+    }
+    const attemptKey = await keyTestAttemptKey(env, uuidSession.invite.uuid);
+    if (!(await consumeAuthAttempt(env, "keytest", attemptKey))) {
+      return html(renderMessage("Too many API key tests", "Try again later."), 429);
+    }
+    const url = new URL(request.url);
+    const currentStatus = await getCurrentAllowStatus(env, request, uuidSession.invite);
+    let result;
+    try {
+      result = await testInviteApiKey(
+        env,
+        uuidSession.invite.uuid,
+        String(form.get("config_id") || "").trim(),
+      );
+    } catch (error) {
+      result = {
+        tested: false,
+        httpStatus: Number(error?.status) || 0,
+        errorCode: publicKeyTestErrorCode(error),
+        modelCount: 0,
+        modelId: "",
+        latencyMs: 0,
+      };
+    }
+    return html(renderDashboard(
+      env,
+      url,
+      uuidSession.invite,
+      request,
+      keyTestNotice(result),
+      currentStatus,
+      uuidSession.csrf || "",
+      result.tested === true ? "success" : "error",
+    ), result.tested === true ? 200 : 502);
   }
 
   const inviteKey = String(form.get("invite_key") || "").trim();
@@ -218,6 +263,18 @@ async function handleSubmit(request, env, uuidSession) {
   );
 }
 
+
+function publicKeyTestErrorCode(error) {
+  const message = String(error?.message || "");
+  if (message === "API key is not ready to test") return "api_key_not_ready";
+  if (Number(error?.status) === 504 || String(error?.code || "").includes("timeout")) {
+    return "timeout";
+  }
+  if (typeof error?.code === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(error.code)) {
+    return error.code;
+  }
+  return "key_test_failed";
+}
 
 export async function verifyTurnstile(secret, token, remoteIp, expectedHostname) {
   const body = new FormData();
@@ -304,10 +361,12 @@ function renderForm(env, url, uuidSession, request, notice = "", currentStatus =
   `);
 }
 
-function renderDashboard(env, url, invite, request, notice = "", currentStatus = null, csrf = "") {
+function renderDashboard(env, url, invite, request, notice = "", currentStatus = null, csrf = "", noticeTone = "success") {
   const configs = getInviteApiConfigs(invite, env, request);
   const statusText = renderCurrentIpStatus(currentStatus);
   const shouldShowAddIp = !currentStatus || (!currentStatus.ok && !currentStatus.error);
+  const noticeClass = noticeTone === "error" ? "warning" : "success";
+  const noticeRole = noticeTone === "error" ? "alert" : "status";
   return page("Sub2API Access", (nonce) => `
     <section class="hero">
       ${sub2apiIcon()}
@@ -316,7 +375,7 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
       <p class="lede">UUID ${escapeHtml(invite.uuid)} is signed in on this browser.</p>
     </section>
     <section class="panel dashboard">
-      ${notice ? `<p class="success">${notice}</p>` : ""}
+      ${notice ? `<p class="${noticeClass}" role="${noticeRole}">${escapeHtml(notice)}</p>` : ""}
       ${statusText}
       ${shouldShowAddIp ? `<form id="allow-network-form" method="post" action="${escapeHtml(url.pathname)}">
         <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
@@ -325,7 +384,7 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
       </form>` : ""}
       <div class="api-list">
         ${renderSub2ApiLogin(invite)}
-        ${configs.length ? configs.map(renderApiConfig).join("") : `<p class="lede">No OpenAI API link has been configured for this UUID.</p>`}
+        ${configs.length ? configs.map((config) => renderApiConfig(config, { csrf, uuid: invite.uuid, action: url.pathname })).join("") : `<p class="lede">No OpenAI API link has been configured for this UUID.</p>`}
       </div>
       <p id="copy-status" class="copy-status" role="status" aria-live="polite"></p>
       <form method="post" action="${escapeHtml(url.pathname)}">
@@ -372,6 +431,14 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
           card?.querySelectorAll(".secret-format").forEach((code) => {
             code.textContent = shouldShow ? code.dataset.fullValue : code.dataset.maskedValue;
           });
+        });
+      });
+      document.querySelectorAll(".key-test-form").forEach((form) => {
+        form.addEventListener("submit", () => {
+          const button = form.querySelector('button[type="submit"]');
+          if (!button || button.disabled) return;
+          button.disabled = true;
+          button.textContent = "Testing...";
         });
       });
     </script>
@@ -554,13 +621,16 @@ function renderCurrentIpStatus(status) {
   return `<p class="warning">Current network is not authorized yet: ${escapeHtml(values)}. IPv4 uses the full /24 network.</p>`;
 }
 
-function renderApiConfig(config) {
+function renderApiConfig(config, { csrf = "", uuid = "", action = "/allow-ip" } = {}) {
   const key = config.apiKey || "";
   const curl = `curl ${config.baseUrl}/chat/completions -H "Authorization: Bearer ${key}"`;
   const maskedCurl = `curl ${config.baseUrl}/chat/completions -H "Authorization: Bearer ${maskSecret(key)}"`;
+  const groupLabel = String(config.groupName || "").trim();
+  const configId = String(config.id || "sub2api-sync");
   return `
     <div class="api-card">
       <strong>${escapeHtml(displayApiName(config.name))}</strong>
+      ${groupLabel ? `<p class="hint">Key group: ${escapeHtml(groupLabel)}</p>` : ""}
       <label>Base URL</label>
       <div class="copy-line"><code>${escapeHtml(config.baseUrl)}</code><button class="ghost compact copy-value" type="button" data-copy="${escapeHtml(config.baseUrl)}">Copy</button></div>
       <label>API key</label>
@@ -571,6 +641,14 @@ function renderApiConfig(config) {
       </div>
       <label>OpenAI format</label>
       <div class="copy-line"><code class="secret-format" data-masked-value="${escapeHtml(maskedCurl)}" data-full-value="${escapeHtml(curl)}">${escapeHtml(maskedCurl)}</code><button class="ghost compact copy-value" type="button" data-copy="${escapeHtml(curl)}">Copy</button></div>
+      ${csrf && uuid ? `
+        <form class="key-test-form" method="post" action="${escapeHtml(action)}">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
+          <input type="hidden" name="action" value="test_api_key" />
+          <input type="hidden" name="config_id" value="${escapeHtml(configId)}" />
+          <button class="ghost-wide" type="submit"${key ? "" : " disabled"}>Test API key</button>
+        </form>
+      ` : ""}
     </div>
   `;
 }
@@ -908,14 +986,14 @@ function page(title, body) {
     }
     .panel, .message {
       padding: 24px;
-      border: 0.5px solid rgba(0, 0, 0, 0.06);
-      border-radius: 8px;
-      background: #fff;
+      border: 0.5px solid rgba(255, 255, 255, 0.62);
+      border-radius: 20px;
+      background: rgba(255, 255, 255, 0.64);
       box-shadow:
         0 1px 3px rgba(0, 0, 0, 0.04),
         0 8px 24px rgba(0, 0, 0, 0.06);
-      backdrop-filter: none;
-      -webkit-backdrop-filter: none;
+      backdrop-filter: blur(20px) saturate(180%);
+      -webkit-backdrop-filter: blur(20px) saturate(180%);
     }
     label {
       color: #1d1d1f;
@@ -1063,10 +1141,11 @@ function page(title, body) {
     .api-list, .api-card { display: grid; gap: 12px; }
     .api-card {
       padding: 16px;
-      border: 0.5px solid rgba(0, 0, 0, 0.06);
-      border-radius: 8px;
-      background: rgba(0, 0, 0, 0.02);
+      border: 0.5px solid rgba(255, 255, 255, 0.55);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.4);
     }
+    .key-test-form { margin: 0; }
     .api-card strong {
       overflow-wrap: anywhere;
     }
@@ -1166,7 +1245,7 @@ function page(title, body) {
       form { gap: 12px; }
       h1 { font-size: 28px; }
       .identity-title { font-size: 24px; line-height: 1.15; }
-      .panel, .message { padding: 16px; border-radius: 8px; }
+      .panel, .message { padding: 16px; border-radius: 16px; }
       .copy-line, .secret-copy-line { grid-template-columns: minmax(0, 1fr); }
       button, a { width: 100%; }
       button.ghost, button.compact { width: auto; }
@@ -1207,11 +1286,13 @@ function page(title, body) {
       .turnstile-control[data-state="expired"] .turnstile-status,
       .copy-status[role="alert"] { color: #ffb340; }
       .panel, .message {
-        border-color: rgba(255, 255, 255, 0.08);
-        background: #1c1c1e;
+        border-color: rgba(255, 255, 255, 0.14);
+        background: rgba(28, 28, 30, 0.62);
         box-shadow:
           0 1px 3px rgba(0, 0, 0, 0.2),
           0 8px 24px rgba(0, 0, 0, 0.3);
+        backdrop-filter: blur(20px) saturate(180%);
+        -webkit-backdrop-filter: blur(20px) saturate(180%);
       }
       label, input { color: #f5f5f7; }
       .secret-field {

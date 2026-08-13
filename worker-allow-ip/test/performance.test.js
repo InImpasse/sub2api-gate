@@ -7,7 +7,10 @@ test("public GET path does not synchronize Sub2API", async () => {
   const source = await readFile(new URL("../src/index.js", import.meta.url), "utf8");
   assert.doesNotMatch(source, /refreshInviteForDisplay/);
   assert.doesNotMatch(source, /refreshInviteFromSub2Api/);
-  assert.doesNotMatch(source, /blur\(20px\)/);
+  assert.match(source, /backdrop-filter: blur\(20px\) saturate\(180%\)/);
+  assert.match(source, /background: rgba\(255, 255, 255, 0\.04\)/);
+  assert.doesNotMatch(source, /gradient\(/);
+  assert.doesNotMatch(source, /ambient-orb/);
   assert.match(source, /<p>\$\{escapeHtml\(message\)\}<\/p>/);
   assert.match(source, /button:focus-visible/);
   assert.match(source, /prefers-reduced-motion/);
@@ -22,6 +25,7 @@ test("admin GET path does not run full invite synchronization", async () => {
   assert.match(source, /ADMIN_IP_GROUP_PAGE_SIZE = 20/);
   assert.match(source, /ADMIN_LIST_HTML_MAX_BYTES = 96 \* 1024/);
   assert.match(source, /ADMIN_DETAIL_HTML_MAX_BYTES = 128 \* 1024/);
+  assert.match(source, /ADMIN_EDIT_HTML_MAX_BYTES = 160 \* 1024/);
   assert.doesNotMatch(source, /hydrateAdminInvites/);
   assert.match(source, /ADMIN_RECORD_PAYLOAD_MAX_BYTES = 256 \* 1024/);
   assert.doesNotMatch(source, /getInvitesWithRecords/);
@@ -34,6 +38,11 @@ test("admin GET path does not run full invite synchronization", async () => {
   assert.doesNotMatch(source, /api\.ip\.sb/);
   assert.match(source, /summary:focus-visible/);
   assert.match(source, /prefers-reduced-motion/);
+  assert.match(source, /backdrop-filter: blur\(20px\) saturate\(180%\)/);
+  assert.match(source, /background: rgba\(255, 255, 255, 0\.04\)/);
+  assert.doesNotMatch(source, /gradient\(/);
+  assert.doesNotMatch(source, /ambient-orb/);
+  assert.match(source, /view === "create" \|\| view === "edit"/);
 });
 
 test("Worker runtime configuration enables current Node compatibility", async () => {

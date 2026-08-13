@@ -13,8 +13,8 @@
       color-scheme: light;
       --bg: #edf2f4;
       --bg-strong: #e2e9ec;
-      --surface: rgba(255, 255, 255, 0.92);
-      --surface-strong: #ffffff;
+      --surface: rgba(255, 255, 255, 0.64);
+      --surface-strong: rgba(255, 255, 255, 0.88);
       --surface-muted: rgba(25, 59, 68, 0.07);
       --text: #172126;
       --text-soft: #4b5c64;
@@ -30,12 +30,12 @@
       --error-soft: rgba(163, 52, 34, 0.12);
       --shadow-lg: 0 24px 80px rgba(13, 35, 42, 0.12);
       --shadow-md: 0 14px 36px rgba(13, 35, 42, 0.08);
-      --radius-xl: 8px;
-      --radius-lg: 8px;
-      --radius-md: 8px;
-      --radius-sm: 6px;
-      --font-display: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, Georgia, serif;
-      --font-body: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+      --radius-xl: 20px;
+      --radius-lg: 16px;
+      --radius-md: 12px;
+      --radius-sm: 8px;
+      --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", system-ui, sans-serif;
+      --font-body: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
       --font-mono: "SFMono-Regular", "Cascadia Code", "Fira Code", Consolas, monospace;
     }
 
@@ -44,8 +44,8 @@
         color-scheme: dark;
         --bg: #101416;
         --bg-strong: #182023;
-        --surface: rgba(29, 39, 43, 0.94);
-        --surface-strong: #222d31;
+        --surface: rgba(28, 28, 30, 0.62);
+        --surface-strong: rgba(34, 45, 49, 0.88);
         --surface-muted: rgba(214, 239, 241, 0.06);
         --text: #f3f7f8;
         --text-soft: #b8c7cc;
@@ -87,7 +87,8 @@
     }
 
     button,
-    input {
+    input,
+    select {
       font: inherit;
     }
 
@@ -107,6 +108,7 @@
     button:focus-visible,
     a:focus-visible,
     input:focus-visible,
+    select:focus-visible,
     .tab:focus-visible {
       outline: 3px solid var(--accent-soft);
       outline-offset: 2px;
@@ -164,9 +166,10 @@
 
     .intro-panel,
     .workspace {
-      border: 1px solid var(--line);
+      border: 0.5px solid rgba(255, 255, 255, 0.55);
       background: var(--surface);
-      backdrop-filter: none;
+      backdrop-filter: blur(20px) saturate(180%);
+      -webkit-backdrop-filter: blur(20px) saturate(180%);
       box-shadow: var(--shadow-lg);
     }
 
@@ -515,6 +518,17 @@
       background: transparent;
       font-size: 15px;
       padding: 0 14px;
+    }
+
+    select {
+      width: 100%;
+      min-height: 44px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      padding: 0 12px;
+      color: var(--text);
+      background: var(--surface-strong);
+      font-size: 15px;
     }
 
     input::placeholder {
@@ -1007,19 +1021,22 @@
         username: "alice",
         email: "alice@sub2api.local",
         uuid: "c1f3d8f1-3d45-4de8-8a1d-2f8c1d4c1022",
-        remark: "Engineering sandbox"
+        remark: "Engineering sandbox",
+        keyGroup: "openai-default"
       },
       {
         username: "ops-oncall",
         email: "ops@sub2api.local",
         uuid: "df0d3ec4-45b0-4aa8-a1d5-b1a4f62ef114",
-        remark: "Temporary incident access"
+        remark: "Temporary incident access",
+        keyGroup: "openai-default"
       },
       {
         username: "research.demo",
         email: "research@sub2api.local",
         uuid: "96d54165-f38d-4f80-9888-5d78b8263f9c",
-        remark: "Product evaluation account"
+        remark: "Product evaluation account",
+        keyGroup: "grok"
       }
     ];
 
@@ -1321,6 +1338,9 @@
               <button class="ghost compact toggle-dashboard-secret" type="button" aria-pressed="false">Show</button>
               <button class="ghost compact copy-value" type="button" data-copy="${esc(apiKey)}">Copy</button>
             </div>
+            <p class="panel-subtitle">Key group: openai-default. The legacy default group is not available.</p>
+            <button class="ghost-wide" type="button" id="testApiKey">Test API key</button>
+            <p id="keyTestStatus" class="copy-status" role="status" aria-live="polite"></p>
             <label>CLI example</label>
             <div class="copy-line">
               <code class="secret-format" data-masked-value="${esc(maskedCurl)}" data-full-value="${esc(curl)}">${esc(maskedCurl)}</code>
@@ -1352,6 +1372,7 @@
           </div>
           <small>${esc(user.email)}</small>
           <code>${esc(user.uuid)}</code>
+          <small>Key group: ${esc(user.keyGroup || "openai-default")}</small>
           <small>${esc(user.remark || "No remark provided")}</small>
         </article>
       `).join("");
@@ -1428,6 +1449,14 @@
               <div class="field span-2">
                 <label for="a-remark">Remark</label>
                 <input id="a-remark" placeholder="Engineering sandbox" />
+              </div>
+              <div class="field span-2">
+                <label for="a-group">Key group</label>
+                <select id="a-group" required>
+                  <option value="openai-default" selected>openai-default</option>
+                  <option value="grok">grok</option>
+                </select>
+                <p class="field-hint">New keys are created in this model group. The legacy default group is not available.</p>
               </div>
               <div class="action-row span-2">
                 <button class="btn-primary" type="submit">Add user</button>
@@ -1648,6 +1677,7 @@
       const uuidInput = document.getElementById("a-uuid");
       const emailInput = document.getElementById("a-email");
       const remarkInput = document.getElementById("a-remark");
+      const groupInput = document.getElementById("a-group");
       const statusEl = document.getElementById("adminStatus");
 
       if (uuidInput && !uuidInput.value) {
@@ -1661,7 +1691,7 @@
         });
       }
 
-      if (addUserForm && usernameInput && uuidInput && emailInput && remarkInput && statusEl) {
+      if (addUserForm && usernameInput && uuidInput && emailInput && remarkInput && groupInput && statusEl) {
         addUserForm.addEventListener("submit", (event) => {
           event.preventDefault();
           const username = normalizeUsername(usernameInput.value);
@@ -1689,23 +1719,42 @@
           }
 
           const email = emailInput.value.trim() || `${username}@sub2api.local`;
+          const keyGroup = groupInput.value === "grok" ? "grok" : "openai-default";
           adminUsers.unshift({
             username,
             email,
             uuid: uuidInput.value.trim() || crypto.randomUUID(),
-            remark: remarkInput.value.trim()
+            remark: remarkInput.value.trim(),
+            keyGroup
           });
 
           addUserForm.reset();
           uuidInput.value = crypto.randomUUID();
           adminStatusKind = "";
-          adminStatusMessage = `Added "${username}". In production this would also provision the Sub2API user and API key.`;
+          adminStatusMessage = `Added "${username}" in ${keyGroup}. In production this would also provision the Sub2API user and API key.`;
           statusEl.className = "admin-status";
           statusEl.textContent = adminStatusMessage;
 
           view = "admin";
           render();
           switchTab("users");
+        });
+      }
+
+      const testApiKey = document.getElementById("testApiKey");
+      if (testApiKey) {
+        testApiKey.addEventListener("click", () => {
+          const status = document.getElementById("keyTestStatus");
+          testApiKey.disabled = true;
+          testApiKey.textContent = "Testing...";
+          window.setTimeout(() => {
+            testApiKey.disabled = false;
+            testApiKey.textContent = "Test API key";
+            if (status) {
+              status.setAttribute("role", "status");
+              status.textContent = "API key works. HTTP 200. 2 models; first model gpt-5.6-sol.";
+            }
+          }, 160);
         });
       }
 
@@ -1716,6 +1765,7 @@
           emailInput.value = "alice2@sub2api.local";
           uuidInput.value = crypto.randomUUID();
           remarkInput.value = "Intentional duplicate";
+          if (groupInput) groupInput.value = "openai-default";
           usernameInput.focus();
           adminStatusKind = "";
           adminStatusMessage = 'Filled with "Alice!!" which normalizes to an existing username. Submit to preview the duplicate check.';
