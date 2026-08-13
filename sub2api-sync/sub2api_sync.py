@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from usage_metadata import (
@@ -43,6 +44,17 @@ LOGIN_ACTION_TIMEOUT_SECONDS = 8
 LOGIN_UPSTREAM_TIMEOUT_SECONDS = 5
 HEALTH_ACTION_TIMEOUT_SECONDS = 2
 HEALTH_DEPENDENCY_TIMEOUT_SECONDS = 1
+KEY_TEST_ACTION_TIMEOUT_SECONDS = 3
+KEY_TEST_UPSTREAM_TIMEOUT_SECONDS = 2
+MAX_KEY_TEST_RESPONSE_BYTES = 16 * 1024
+MAX_GROUP_CATALOG = 32
+GROUP_CATALOG_TTL_SECONDS = 30
+GROUP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+MODEL_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
+FORBIDDEN_GROUP_NAMES = frozenset({"default"})
+INTERNAL_LOGIN_PATH = "/api/v1/auth/login"
+INTERNAL_MODELS_PATH = "/v1/models"
+INTERNAL_HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 DEFAULT_DB_CLIENT_TIMEOUT_SECONDS = 4
 DEFAULT_DB_STATEMENT_TIMEOUT_MS = 3_000
 USAGE_DB_STATEMENT_TIMEOUT_MS = 2_000
@@ -65,6 +77,8 @@ SYNC_ACTIONS = frozenset({
     "purge",
     "usage_logs_list",
     "usage_log_detail",
+    "list_groups",
+    "test_api_key",
 })
 LOGIN_USER_FIELDS = (
     "id",
@@ -80,6 +94,8 @@ LOGIN_USER_FIELDS = (
 )
 _DATABASE_TRANSACTION = threading.local()
 _REQUEST_CONTEXT = threading.local()
+_GROUP_CATALOG_LOCK = threading.Lock()
+_GROUP_CATALOG = {"expires_at": 0.0, "groups": None}
 
 
 def env_int(name, default):
@@ -96,6 +112,8 @@ def action_deadline(action, started_at=None):
         if action == "login"
         else HEALTH_ACTION_TIMEOUT_SECONDS
         if action == "health"
+        else KEY_TEST_ACTION_TIMEOUT_SECONDS
+        if action == "test_api_key"
         else DEFAULT_ACTION_TIMEOUT_SECONDS
     )
     previous = getattr(_REQUEST_CONTEXT, "deadline", None)
@@ -620,10 +638,13 @@ def requested_tokens(payload):
         if not key or key in seen:
             continue
         seen.add(key)
-        result.append({
+        token = {
             "key": key,
             "name": clean_key_name(item.get("tokenName") or item.get("apiKeyName") or DEFAULT_KEY_NAME),
-        })
+        }
+        if item.get("groupName"):
+            token["groupName"] = validate_group_name(item.get("groupName"))
+        result.append(token)
         if len(result) > MAX_USER_API_KEYS:
             raise RuntimeError("api_key_limit_exceeded")
     return result
@@ -651,18 +672,57 @@ def configured_groups():
     groups = []
     seen = set()
     for part in str(raw).split(","):
-        group = part.strip()[:100]
-        if not group or group in seen:
+        candidate = part.strip()[:100]
+        try:
+            group = validate_group_name(candidate)
+        except ValueError:
+            continue
+        if group in seen:
             continue
         seen.add(group)
         groups.append(group)
     return groups or ["openai-default"]
 
 
+def validate_group_name(value):
+    name = str(value or "").strip()
+    if not name or not GROUP_NAME_RE.fullmatch(name):
+        raise ValueError("invalid_group")
+    if name.lower() in FORBIDDEN_GROUP_NAMES:
+        raise ValueError("invalid_group")
+    return name
+
+
+def requested_groups(payload):
+    names = []
+    if "allowedGroups" in payload:
+        raw = payload.get("allowedGroups")
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("invalid_group")
+        names.extend(raw)
+    elif isinstance(payload.get("groupNames"), list):
+        names.extend(payload.get("groupNames") or [])
+    if isinstance(payload.get("tokens"), list):
+        for item in payload.get("tokens") or []:
+            if isinstance(item, dict) and item.get("groupName"):
+                names.append(item.get("groupName"))
+    seen = []
+    for name in names:
+        group = validate_group_name(name)
+        if group in seen:
+            continue
+        seen.append(group)
+        if len(seen) > MAX_GROUP_CATALOG:
+            raise ValueError("too_many_groups")
+    return seen or list(configured_groups())
+
+
 def group_profile(group):
     name = str(group or "").strip().lower()
     if name == "default" or name.startswith("openai"):
         return "openai", "OpenAI-compatible gateway"
+    if name.startswith("grok") or name.startswith("xai"):
+        return "openai", "Grok gateway"
     if name.startswith("anthropic"):
         return "anthropic", "Anthropic gateway"
     if name.startswith("gemini"):
@@ -673,27 +733,103 @@ def group_profile(group):
 
 
 def ensure_group(group):
-    platform, description = group_profile(group)
+    name = validate_group_name(group)
+    platform, description = group_profile(name)
     psql(
         "INSERT INTO groups "
         "(name,description,platform,subscription_type,rate_multiplier,status,allow_messages_dispatch,created_at,updated_at) "
         "SELECT "
-        f"{sql_quote(group)},{sql_quote(description)},"
+        f"{sql_quote(name)},{sql_quote(description)},"
         f"{sql_quote(platform)},'standard',0,'active',true,now(),now() "
-        f"WHERE NOT EXISTS (SELECT 1 FROM groups WHERE name={sql_quote(group)} AND deleted_at IS NULL);"
+        f"WHERE NOT EXISTS (SELECT 1 FROM groups WHERE name={sql_quote(name)} AND deleted_at IS NULL);"
         "UPDATE groups SET subscription_type='standard', rate_multiplier=0, "
         f"description=CASE WHEN COALESCE(description,'')='' THEN {sql_quote(description)} ELSE description END, "
         "status='active', allow_messages_dispatch=true, updated_at=now() "
-        f"WHERE name={sql_quote(group)} AND deleted_at IS NULL;"
+        f"WHERE name={sql_quote(name)} AND deleted_at IS NULL;"
     )
-    row = first_row(f"SELECT id FROM groups WHERE name={sql_quote(group)} AND deleted_at IS NULL LIMIT 1;")
-    if not row:
+    group_id = lookup_active_group_id(name)
+    if not group_id:
         raise RuntimeError("sub2api group not found")
-    return int(row[0])
+    return group_id
+
+
+def lookup_active_group_id(group):
+    name = validate_group_name(group)
+    row = first_row(
+        "SELECT id FROM groups "
+        f"WHERE name={sql_quote(name)} AND deleted_at IS NULL "
+        "AND status='active' LIMIT 1;"
+    )
+    return int(row[0]) if row else None
 
 
 def ensure_groups():
     return [(group, ensure_group(group)) for group in configured_groups()]
+
+
+def resolve_provision_groups(payload):
+    requested = requested_groups(payload)
+    configured = configured_groups()
+    if requested == configured:
+        return ensure_groups()
+    configured_set = set(configured)
+    resolved = []
+    for name in requested:
+        if name in configured_set:
+            resolved.append((name, ensure_group(name)))
+            continue
+        group_id = lookup_active_group_id(name)
+        if group_id is None:
+            raise ValueError("unknown_group")
+        resolved.append((name, group_id))
+    return resolved
+
+
+def load_group_catalog(force=False):
+    now = time.monotonic()
+    with _GROUP_CATALOG_LOCK:
+        cached = _GROUP_CATALOG.get("groups")
+        expires_at = float(_GROUP_CATALOG.get("expires_at") or 0)
+        if not force and cached is not None and expires_at > now:
+            return list(cached)
+    catalog = []
+    seen = set()
+    group_rows = rows(
+        "SELECT id,LEFT(COALESCE(name,''),64),LEFT(COALESCE(platform,''),32) "
+        "FROM groups "
+        "WHERE deleted_at IS NULL AND status='active' "
+        f"ORDER BY name LIMIT {MAX_GROUP_CATALOG + 1};"
+    )
+    for row in group_rows:
+        if len(catalog) >= MAX_GROUP_CATALOG:
+            break
+        try:
+            name = validate_group_name(row[1] if len(row) > 1 else "")
+        except (ValueError, IndexError):
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        catalog.append({
+            "id": int(row[0]),
+            "name": name,
+            "platform": str(row[2] if len(row) > 2 else "")[:32],
+        })
+    with _GROUP_CATALOG_LOCK:
+        _GROUP_CATALOG["groups"] = list(catalog)
+        _GROUP_CATALOG["expires_at"] = time.monotonic() + GROUP_CATALOG_TTL_SECONDS
+    return catalog
+
+
+def list_groups(_payload):
+    with database_transaction():
+        groups = load_group_catalog()
+    return {
+        "ok": True,
+        "action": "list_groups",
+        "groups": groups,
+        "syncedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
 
 
 def subscription_days():
@@ -738,11 +874,13 @@ def ensure_default_subscription(user_id, group_id):
 
 def get_user_keys(user_id):
     key_rows = rows(
-        "SELECT id,LEFT(COALESCE(name,''),100),LEFT(COALESCE(key,''),128),"
-        "LEFT(COALESCE(status,''),16),LEFT(COALESCE(quota::text,'0'),64),"
-        "LEFT(COALESCE(quota_used::text,'0'),64) "
-        f"FROM api_keys WHERE user_id={int(user_id)} AND deleted_at IS NULL "
-        f"ORDER BY id LIMIT {MAX_USER_API_KEYS + 1};"
+        "SELECT api_keys.id,LEFT(COALESCE(api_keys.name,''),100),LEFT(COALESCE(api_keys.key,''),128),"
+        "LEFT(COALESCE(api_keys.status,''),16),LEFT(COALESCE(api_keys.quota::text,'0'),64),"
+        "LEFT(COALESCE(api_keys.quota_used::text,'0'),64),LEFT(COALESCE(groups.name,''),64) "
+        "FROM api_keys "
+        "LEFT JOIN groups ON groups.id = api_keys.group_id "
+        f"WHERE api_keys.user_id={int(user_id)} AND api_keys.deleted_at IS NULL "
+        f"ORDER BY api_keys.id LIMIT {MAX_USER_API_KEYS + 1};"
     )
     if len(key_rows) > MAX_USER_API_KEYS:
         raise RuntimeError("api_key_limit_exceeded")
@@ -756,6 +894,7 @@ def get_user_keys(user_id):
             "status": 1 if row[3] == "active" else 0,
             "quota": float(row[4] or 0),
             "quotaUsed": float(row[5] or 0),
+            "groupName": row[6] if len(row) >= 7 else "",
         }
         for row in key_rows
         if len(row) >= 6
@@ -770,6 +909,10 @@ def sync_user_keys(user_id, group_id, tokens):
     for token in tokens:
         key = token["key"]
         name = token["name"]
+        token_group_id = group_id
+        token_group_name = str(token.get("groupName") or "").strip()
+        if token_group_name:
+            token_group_id = lookup_active_group_id(token_group_name) or group_id
         existing_key = first_row(
             "SELECT id,user_id,COALESCE(deleted_at::text,'') FROM api_keys "
             f"WHERE key={sql_quote(key, 128)} LIMIT 1;"
@@ -782,7 +925,7 @@ def sync_user_keys(user_id, group_id, tokens):
                 raise RuntimeError("requested api key is already assigned to another active user")
             psql(
                 "UPDATE api_keys SET "
-                f"user_id={int(user_id)}, key={sql_quote(key, 128)}, name={sql_quote(name, 100)}, group_id={int(group_id)}, "
+                f"user_id={int(user_id)}, key={sql_quote(key, 128)}, name={sql_quote(name, 100)}, group_id={int(token_group_id)}, "
                 "status='active', quota=0, expires_at=NULL, deleted_at=NULL, updated_at=now() "
                 f"WHERE id={api_key_id};"
             )
@@ -791,7 +934,7 @@ def sync_user_keys(user_id, group_id, tokens):
                 "INSERT INTO api_keys "
                 "(user_id,key,name,group_id,status,quota,quota_used,created_at,updated_at) "
                 "VALUES "
-                f"({int(user_id)},{sql_quote(key, 128)},{sql_quote(name, 100)},{int(group_id)},'active',0,0,now(),now());"
+                f"({int(user_id)},{sql_quote(key, 128)},{sql_quote(name, 100)},{int(token_group_id)},'active',0,0,now(),now());"
             )
             api_key_id = int(first_row(f"SELECT id FROM api_keys WHERE key={sql_quote(key, 128)} LIMIT 1;")[0])
 
@@ -845,7 +988,7 @@ def _provision(payload):
             include_deleted=True,
         )
 
-    groups = ensure_groups()
+    groups = resolve_provision_groups(payload)
     primary_group_id = groups[0][1]
     for _group_name, group_id in groups:
         ensure_subscription_plan(group_id)
@@ -1237,6 +1380,171 @@ def _redis_read(stream):
     raise RuntimeError("redis_protocol_error")
 
 
+def internal_models_url():
+    raw = os.environ.get(
+        "SUB2API_INTERNAL_LOGIN_URL",
+        "http://127.0.0.1:8080/api/v1/auth/login",
+    )
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("invalid_internal_login_url")
+    if parsed.path != INTERNAL_LOGIN_PATH or parsed.query or parsed.fragment:
+        raise ValueError("invalid_internal_login_url")
+    if parsed.username or parsed.password:
+        raise ValueError("invalid_internal_login_url")
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in {"127.0.0.1", "localhost"} and not INTERNAL_HOST_RE.fullmatch(hostname):
+        raise ValueError("invalid_internal_login_url")
+    return urllib.parse.urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        INTERNAL_MODELS_PATH,
+        "",
+        "",
+    ))
+
+
+def _key_test_error_code(status):
+    if status == 401:
+        return "unauthorized"
+    if status == 403:
+        return "forbidden"
+    if status == 404:
+        return "not_found"
+    if status == 429:
+        return "rate_limited"
+    if 500 <= status <= 599:
+        return "upstream_error"
+    return "request_failed"
+
+
+def _sanitize_models_probe(payload):
+    if not isinstance(payload, dict):
+        return 0, ""
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return 0, ""
+    count = 0
+    model_id = ""
+    for item in data[:256]:
+        if not isinstance(item, dict):
+            continue
+        ident = item.get("id")
+        if not isinstance(ident, str) or not MODEL_ID_RE.fullmatch(ident):
+            continue
+        count += 1
+        if not model_id:
+            model_id = ident[:128]
+    return count, model_id
+
+
+def test_api_key(payload):
+    uuid, legacy_username, username = payload_identity(payload)
+    user_id = payload_user_id(payload)
+    api_key_id = payload_token_id(payload)
+    with database_transaction():
+        user = resolve_invite_user(
+            uuid,
+            legacy_username,
+            username,
+            user_id=user_id,
+            api_key_id=api_key_id,
+            allow_bind=False,
+        )
+        if not user:
+            raise RuntimeError("invite_identity_mismatch")
+        owner_id = int(user[0])
+        if api_key_id > 0:
+            key_row = first_row(
+                "SELECT id,LEFT(COALESCE(key,''),128) FROM api_keys "
+                f"WHERE id={int(api_key_id)} AND user_id={owner_id} "
+                "AND deleted_at IS NULL AND status='active' LIMIT 1;"
+            )
+        else:
+            key_row = first_row(
+                "SELECT id,LEFT(COALESCE(key,''),128) FROM api_keys "
+                f"WHERE user_id={owner_id} AND deleted_at IS NULL AND status='active' "
+                "ORDER BY id LIMIT 1;"
+            )
+        if not key_row:
+            raise ValueError("api_key_not_found")
+        api_key_id = int(key_row[0])
+        token = str(key_row[1] or "")
+        if not is_api_key(token):
+            raise ValueError("api_key_not_found")
+
+    started = time.monotonic()
+    result = {
+        "ok": True,
+        "action": "test_api_key",
+        "uuid": uuid,
+        "apiKeyId": api_key_id,
+        "tokenId": api_key_id,
+        "tested": False,
+        "httpStatus": 0,
+        "errorCode": "",
+        "modelCount": 0,
+        "modelId": "",
+        "latencyMs": 0,
+        "syncedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    request = urllib.request.Request(
+        internal_models_url(),
+        method="GET",
+        headers={
+            "authorization": "Bearer " + token,
+            "accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(
+            request, timeout=remaining_timeout(KEY_TEST_UPSTREAM_TIMEOUT_SECONDS)
+        ) as response:
+            result["httpStatus"] = int(getattr(response, "status", 200) or 200)
+            declared_length = response.headers.get("content-length", "")
+            if declared_length:
+                try:
+                    if int(declared_length) > MAX_KEY_TEST_RESPONSE_BYTES:
+                        result["errorCode"] = "response_too_large"
+                        result["latencyMs"] = int((time.monotonic() - started) * 1000)
+                        return result
+                except ValueError:
+                    result["errorCode"] = "invalid_response"
+                    result["latencyMs"] = int((time.monotonic() - started) * 1000)
+                    return result
+            body = response.read(MAX_KEY_TEST_RESPONSE_BYTES + 1)
+            if len(body) > MAX_KEY_TEST_RESPONSE_BYTES:
+                result["errorCode"] = "response_too_large"
+                result["latencyMs"] = int((time.monotonic() - started) * 1000)
+                return result
+            try:
+                payload_json = json.loads(body.decode())
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                result["errorCode"] = "invalid_response"
+                result["latencyMs"] = int((time.monotonic() - started) * 1000)
+                return result
+            count, model_id = _sanitize_models_probe(payload_json)
+            result["tested"] = result["httpStatus"] == 200
+            result["modelCount"] = count
+            result["modelId"] = model_id
+    except urllib.error.HTTPError as error:
+        result["httpStatus"] = int(error.code or 0)
+        result["errorCode"] = _key_test_error_code(result["httpStatus"])
+        try:
+            error.read(MAX_KEY_TEST_RESPONSE_BYTES)
+        except Exception:
+            pass
+    except urllib.error.URLError as error:
+        timed_out = isinstance(getattr(error, "reason", None), (TimeoutError, socket.timeout))
+        result["errorCode"] = "timeout" if timed_out else "upstream_unavailable"
+        result["httpStatus"] = 0
+    except (TimeoutError, socket.timeout, subprocess.TimeoutExpired):
+        result["errorCode"] = "timeout"
+        result["httpStatus"] = 0
+    result["latencyMs"] = int((time.monotonic() - started) * 1000)
+    return result
+
+
 def claim_nonce(nonce):
     nonce_key = "sub2api-sync:nonce:" + hashlib.sha256(nonce.encode()).hexdigest()
     return redis_command("SET", nonce_key, "1", "NX", "EX", NONCE_TTL_SECONDS) == "OK"
@@ -1286,6 +1594,10 @@ def dispatch_action(action, payload):
         return list_usage_logs(payload)
     if action == "usage_log_detail":
         return get_usage_log_detail(payload)
+    if action == "list_groups":
+        return list_groups(payload)
+    if action == "test_api_key":
+        return test_api_key(payload)
     raise ValueError("invalid action")
 
 

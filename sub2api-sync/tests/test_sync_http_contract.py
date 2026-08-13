@@ -105,6 +105,8 @@ class SyncHttpContractTests(unittest.TestCase):
             handler_name = {
                 "usage_logs_list": "list_usage_logs",
                 "usage_log_detail": "get_usage_log_detail",
+                "list_groups": "list_groups",
+                "test_api_key": "test_api_key",
             }.get(action, action)
             patches.append(
                 mock.patch.object(SYNC, handler_name, side_effect=side_effect)
@@ -139,6 +141,58 @@ class SyncHttpContractTests(unittest.TestCase):
                 "requestId": "req-contract-1",
             },
         )
+
+    def test_list_groups_and_test_api_key_are_accepted_actions(self):
+        with RunningSyncServer() as server:
+            status, response_headers, payload = self.signed_action_request(
+                server,
+                "list_groups",
+                request_id="req-groups-ok",
+                side_effect=lambda _payload: {
+                    "ok": True,
+                    "action": "list_groups",
+                    "groups": [{"id": 2, "name": "openai-default"}],
+                },
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(response_headers["x-request-id"], "req-groups-ok")
+        self.assertEqual(payload["action"], "list_groups")
+        self.assertEqual(payload["groups"][0]["name"], "openai-default")
+        self.assertNotIn("prompt", json.dumps(payload))
+
+        with RunningSyncServer() as server:
+            status, _headers, payload = self.signed_action_request(
+                server,
+                "test_api_key",
+                request_id="req-key-test-ok",
+                side_effect=lambda _payload: {
+                    "ok": True,
+                    "action": "test_api_key",
+                    "tested": True,
+                    "httpStatus": 200,
+                    "modelCount": 1,
+                    "modelId": "gpt-5.6-sol",
+                },
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["tested"])
+        encoded = json.dumps(payload)
+        self.assertNotIn("choices", encoded)
+        self.assertNotIn("sk-", encoded)
+
+    def test_missing_api_key_maps_to_stable_bad_request(self):
+        with RunningSyncServer() as server:
+            status, _headers, payload = self.signed_action_request(
+                server,
+                "test_api_key",
+                request_id="req-key-missing",
+                side_effect=ValueError("api_key_not_found"),
+            )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"], "invalid_request")
+        self.assertFalse(payload["retryable"])
+        self.assertEqual(payload["action"], "test_api_key")
+        self.assertNotIn("api_key_not_found", json.dumps(payload))
 
     def test_malformed_json_is_a_bounded_non_retryable_bad_request(self):
         body = b'{"action":'
