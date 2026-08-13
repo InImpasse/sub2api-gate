@@ -43,6 +43,8 @@ test("admin GET path does not run full invite synchronization", async () => {
   assert.doesNotMatch(source, /gradient\(/);
   assert.doesNotMatch(source, /ambient-orb/);
   assert.match(source, /view === "create" \|\| view === "edit"/);
+  assert.match(source, /PENDING_LOGIN_TTL_SECONDS = 5 \* 60/);
+  assert.match(source, /value="login_totp"/);
 });
 
 test("Worker runtime configuration enables current Node compatibility", async () => {

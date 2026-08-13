@@ -72,6 +72,46 @@ test("AuthState byte limits count UTF-8 bytes instead of JavaScript code units",
   );
 });
 
+test("AuthState admin sessions allow only the pending TOTP login phase", () => {
+  const expiresAt = Date.now() + 60_000;
+  const totpBinding = "a".repeat(64);
+  assert.deepEqual(
+    authStateTest.normalizeAdminSession({
+      csrf: "pending-csrf",
+      expiresAt,
+      totpBinding,
+      loginPhase: "totp",
+      extra: "drop-me",
+    }, Date.now()),
+    { csrf: "pending-csrf", expiresAt, totpBinding, loginPhase: "totp" },
+  );
+  assert.deepEqual(
+    authStateTest.normalizeAdminSession({
+      csrf: "full-csrf",
+      expiresAt,
+      totpBinding,
+    }, Date.now()),
+    { csrf: "full-csrf", expiresAt, totpBinding },
+  );
+  assert.throws(
+    () => authStateTest.normalizeAdminSession({
+      csrf: "bad-phase",
+      expiresAt,
+      totpBinding,
+      loginPhase: "authenticated",
+    }, Date.now()),
+    /auth_state_admin_session_invalid/,
+  );
+  assert.throws(
+    () => authStateTest.normalizeAdminSession({
+      csrf: "missing-binding",
+      expiresAt,
+      loginPhase: "totp",
+    }, Date.now()),
+    /auth_state_admin_session_invalid/,
+  );
+});
+
 test("legacy KV cleanup fails closed, retries, and never deletes records keys", async () => {
   const values = new Map([
     ["invites", "private-invite-source"],

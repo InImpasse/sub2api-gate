@@ -38,6 +38,8 @@ const COOKIE_NAME = "sub2api_allow_admin";
 const DELETE_ADMIN_COOKIE = `${COOKIE_NAME}=; Path=${ADMIN_PATH}; Max-Age=0; HttpOnly; Secure; SameSite=Strict`;
 const REQUEST_AUTH_STATE_STORE = Symbol("requestAuthStateStore");
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
+const PENDING_LOGIN_TTL_SECONDS = 5 * 60;
+const LOGIN_PHASE_TOTP = "totp";
 const ADMIN_SESSION_TOTP_BINDING_DOMAIN =
   "sub2api-gate/admin-session-totp-binding/v4\0";
 const ADMIN_SESSION_TOTP_BINDING = /^[a-f0-9]{64}$/;
@@ -171,6 +173,11 @@ async function handleAdminRequest(request, env) {
       return setResponseCookie(html(renderLogin()), hadSessionCookie ? DELETE_ADMIN_COOKIE : "");
     }
 
+    if (isPendingTotpLogin(session)) {
+      if (!isDashboardPath) return redirect(ADMIN_PATH);
+      return html(renderLoginTotp(session.csrf));
+    }
+
     if (adminUrl.pathname === `${ADMIN_PATH}/requests`) {
       const usage = await listUsageMetadata(env, request);
       return html(renderUsageInspector(usage, session.csrf, request), 200);
@@ -231,6 +238,17 @@ async function handleAdminRequest(request, env) {
   if (action === "logout") {
     await deleteSession(env, request);
     return redirect(ADMIN_PATH, DELETE_ADMIN_COOKIE);
+  }
+
+  if (isPendingTotpLogin(session)) {
+    if (action === "login_totp") {
+      return await handleAdminTotpLogin(form, env, session);
+    }
+    return html(renderLoginTotp(session.csrf, "Complete 2FA to continue."), 403);
+  }
+
+  if (action === "login_totp") {
+    return redirect(ADMIN_PATH);
   }
 
   if (requiresStepUpAction(action)) {
@@ -738,7 +756,6 @@ export async function loginInviteToSub2Api(env, invite) {
 async function handleAdminLogin(form, env, request) {
   const username = String(form.get("username") || "").trim();
   const password = String(form.get("password") || "");
-  const token = String(form.get("token") || "").replace(/\s+/g, "");
   const attemptKey = await loginAttemptKey(env, request);
   if (!(await consumeAuthAttempt(env, "admin", attemptKey))) {
     return html(renderLogin("Too many failed sign-in attempts. Try again later."), 429);
@@ -746,41 +763,47 @@ async function handleAdminLogin(form, env, request) {
 
   const usernameOk = await timingSafeEqual(username, env.ADMIN_USERNAME);
   const passwordOk = await verifyPbkdf2Password(password, env.ADMIN_PASSWORD_PBKDF2);
-  const tokenOk = await verifyAdminTotp(env, token);
 
-  if (!usernameOk || !passwordOk || !tokenOk) {
-    return html(renderLogin("The username, password, or 2FA code is incorrect."), 403);
+  if (!usernameOk || !passwordOk) {
+    return html(renderLogin("The username or password is incorrect."), 403);
   }
   await resetAuthAttempts(env, "admin", attemptKey);
 
-  const sessionToken = randomHex(32);
-  const sessionHash = await sha256Hex(sessionToken);
+  const csrf = randomHex(24);
+  const expiresAt = Date.now() + PENDING_LOGIN_TTL_SECONDS * 1000;
+  const totpBinding = await adminSessionTotpBindingForEnvironment(env);
+  const { cookie } = await persistAdminSession(env, {
+    csrf,
+    expiresAt,
+    totpBinding,
+    loginPhase: LOGIN_PHASE_TOTP,
+  }, PENDING_LOGIN_TTL_SECONDS);
+
+  return redirect(ADMIN_PATH, cookie);
+}
+
+async function handleAdminTotpLogin(form, env, session) {
+  const token = String(form.get("token") || "").replace(/\s+/g, "");
+  const attemptKey = await stepUpAttemptKey(env, session.sessionHash);
+  if (!(await consumeAuthAttempt(env, "totp", attemptKey))) {
+    return html(renderLoginTotp(session.csrf, "Too many 2FA attempts. Try again later."), 429);
+  }
+
+  const tokenOk = await verifyAdminTotp(env, token);
+  if (!tokenOk) {
+    return html(renderLoginTotp(session.csrf, "The 2FA code is incorrect."), 403);
+  }
+  await resetAuthAttempts(env, "totp", attemptKey);
+  await deleteAdminSession(env, session.sessionHash);
+
   const csrf = randomHex(24);
   const expiresAt = Date.now() + SESSION_TTL_SECONDS * 1000;
   const totpBinding = await adminSessionTotpBindingForEnvironment(env);
-
-  if (isAuthStateBindingConfigured(env)) {
-    await authStateStore(env).createAdminSession(sessionHash, {
-      csrf,
-      expiresAt,
-      totpBinding,
-    });
-  } else {
-    await env.INVITE_STORE.put(
-      sessionKey(sessionHash),
-      JSON.stringify({ csrf, expiresAt, totpBinding }),
-      { expirationTtl: SESSION_TTL_SECONDS },
-    );
-  }
-
-  const cookie = [
-    `${COOKIE_NAME}=${sessionToken}`,
-    `Path=${ADMIN_PATH}`,
-    `Max-Age=${SESSION_TTL_SECONDS}`,
-    "HttpOnly",
-    "Secure",
-    "SameSite=Strict",
-  ].join("; ");
+  const { cookie } = await persistAdminSession(env, {
+    csrf,
+    expiresAt,
+    totpBinding,
+  }, SESSION_TTL_SECONDS);
 
   return redirect(ADMIN_PATH, cookie);
 }
@@ -799,11 +822,7 @@ async function getAdminSession(request, env) {
   } else {
     const raw = await env.INVITE_STORE.get(sessionKey(sessionHash));
     if (!raw) return null;
-    const parsed = parseJson(raw, null);
-    const expiresAt = Number(parsed?.expiresAt);
-    if (parsed && parsed.csrf && Number.isFinite(expiresAt) && expiresAt > Date.now()) {
-      session = { ...parsed, expiresAt };
-    }
+    session = parseKvAdminSession(parseJson(raw, null));
   }
 
   if (!session || !(await sessionMatchesAdminTotpBinding(session, env))) {
@@ -829,6 +848,53 @@ async function deleteAdminSession(env, sessionHash) {
   } else {
     await env.INVITE_STORE.delete(sessionKey(sessionHash));
   }
+}
+
+function isPendingTotpLogin(session) {
+  return session?.loginPhase === LOGIN_PHASE_TOTP;
+}
+
+function parseKvAdminSession(parsed) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  if (typeof parsed.csrf !== "string" || !parsed.csrf) return null;
+  const expiresAt = Number(parsed.expiresAt);
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return null;
+  const session = { csrf: parsed.csrf, expiresAt };
+  if (Object.hasOwn(parsed, "totpBinding")) {
+    if (!ADMIN_SESSION_TOTP_BINDING.test(String(parsed.totpBinding))) return null;
+    session.totpBinding = parsed.totpBinding;
+  }
+  if (Object.hasOwn(parsed, "loginPhase")) {
+    if (parsed.loginPhase !== LOGIN_PHASE_TOTP || !session.totpBinding) return null;
+    session.loginPhase = LOGIN_PHASE_TOTP;
+  }
+  return session;
+}
+
+function adminSessionCookie(sessionToken, ttlSeconds) {
+  return [
+    `${COOKIE_NAME}=${sessionToken}`,
+    `Path=${ADMIN_PATH}`,
+    `Max-Age=${ttlSeconds}`,
+    "HttpOnly",
+    "Secure",
+    "SameSite=Strict",
+  ].join("; ");
+}
+
+async function persistAdminSession(env, payload, ttlSeconds) {
+  const sessionToken = randomHex(32);
+  const sessionHash = await sha256Hex(sessionToken);
+  if (isAuthStateBindingConfigured(env)) {
+    await authStateStore(env).createAdminSession(sessionHash, payload);
+  } else {
+    await env.INVITE_STORE.put(
+      sessionKey(sessionHash),
+      JSON.stringify(payload),
+      { expirationTtl: ttlSeconds },
+    );
+  }
+  return { sessionToken, sessionHash, cookie: adminSessionCookie(sessionToken, ttlSeconds) };
 }
 
 async function getAdminDashboard(env, adminUrl) {
@@ -2656,7 +2722,7 @@ function renderLogin(error = "") {
       ${sub2apiIcon()}
       <p class="eyebrow">Sub2API Admin</p>
       <h1>Admin sign in</h1>
-      <p class="lede">Use your password and 2FA code to manage UUID access.</p>
+      <p class="lede">Enter your username and password. You will be asked for a 2FA code next.</p>
     </section>
     <form class="panel" method="post" action="${ADMIN_PATH}">
       <input type="hidden" name="action" value="login" />
@@ -2665,9 +2731,31 @@ function renderLogin(error = "") {
       <input id="username" name="username" type="text" autocomplete="username" required autofocus />
       <label for="password">Admin password</label>
       <input id="password" name="password" type="password" autocomplete="current-password" required />
+      <button type="submit">Continue</button>
+    </form>
+  `);
+}
+
+function renderLoginTotp(csrf, error = "") {
+  return page("Admin 2FA", `
+    <section class="hero">
+      ${sub2apiIcon()}
+      <p class="eyebrow">Sub2API Admin</p>
+      <h1>Two-factor authentication</h1>
+      <p class="lede">Enter the 6-digit code from your authenticator app.</p>
+    </section>
+    <form class="panel" method="post" action="${ADMIN_PATH}">
+      <input type="hidden" name="action" value="login_totp" />
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
+      ${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}
       <label for="token">2FA code</label>
-      <input id="token" name="token" type="text" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" required />
+      <input id="token" name="token" type="text" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" required autofocus />
       <button type="submit">Sign in</button>
+    </form>
+    <form method="post" action="${ADMIN_PATH}">
+      <input type="hidden" name="action" value="logout" />
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
+      <button type="submit" class="secondary">Use a different account</button>
     </form>
   `);
 }
@@ -6086,6 +6174,8 @@ export const __test = Object.freeze({
   shouldRefreshInvitesOnAdminGet,
   getAdminSetupError,
   handleAdminLogin,
+  handleAdminTotpLogin,
+  isPendingTotpLogin,
   configuredAdminTotpSecrets,
   verifyAdminTotp,
   requireStepUpTotp,

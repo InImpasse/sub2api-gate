@@ -1228,6 +1228,12 @@ function normalizeAdminSession(value, now) {
     }
     normalized.totpBinding = payload.totpBinding;
   }
+  if (Object.hasOwn(payload, "loginPhase")) {
+    if (payload.loginPhase !== "totp" || !normalized.totpBinding) {
+      fail("auth_state_admin_session_invalid");
+    }
+    normalized.loginPhase = "totp";
+  }
   return normalized;
 }
 
@@ -2220,6 +2226,7 @@ export const __test = Object.freeze({
   MAX_CLOUDFLARE_MUTATION_CLAIM,
   normalizeInvite,
   normalizeTrashItem,
+  normalizeAdminSession,
   normalizePublicSession,
   parseStoredJson,
   sanitizeTrashForAuthState,

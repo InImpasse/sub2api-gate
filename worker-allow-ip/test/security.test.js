@@ -1038,7 +1038,7 @@ test("every access-changing admin action requires TOTP step-up", () => {
   ]) {
     assert.equal(adminTest.requiresStepUpAction(action), true, action);
   }
-  for (const action of ["login", "logout", "refresh_sub2api_status", "test_api_key"]) {
+  for (const action of ["login", "login_totp", "logout", "refresh_sub2api_status", "test_api_key"]) {
     assert.equal(adminTest.requiresStepUpAction(action), false, action);
   }
 });
@@ -1070,6 +1070,35 @@ test("admin UI renders a TOTP field for every access-changing action", () => {
       action,
     );
   }
+});
+
+test("password login form omits 2FA and the TOTP step has no password fields", () => {
+  const loginFn = ADMIN_SOURCE.split("function renderLogin(", 2)[1].split("\nfunction ", 1)[0];
+  const totpFn = ADMIN_SOURCE.split("function renderLoginTotp(", 2)[1].split("\nfunction ", 1)[0];
+  assert.match(loginFn, /name="username"/);
+  assert.match(loginFn, /name="password"/);
+  assert.doesNotMatch(loginFn, /name="token"/);
+  assert.doesNotMatch(loginFn, /name="step_up_token"/);
+  assert.match(totpFn, /value="login_totp"/);
+  assert.match(totpFn, /name="token"/);
+  assert.match(totpFn, /name="csrf"/);
+  assert.doesNotMatch(totpFn, /name="username"/);
+  assert.doesNotMatch(totpFn, /name="password"/);
+});
+
+test("unauthenticated admin GET shows username and password only", async () => {
+  const response = await worker.fetch(
+    new Request("https://api.example.test/allow-ip/admin"),
+    validAdminEnv(memoryKv(new Map())),
+  );
+  const body = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(body, /Admin sign in/);
+  assert.match(body, /name="username"/);
+  assert.match(body, /name="password"/);
+  assert.doesNotMatch(body, /name="token"/);
+  assert.doesNotMatch(body, /name="csrf"/);
+  assert.doesNotMatch(body, /UUID Admin/);
 });
 
 test("legacy AuthState cleanup requires TOTP and every seven-day deadline to expire", async () => {
@@ -1716,10 +1745,6 @@ test("admin login persists the canonical TOTP binding while temporary Secrets re
   const form = new FormData();
   form.set("username", env.ADMIN_USERNAME);
   form.set("password", "test-admin-password");
-  form.set(
-    "token",
-    await adminTest.totp(env.ADMIN_TOTP_SECRET, Math.floor(Date.now() / 1000 / 30)),
-  );
 
   const response = await adminTest.handleAdminLogin(
     form,
@@ -1729,14 +1754,25 @@ test("admin login persists the canonical TOTP binding while temporary Secrets re
     }),
   );
   const persisted = [...values.entries()].find(([key]) => key.startsWith("session:"));
+  const cookie = adminCookieFromResponse(response);
 
   assert.equal(response.status, 303);
+  assert.match(response.headers.get("set-cookie") || "", /Max-Age=300/);
   assert.ok(persisted);
   assert.match(persisted[0], /^session:[a-f0-9]{64}$/);
-  assert.equal(
-    JSON.parse(persisted[1]).totpBinding,
-    await adminSessionTotpBinding(env.ADMIN_TOTP_SECRET),
-  );
+  const session = JSON.parse(persisted[1]);
+  assert.equal(session.loginPhase, "totp");
+  assert.equal(session.totpBinding, await adminSessionTotpBinding(env.ADMIN_TOTP_SECRET));
+
+  const pending = await worker.fetch(new Request("https://api.example.test/allow-ip/admin", {
+    headers: { cookie: `sub2api_allow_admin=${cookie}` },
+  }), env);
+  const pendingBody = await pending.text();
+  assert.equal(pending.status, 200);
+  assert.match(pendingBody, /Two-factor authentication/);
+  assert.match(pendingBody, /name="token"/);
+  assert.doesNotMatch(pendingBody, /UUID Admin/);
+  assert.doesNotMatch(pendingBody, /name="password"/);
 });
 
 test("routine admin listing never decrypts stored credential envelopes", async () => {
@@ -1797,6 +1833,24 @@ test("admin sessions without a finite expiry are deleted and rejected", async ()
   const key = `session:${await sha256Hex(token)}`;
   const values = new Map([
     [key, JSON.stringify({ csrf: "csrf", expiresAt: "not-a-timestamp" })],
+  ]);
+  const response = await worker.fetch(new Request("https://api.example.test/allow-ip/admin", {
+    headers: { cookie: `sub2api_allow_admin=${token}` },
+  }), validAdminEnv(memoryKv(values)));
+
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /Admin sign in/);
+  assert.equal(values.has(key), false);
+});
+
+test("admin sessions with an unknown login phase are deleted and rejected", async () => {
+  const token = "unknown-login-phase-session";
+  const key = `session:${await sha256Hex(token)}`;
+  const values = new Map([
+    [key, JSON.stringify({
+      ...(await boundAdminSession("csrf", Date.now() + 60_000)),
+      loginPhase: "authenticated",
+    })],
   ]);
   const response = await worker.fetch(new Request("https://api.example.test/allow-ip/admin", {
     headers: { cookie: `sub2api_allow_admin=${token}` },
@@ -1941,6 +1995,178 @@ test("credential migration issues bounded 25-account batches and reports the rem
   assert.doesNotMatch(secondBody, /accounts remain/);
   stored = JSON.parse(values.get("invites"));
   assert.equal(stored.every((invite) => invite.accessKeyHmac), true);
+});
+
+test("admin password success waits for 2FA before issuing a dashboard session", async () => {
+  const values = new Map([
+    ["invites", "[]"],
+    ["trash", "[]"],
+  ]);
+  const env = validAdminEnv(memoryKv(values));
+  env.ADMIN_PASSWORD_PBKDF2 = await pbkdf2PasswordRecord(
+    "test-admin-password",
+    100_000,
+    new Uint8Array(16).fill(7),
+  );
+  const login = await worker.fetch(new Request("https://api.example.test/allow-ip/admin", {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "CF-Connecting-IP": "198.51.100.44",
+    },
+    body: new URLSearchParams({
+      action: "login",
+      username: env.ADMIN_USERNAME,
+      password: "test-admin-password",
+    }),
+  }), env);
+  const pendingCookie = adminCookieFromResponse(login);
+  const pendingSession = JSON.parse([...values.entries()]
+    .find(([key]) => key.startsWith("session:"))[1]);
+
+  assert.equal(login.status, 303);
+  assert.equal(pendingSession.loginPhase, "totp");
+
+  const usage = await worker.fetch(new Request("https://api.example.test/allow-ip/admin/requests", {
+    headers: { cookie: `sub2api_allow_admin=${pendingCookie}` },
+  }), env);
+  assert.equal(usage.status, 303);
+  assert.equal(usage.headers.get("location"), "/allow-ip/admin");
+
+  const blocked = await worker.fetch(new Request("https://api.example.test/allow-ip/admin", {
+    method: "POST",
+    headers: {
+      cookie: `sub2api_allow_admin=${pendingCookie}`,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      action: "create",
+      csrf: pendingSession.csrf,
+      uuid: "7c484f74-6d93-43d1-9441-00c7d8d4ab11",
+      username: "blocked",
+      step_up_token: "000000",
+    }),
+  }), env);
+  const blockedBody = await blocked.text();
+  assert.equal(blocked.status, 403);
+  assert.match(blockedBody, /Complete 2FA to continue/);
+  assert.doesNotMatch(blockedBody, /UUID Admin/);
+
+  const wrongTotp = await worker.fetch(new Request("https://api.example.test/allow-ip/admin", {
+    method: "POST",
+    headers: {
+      cookie: `sub2api_allow_admin=${pendingCookie}`,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      action: "login_totp",
+      csrf: pendingSession.csrf,
+      token: "000000",
+    }),
+  }), env);
+  assert.equal(wrongTotp.status, 403);
+  assert.match(await wrongTotp.text(), /The 2FA code is incorrect/);
+  assert.equal(JSON.parse(values.get([...values.keys()].find((key) => key.startsWith("session:")))).loginPhase, "totp");
+
+  const totpOk = await worker.fetch(new Request("https://api.example.test/allow-ip/admin", {
+    method: "POST",
+    headers: {
+      cookie: `sub2api_allow_admin=${pendingCookie}`,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      action: "login_totp",
+      csrf: pendingSession.csrf,
+      token: await adminTest.totp(env.ADMIN_TOTP_SECRET, Math.floor(Date.now() / 1000 / 30)),
+    }),
+  }), env);
+  const fullCookie = adminCookieFromResponse(totpOk);
+  const fullSessions = [...values.entries()].filter(([key]) => key.startsWith("session:"));
+
+  assert.equal(totpOk.status, 303);
+  assert.match(totpOk.headers.get("set-cookie") || "", /Max-Age=604800/);
+  assert.equal(fullSessions.length, 1);
+  assert.equal(JSON.parse(fullSessions[0][1]).loginPhase, undefined);
+
+  const dashboard = await worker.fetch(new Request("https://api.example.test/allow-ip/admin", {
+    headers: { cookie: `sub2api_allow_admin=${fullCookie}` },
+  }), env);
+  assert.equal(dashboard.status, 200);
+  assert.match(await dashboard.text(), /UUID Admin/);
+});
+
+test("admin password failures stay on the password form and do not create a session", async () => {
+  const values = new Map();
+  const env = validAdminEnv(memoryKv(values));
+  env.ADMIN_PASSWORD_PBKDF2 = await pbkdf2PasswordRecord(
+    "test-admin-password",
+    100_000,
+    new Uint8Array(16).fill(7),
+  );
+  const response = await worker.fetch(new Request("https://api.example.test/allow-ip/admin", {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "CF-Connecting-IP": "198.51.100.44",
+    },
+    body: new URLSearchParams({
+      action: "login",
+      username: env.ADMIN_USERNAME,
+      password: "wrong-password",
+      token: await adminTest.totp(env.ADMIN_TOTP_SECRET, Math.floor(Date.now() / 1000 / 30)),
+    }),
+  }), env);
+  const body = await response.text();
+  assert.equal(response.status, 403);
+  assert.match(body, /The username or password is incorrect/);
+  assert.match(body, /name="password"/);
+  assert.doesNotMatch(body, /name="token"/);
+  assert.equal([...values.keys()].some((key) => key.startsWith("session:")), false);
+});
+
+test("pending 2FA login is rate-limited by an HMAC of the pending session", async () => {
+  const values = new Map();
+  const env = validAdminEnv(memoryKv(values));
+  env.ADMIN_PASSWORD_PBKDF2 = await pbkdf2PasswordRecord(
+    "test-admin-password",
+    100_000,
+    new Uint8Array(16).fill(7),
+  );
+  const login = await adminTest.handleAdminLogin(
+    (() => {
+      const form = new FormData();
+      form.set("username", env.ADMIN_USERNAME);
+      form.set("password", "test-admin-password");
+      return form;
+    })(),
+    env,
+    new Request("https://api.example.test/allow-ip/admin", {
+      headers: { "CF-Connecting-IP": "198.51.100.44" },
+    }),
+  );
+  const pendingCookie = adminCookieFromResponse(login);
+  const pendingSession = JSON.parse([...values.entries()]
+    .find(([key]) => key.startsWith("session:"))[1]);
+  const seenKeys = [];
+  env.AUTH_RATE_LIMITER = observingRateLimiter(false, seenKeys);
+
+  const rateLimited = await worker.fetch(new Request("https://api.example.test/allow-ip/admin", {
+    method: "POST",
+    headers: {
+      cookie: `sub2api_allow_admin=${pendingCookie}`,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      action: "login_totp",
+      csrf: pendingSession.csrf,
+      token: "000000",
+    }),
+  }), env);
+
+  assert.equal(rateLimited.status, 429);
+  assert.match(await rateLimited.text(), /Too many 2FA attempts/);
+  assert.equal(seenKeys.length, 1);
+  assert.match(seenKeys[0], /^totp-attempt:[a-f0-9]{64}$/);
 });
 
 test("admin login rate limiting uses one Durable Object HMAC bucket per IP", async () => {
@@ -2187,6 +2413,12 @@ test("public helper text meets AA contrast and long headings can wrap", async ()
     /@media \(max-width: 560px\)[\s\S]*?\.identity-title \{ font-size: 24px; line-height: 1\.15; \}/,
   );
 });
+
+function adminCookieFromResponse(response) {
+  const match = String(response.headers.get("set-cookie") || "").match(/^sub2api_allow_admin=([^;]+)/);
+  assert.ok(match, "admin session cookie was not set");
+  return match[1];
+}
 
 function validAdminEnv(store) {
   return {
