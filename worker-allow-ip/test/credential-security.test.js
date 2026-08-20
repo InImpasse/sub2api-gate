@@ -294,28 +294,32 @@ test("admin passwords use a salted PBKDF2 record and reject tampering", async ()
   assert.equal(await verifyPbkdf2Password("correct horse battery staple", `${record}x`), false);
 });
 
+test("admin password verification matches an independent PBKDF2 fixed vector", async () => {
+  const record = "pbkdf2_sha256$100000$AAECAwQFBgcICQoLDA0ODw$qCj5jsXKsJd7TBBNk5JduIxnrurIUwcg5rDmjfGwquc";
+  assert.equal(await verifyPbkdf2Password("pbkdf2-production-vector", record), true);
+  assert.equal(await verifyPbkdf2Password("pbkdf2-production-vector\n", record), false);
+});
+
 test("secret comparisons hash inputs before constant-time comparison", async () => {
   assert.equal(await timingSafeTextEqual("same", "same"), true);
   assert.equal(await timingSafeTextEqual("short", "a different length"), false);
 });
 
-test("secret comparisons use the Worker-native timingSafeEqual when available", async () => {
+test("secret comparisons do not depend on runtime-specific comparison extensions", async () => {
   const subtle = crypto.subtle;
   const original = subtle.timingSafeEqual;
   let calls = 0;
   Object.defineProperty(subtle, "timingSafeEqual", {
     configurable: true,
-    value(left, right) {
+    value() {
       calls += 1;
-      assert.equal(left.byteLength, 32);
-      assert.equal(right.byteLength, 32);
-      return left.every((byte, index) => byte === right[index]);
+      throw new Error("runtime-specific timingSafeEqual must not be called");
     },
   });
   try {
     assert.equal(await timingSafeTextEqual("native", "native"), true);
     assert.equal(await timingSafeTextEqual("native", "different"), false);
-    assert.equal(calls, 2);
+    assert.equal(calls, 0);
   } finally {
     if (original) {
       Object.defineProperty(subtle, "timingSafeEqual", { configurable: true, value: original });

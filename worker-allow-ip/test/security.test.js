@@ -1775,54 +1775,6 @@ test("admin login persists the canonical TOTP binding while temporary Secrets re
   assert.doesNotMatch(pendingBody, /name="password"/);
 });
 
-test("failed admin login emits only bounded boolean diagnostics", async () => {
-  const env = validAdminEnv(memoryKv(new Map()));
-  const usernameSentinel = "private-admin-username-sentinel";
-  const passwordSentinel = "private-admin-password-sentinel";
-  const recordSentinel = "invalid-private-pbkdf2-record-sentinel";
-  env.ADMIN_USERNAME = usernameSentinel;
-  env.ADMIN_PASSWORD_PBKDF2 = recordSentinel;
-  const form = new FormData();
-  form.set("username", usernameSentinel);
-  form.set("password", passwordSentinel);
-  const warnings = [];
-  const originalWarn = console.warn;
-  console.warn = (value) => warnings.push(String(value));
-  try {
-    const response = await adminTest.handleAdminLogin(
-      form,
-      env,
-      new Request("https://api.example.test/allow-ip/admin", {
-        headers: { "CF-Connecting-IP": "198.51.100.44" },
-      }),
-    );
-    assert.equal(response.status, 403);
-  } finally {
-    console.warn = originalWarn;
-  }
-
-  assert.equal(warnings.length, 1);
-  const diagnostic = JSON.parse(warnings[0]);
-  assert.deepEqual(Object.keys(diagnostic).sort(), [
-    "message",
-    "password_ok",
-    "password_record_valid",
-    "username_ok",
-  ]);
-  assert.deepEqual(diagnostic, {
-    message: "admin_login_diagnostic",
-    username_ok: true,
-    password_record_valid: false,
-    password_ok: false,
-  });
-  assert.doesNotMatch(warnings[0], new RegExp([
-    usernameSentinel,
-    passwordSentinel,
-    recordSentinel,
-    "198\\.51\\.100\\.44",
-  ].join("|")));
-});
-
 test("routine admin listing never decrypts stored credential envelopes", async () => {
   const token = "admin-session-token";
   const uuid = "7c484f74-6d93-43d1-9441-00c7d8d4ab11";

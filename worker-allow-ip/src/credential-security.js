@@ -477,15 +477,21 @@ async function importAesKey(secret, usages) {
 }
 
 async function derivePbkdf2(password, salt, iterations) {
+  const passwordBytes = encoder.encode(String(password || ""));
+  const passwordBuffer = passwordBytes.buffer.slice(
+    passwordBytes.byteOffset,
+    passwordBytes.byteOffset + passwordBytes.byteLength,
+  );
+  const saltBuffer = salt.buffer.slice(salt.byteOffset, salt.byteOffset + salt.byteLength);
   const material = await crypto.subtle.importKey(
     "raw",
-    encoder.encode(String(password || "")),
+    passwordBuffer,
     "PBKDF2",
     false,
     ["deriveBits"],
   );
   return new Uint8Array(await crypto.subtle.deriveBits(
-    { name: "PBKDF2", hash: "SHA-256", salt, iterations },
+    { name: "PBKDF2", hash: "SHA-256", salt: saltBuffer, iterations },
     material,
     256,
   ));
@@ -529,16 +535,11 @@ export async function timingSafeTextEqual(left, right) {
   return timingSafeBytesEqual(new Uint8Array(leftHash), new Uint8Array(rightHash));
 }
 
-function timingSafeBytesEqual(left, right) {
-  if (typeof crypto.subtle.timingSafeEqual === "function") {
-    return crypto.subtle.timingSafeEqual(left, right);
-  }
-
-  // Node's Web Crypto does not yet expose the Workers-only primitive used in production.
+async function timingSafeBytesEqual(left, right) {
   const maxLength = Math.max(left.byteLength, right.byteLength);
   let difference = left.byteLength ^ right.byteLength;
   for (let index = 0; index < maxLength; index += 1) {
-    difference |= (left[index] || 0) ^ (right[index] || 0);
+    difference |= (left[index] ?? 0) ^ (right[index] ?? 0);
   }
   return difference === 0;
 }
