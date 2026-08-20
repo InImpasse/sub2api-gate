@@ -15,6 +15,7 @@ RECOVERY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RECOVERY)
 
 VERSION_ID = "11111111-1111-4111-8111-111111111111"
+SOURCE_VERSION_ID = "33333333-3333-4333-8333-333333333333"
 DEPLOYMENT_ID = "22222222-2222-4222-8222-222222222222"
 REQUIRED_SECRETS = {
     "TURNSTILE_SECRET_KEY",
@@ -49,6 +50,7 @@ class WorkerAdminRecoverySubprocessTests(unittest.TestCase):
             "#!" + sys.executable + "\n"
             "import json, os, pathlib, stat, sys\n"
             f"VERSION_ID = {VERSION_ID!r}\n"
+            f"SOURCE_VERSION_ID = {SOURCE_VERSION_ID!r}\n"
             f"DEPLOYMENT_ID = {DEPLOYMENT_ID!r}\n"
             f"REQUIRED = {sorted(REQUIRED_SECRETS)!r}\n"
             "args = sys.argv[1:]\n"
@@ -59,14 +61,25 @@ class WorkerAdminRecoverySubprocessTests(unittest.TestCase):
             "    event('verify-secrets'); sys.exit(0)\n"
             "if 'secret' in args and 'list' in args:\n"
             "    event('secret-list'); print(json.dumps([{'name': name, 'type': 'secret_text'} for name in REQUIRED])); sys.exit(0)\n"
+            "if 'secret' in args and 'bulk' in args:\n"
+            "    versions_at = args.index('versions')\n"
+            "    if args[versions_at:versions_at + 3] != ['versions', 'secret', 'bulk']: sys.exit(17)\n"
+            "    payload = json.load(sys.stdin)\n"
+            "    if set(payload) != {'ADMIN_PASSWORD_PBKDF2', 'ADMIN_TOTP_SECRET'}: sys.exit(18)\n"
+            "    event('secret-bulk'); sys.exit(0)\n"
+            "if 'versions' in args and 'list' in args:\n"
+            "    prior = events.read_text(encoding='ascii').splitlines() if events.exists() else []\n"
+            "    versions = []\n"
+            "    if 'secret-bulk' in prior: versions.append({'id': VERSION_ID, 'annotations': {'workers/tag': os.environ['FAKE_WRANGLER_TAG'], 'workers/message': os.environ['FAKE_WRANGLER_MESSAGE']}})\n"
+            "    if 'upload' in prior: versions.append({'id': SOURCE_VERSION_ID, 'annotations': {'workers/tag': os.environ['FAKE_WRANGLER_TAG'], 'workers/message': os.environ['FAKE_WRANGLER_MESSAGE']}})\n"
+            "    event('versions-list'); print(json.dumps(versions)); sys.exit(0)\n"
             "if 'versions' in args and 'upload' in args:\n"
-            "    secret = pathlib.Path(args[args.index('--secrets-file') + 1])\n"
-            "    if stat.S_IMODE(secret.stat().st_mode) != 0o600: sys.exit(17)\n"
-            "    if set(json.loads(secret.read_text(encoding='ascii'))) != {'ADMIN_PASSWORD_PBKDF2', 'ADMIN_TOTP_SECRET'}: sys.exit(18)\n"
-            "    pathlib.Path(os.environ['WRANGLER_OUTPUT_FILE_PATH']).write_text(json.dumps({'type':'version-upload','version':1,'version_id':VERSION_ID}) + '\\n', encoding='ascii')\n"
+            "    if '--secrets-file' in args: sys.exit(17)\n"
+            "    pathlib.Path(os.environ['WRANGLER_OUTPUT_FILE_PATH']).write_text(json.dumps({'type':'version-upload','version':1,'version_id':SOURCE_VERSION_ID}) + '\\n', encoding='ascii')\n"
             "    event('upload'); sys.exit(0)\n"
             "if 'versions' in args and 'view' in args:\n"
-            "    event('version-view'); print(json.dumps({'id': VERSION_ID, 'annotations': {'workers/tag': os.environ['FAKE_WRANGLER_TAG'], 'workers/message': os.environ['FAKE_WRANGLER_MESSAGE']}, 'resources': {'bindings': [{'name': name, 'type': 'secret_text'} for name in REQUIRED]}})); sys.exit(0)\n"
+            "    requested = args[args.index('view') + 1]\n"
+            "    event('version-view'); print(json.dumps({'id': requested, 'annotations': {'workers/tag': os.environ['FAKE_WRANGLER_TAG'], 'workers/message': os.environ['FAKE_WRANGLER_MESSAGE']}, 'resources': {'bindings': [{'name': name, 'type': 'secret_text'} for name in REQUIRED]}})); sys.exit(0)\n"
             "if 'versions' in args and 'deploy' in args:\n"
             "    pathlib.Path(os.environ['WRANGLER_OUTPUT_FILE_PATH']).write_text(json.dumps({'type':'version-deploy','version':1,'deployment_id':DEPLOYMENT_ID}) + '\\n', encoding='ascii')\n"
             "    event('deploy'); sys.exit(0)\n"
@@ -107,7 +120,9 @@ class WorkerAdminRecoverySubprocessTests(unittest.TestCase):
             self.assertEqual(result["deployment_id"], DEPLOYMENT_ID)
             self.assertEqual(login_proofs, [worker / "wrangler.private.jsonc"])
             self.assertEqual(events.read_text(encoding="ascii").splitlines(), [
-                "secret-list", "verify-secrets", "upload", "version-view",
+                "secret-list", "verify-secrets", "versions-list", "upload", "version-view",
+                "secret-list", "versions-list", "secret-bulk", "versions-list",
+                "secret-list", "version-view",
                 "deploy", "deployment-status", "secret-list", "verify-secrets",
             ])
             self.assertFalse(list(stage.glob(".admin-recovery-secrets-*.json")))

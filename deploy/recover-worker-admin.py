@@ -50,13 +50,17 @@ RECOVERY_MESSAGE = f"src={RECOVERY_RELEASE} toolchain={TOOLCHAIN_DIGEST}"
 MAX_WRANGLER_JSON_BYTES = 64 * 1024
 ADMIN_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_ADMIN_PASSWORD_CHARACTERS = 4096
+MAX_ADMIN_TOTP_SEED_CHARACTERS = 128
+MAX_PRIVATE_SECRET_FILE_BYTES = MAX_ADMIN_PASSWORD_CHARACTERS + 2
 MAX_ADMIN_LOGIN_FORM_BYTES = 32 * 1024
+LEGACY_COMPATIBILITY_SECRET_NAMES = frozenset({"ADMIN_PASSWORD_HASH"})
 REMOTE_OUTCOME_UNKNOWN = (
     "remote_outcome_unknown: exact Worker state could not be proven; "
     "do not retry until the remote version and deployment are reconciled"
 )
 READBACK_ATTEMPTS = 3
 READBACK_RETRY_SECONDS = 0.25
+LOCAL_RECOVERY_DIRECTORY_NAME = ".admin-recovery"
 
 
 class AdminRecoveryError(RuntimeError):
@@ -180,6 +184,77 @@ def _remove_recovery_files(paths):
     return first_error
 
 
+def _read_private_secret_line(path, *, expected_uid, max_characters, label):
+    target = pathlib.Path(path)
+    if not target.is_absolute():
+        raise AdminRecoveryError(f"{label} path must be absolute")
+    try:
+        metadata = target.lstat()
+        parent = target.parent.lstat()
+        resolved = target.resolve(strict=True)
+        worktree = ROOT.resolve()
+    except OSError as error:
+        raise AdminRecoveryError(f"{label} is unavailable") from error
+    try:
+        relative = resolved.relative_to(worktree)
+    except ValueError:
+        relative = None
+    if relative is not None and (
+        len(relative.parts) < 2
+        or relative.parts[0] != LOCAL_RECOVERY_DIRECTORY_NAME
+    ):
+        raise AdminRecoveryError(
+            f"{label} in the Git worktree must be under {LOCAL_RECOVERY_DIRECTORY_NAME}/"
+        )
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != expected_uid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size < 1
+        or metadata.st_size > MAX_PRIVATE_SECRET_FILE_BYTES
+        or not stat.S_ISDIR(parent.st_mode)
+        or stat.S_ISLNK(parent.st_mode)
+        or parent.st_uid != expected_uid
+        or stat.S_IMODE(parent.st_mode) & 0o022
+    ):
+        raise AdminRecoveryError(f"{label} is invalid")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+    except OSError as error:
+        raise AdminRecoveryError(f"{label} is unavailable") from error
+    try:
+        opened = os.fstat(descriptor)
+        payload = os.read(descriptor, MAX_PRIVATE_SECRET_FILE_BYTES + 1)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or stat.S_IMODE(opened.st_mode) != 0o600
+        or opened.st_uid != expected_uid
+        or len(payload) > MAX_PRIVATE_SECRET_FILE_BYTES
+        or (metadata.st_dev, metadata.st_ino, metadata.st_size)
+        != (after.st_dev, after.st_ino, after.st_size)
+    ):
+        raise AdminRecoveryError(f"{label} is invalid")
+    try:
+        text = payload.decode("utf-8", "strict")
+    except UnicodeError as error:
+        raise AdminRecoveryError(f"{label} is invalid") from error
+    if "\0" in text:
+        raise AdminRecoveryError(f"{label} is invalid")
+    if text.endswith("\r\n"):
+        text = text[:-2]
+    elif text.endswith("\n") or text.endswith("\r"):
+        text = text[:-1]
+    if "\n" in text or "\r" in text or not text or len(text) > max_characters:
+        raise AdminRecoveryError(f"{label} is invalid")
+    return text
+
+
 def _read_wrangler_output(path, expected_type):
     target = pathlib.Path(path)
     try:
@@ -231,6 +306,74 @@ def _read_remote_mutation_record(path, expected_type):
         raise AdminRecoveryError(REMOTE_OUTCOME_UNKNOWN) from error
 
 
+def _remote_version_ids(node, wrangler, config, *, env, cwd, runner):
+    result = run_remote_mutation(
+        [node, wrangler, "versions", "list", "--json", "--config", config],
+        env=env,
+        cwd=cwd,
+        runner=runner,
+    )
+    if result is None or result.returncode != 0:
+        raise AdminRecoveryError(REMOTE_OUTCOME_UNKNOWN)
+    document = _parse_json(result.stdout, "Worker version list")
+    if not isinstance(document, list):
+        raise AdminRecoveryError(REMOTE_OUTCOME_UNKNOWN)
+    return document
+
+
+def _recover_uploaded_version_id(before, after):
+    prior = {
+        item.get("id")
+        for item in before
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    created = [
+        item
+        for item in after
+        if isinstance(item, dict)
+        and item.get("id") not in prior
+        and isinstance(item.get("id"), str)
+    ]
+    candidates = [
+        item.get("id")
+        for item in created
+        if isinstance(item.get("annotations"), dict)
+        and item["annotations"].get("workers/tag") == RECOVERY_TAG
+        and item["annotations"].get("workers/message") == RECOVERY_MESSAGE
+    ]
+    if len(created) != 1 or len(candidates) != 1:
+        raise AdminRecoveryError(REMOTE_OUTCOME_UNKNOWN)
+    return _validated_remote_identifier(candidates[0], "uploaded Worker version ID")
+
+
+def _validate_latest_reviewed_version(versions, version_id):
+    if not versions or not isinstance(versions[0], dict):
+        raise AdminRecoveryError(REMOTE_OUTCOME_UNKNOWN)
+    latest = versions[0]
+    annotations = latest.get("annotations")
+    if (
+        latest.get("id") != version_id
+        or not isinstance(annotations, dict)
+        or annotations.get("workers/tag") != RECOVERY_TAG
+        or annotations.get("workers/message") != RECOVERY_MESSAGE
+    ):
+        raise AdminRecoveryError(REMOTE_OUTCOME_UNKNOWN)
+
+
+def _recover_deployment_id(payload, version_id):
+    document = _parse_json(payload, "Worker deployment readback")
+    versions = document.get("versions") if isinstance(document, dict) else None
+    annotations = document.get("annotations") if isinstance(document, dict) else None
+    deployment_id = document.get("id") if isinstance(document, dict) else None
+    if (
+        not isinstance(annotations, dict)
+        or annotations.get("workers/message") != RECOVERY_MESSAGE
+        or versions != [{"version_id": version_id, "percentage": 100}]
+    ):
+        raise AdminRecoveryError(REMOTE_OUTCOME_UNKNOWN)
+    return _validated_remote_identifier(deployment_id, "Worker deployment ID")
+
+
 def _validated_identifier(value, label):
     normalized = str(value or "").lower()
     if not VERSION_ID_RE.fullmatch(normalized):
@@ -261,7 +404,8 @@ def _validate_version_view(payload, version_id, required_secrets):
         or annotations.get("workers/tag") != RECOVERY_TAG
         or annotations.get("workers/message") != RECOVERY_MESSAGE
         or not isinstance(bindings, list)
-        or secret_names != set(required_secrets)
+        or not secret_names.issuperset(required_secrets)
+        or secret_names - set(required_secrets) - LEGACY_COMPATIBILITY_SECRET_NAMES
     ):
         raise AdminRecoveryError("uploaded Worker version attestation does not match")
 
@@ -319,6 +463,86 @@ def check_secret_names_at(node, wrangler, config, manifest, *, env, cwd, runner=
     )
 
 
+def _remote_secret_names(node, wrangler, config, *, env, cwd, runner):
+    result = run_remote_mutation(
+        [node, wrangler, "secret", "list", "--format", "json", "--config", config],
+        env=env,
+        cwd=cwd,
+        runner=runner,
+    )
+    if result is None or result.returncode != 0:
+        raise AdminRecoveryError(REMOTE_OUTCOME_UNKNOWN)
+    payload = _parse_json(result.stdout, "Worker Secret list")
+    if not isinstance(payload, list):
+        raise AdminRecoveryError(REMOTE_OUTCOME_UNKNOWN)
+    names = set()
+    for item in payload:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            raise AdminRecoveryError(REMOTE_OUTCOME_UNKNOWN)
+        names.add(item["name"])
+    return names
+
+
+def _validate_credential_secret_names(names, required):
+    allowed = set(required) | LEGACY_COMPATIBILITY_SECRET_NAMES
+    if not set(required).issubset(names) or names - allowed:
+        raise AdminRecoveryError("remote Worker Secret name set is invalid")
+
+
+def migrate_admin_credentials(
+    node,
+    wrangler,
+    config,
+    manifest,
+    password,
+    seed,
+    base_version_id,
+    *,
+    env,
+    cwd,
+    runner=subprocess.run,
+):
+    required = _required_secret_names(manifest)
+    before = _remote_secret_names(node, wrangler, config, env=env, cwd=cwd, runner=runner)
+    _validate_credential_secret_names(before, required)
+    versions_before = _remote_version_ids(node, wrangler, config, env=env, cwd=cwd, runner=runner)
+    _validate_latest_reviewed_version(versions_before, base_version_id)
+    payload = json.dumps(
+        {
+            "ADMIN_PASSWORD_PBKDF2": password_record(password),
+            "ADMIN_TOTP_SECRET": validate_seed(seed),
+        },
+        separators=(",", ":"),
+    )
+    try:
+        run_remote_mutation(
+            [
+                node,
+                wrangler,
+                "versions",
+                "secret",
+                "bulk",
+                "--config",
+                config,
+                "--tag",
+                RECOVERY_TAG,
+                "--message",
+                RECOVERY_MESSAGE,
+            ],
+            env=env,
+            cwd=cwd,
+            runner=lambda arguments, **kwargs: runner(arguments, input=payload, **kwargs),
+        )
+    finally:
+        payload = ""
+    versions_after = _remote_version_ids(node, wrangler, config, env=env, cwd=cwd, runner=runner)
+    version_id = _recover_uploaded_version_id(versions_before, versions_after)
+    _validate_latest_reviewed_version(versions_after, version_id)
+    after = _remote_secret_names(node, wrangler, config, env=env, cwd=cwd, runner=runner)
+    _validate_credential_secret_names(after, required)
+    return version_id
+
+
 def publish_recovery_version(
     stage_dir,
     password,
@@ -340,52 +564,65 @@ def publish_recovery_version(
     validate_password(password)
     username, _hostname = _recovery_login_settings(config)
     _build_admin_login_form(username, password, normalized_seed, 0)
-    record = password_record(password)
-    secret_path = stage / f".admin-recovery-secrets-{secrets.token_hex(8)}.json"
     upload_output = stage / f".wrangler-upload-{secrets.token_hex(8)}.json"
     deploy_output = stage / f".wrangler-deploy-{secrets.token_hex(8)}.json"
-    secret_payload = json.dumps(
-        {"ADMIN_PASSWORD_PBKDF2": record, "ADMIN_TOTP_SECRET": normalized_seed},
-        separators=(",", ":"),
-    ).encode("ascii")
     operation_error = None
     try:
-        _create_private_file(secret_path, secret_payload)
         _create_private_file(upload_output)
         _create_private_file(deploy_output)
-        secret_payload = b""
         check_secret_names_at(node, wrangler, config, manifest, env=env, cwd=stage, runner=runner)
+        versions_before = _remote_version_ids(node, wrangler, config, env=env, cwd=stage, runner=runner)
         upload_environment = dict(env)
         upload_environment["WRANGLER_OUTPUT_FILE_PATH"] = str(upload_output)
+        run_remote_mutation(
+            [
+                node,
+                wrangler,
+                "versions",
+                "upload",
+                "--config",
+                config,
+                "--strict",
+                "--tag",
+                RECOVERY_TAG,
+                "--message",
+                RECOVERY_MESSAGE,
+            ],
+            env=upload_environment,
+            cwd=stage,
+            runner=runner,
+        )
         try:
-            run_remote_mutation(
-                [
-                    node,
-                    wrangler,
-                    "versions",
-                    "upload",
-                    "--config",
-                    config,
-                    "--secrets-file",
-                    secret_path,
-                    "--strict",
-                    "--tag",
-                    RECOVERY_TAG,
-                    "--message",
-                    RECOVERY_MESSAGE,
-                ],
-                env=upload_environment,
-                cwd=stage,
-                runner=runner,
+            upload_record = _read_remote_mutation_record(upload_output, "version-upload")
+            source_version_id = _validated_remote_identifier(upload_record.get("version_id"), "uploaded Worker version ID")
+        except AdminRecoveryError as error:
+            if str(error) != REMOTE_OUTCOME_UNKNOWN:
+                raise
+            source_version_id = _recover_uploaded_version_id(
+                versions_before,
+                _remote_version_ids(node, wrangler, config, env=env, cwd=stage, runner=runner),
             )
-        finally:
-            secret_cleanup_error = _remove_recovery_files((secret_path,))
-            if secret_cleanup_error is not None:
-                raise AdminRecoveryError(
-                    f"{REMOTE_OUTCOME_UNKNOWN}; administrator recovery Secret file cleanup failed"
-                ) from secret_cleanup_error
-        upload_record = _read_remote_mutation_record(upload_output, "version-upload")
-        version_id = _validated_remote_identifier(upload_record.get("version_id"), "uploaded Worker version ID")
+        reconcile_remote_readback(
+            [node, wrangler, "versions", "view", source_version_id, "--json", "--config", config],
+            lambda payload: _validate_version_view(payload, source_version_id, required_secrets),
+            env=env,
+            cwd=stage,
+            runner=runner,
+            sleeper=sleeper,
+        )
+
+        version_id = migrate_admin_credentials(
+            node,
+            wrangler,
+            config,
+            manifest,
+            password,
+            normalized_seed,
+            source_version_id,
+            env=env,
+            cwd=stage,
+            runner=runner,
+        )
         reconcile_remote_readback(
             [node, wrangler, "versions", "view", version_id, "--json", "--config", config],
             lambda payload: _validate_version_view(payload, version_id, required_secrets),
@@ -414,8 +651,21 @@ def publish_recovery_version(
             cwd=stage,
             runner=runner,
         )
-        deploy_record = _read_remote_mutation_record(deploy_output, "version-deploy")
-        deployment_id = _validated_remote_identifier(deploy_record.get("deployment_id"), "Worker deployment ID")
+        try:
+            deploy_record = _read_remote_mutation_record(deploy_output, "version-deploy")
+            deployment_id = _validated_remote_identifier(deploy_record.get("deployment_id"), "Worker deployment ID")
+        except AdminRecoveryError as error:
+            if str(error) != REMOTE_OUTCOME_UNKNOWN:
+                raise
+            status_result = run_remote_mutation(
+                [node, wrangler, "deployments", "status", "--json", "--config", config],
+                env=env,
+                cwd=stage,
+                runner=runner,
+            )
+            if status_result is None or status_result.returncode != 0:
+                raise AdminRecoveryError(REMOTE_OUTCOME_UNKNOWN) from error
+            deployment_id = _recover_deployment_id(status_result.stdout, version_id)
         reconcile_remote_readback(
             [node, wrangler, "deployments", "status", "--json", "--config", config],
             lambda payload: _validate_deployment_status(payload, deployment_id, version_id),
@@ -438,10 +688,8 @@ def publish_recovery_version(
         operation_error = error
         raise
     finally:
-        secret_payload = b""
-        record = ""
         normalized_seed = ""
-        cleanup_error = _remove_recovery_files((secret_path, upload_output, deploy_output))
+        cleanup_error = _remove_recovery_files((upload_output, deploy_output))
         if cleanup_error is not None:
             message = "administrator recovery temporary file cleanup failed"
             if operation_error is None:
@@ -477,8 +725,8 @@ def validate_password(password):
 def password_record(password):
     validate_password(password)
     salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
-    return f"pbkdf2_sha256$310000${b64url(salt)}${b64url(digest)}"
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+    return f"pbkdf2_sha256$100000${b64url(salt)}${b64url(digest)}"
 
 
 def _decode_totp_seed(seed):
@@ -568,6 +816,46 @@ def _validate_login_cookie(headers):
     )
 
 
+def _cookie_value(headers):
+    values = [value for name, value in headers if name.lower() == "set-cookie"]
+    if len(values) != 1:
+        raise AdminRecoveryError("administrator login proof failed")
+    value = values[0].split(";", 1)[0]
+    if not re.fullmatch(r"sub2api_allow_admin=[0-9a-f]{64}", value):
+        raise AdminRecoveryError("administrator login proof failed")
+    return value
+
+
+def _pending_login_cookie(headers):
+    values = [value for name, value in headers if name.lower() == "set-cookie"]
+    if len(values) != 1:
+        return False
+    parts = [part.strip() for part in values[0].split(";")]
+    if not re.fullmatch(r"sub2api_allow_admin=[0-9a-f]{64}", parts[0]):
+        return False
+    attributes = {}
+    flags = set()
+    for part in parts[1:]:
+        if "=" in part:
+            name, value = part.split("=", 1)
+            normalized_name = name.lower()
+            if normalized_name in attributes:
+                return False
+            attributes[normalized_name] = value
+        else:
+            normalized_flag = part.lower()
+            if normalized_flag in flags:
+                return False
+            flags.add(normalized_flag)
+    return (
+        attributes.get("path") == "/allow-ip/admin"
+        and attributes.get("samesite", "").lower() == "strict"
+        and attributes.get("max-age") == "300"
+        and "domain" not in attributes
+        and {"httponly", "secure"}.issubset(flags)
+    )
+
+
 def _build_admin_login_form(username, password, seed, timestamp):
     try:
         form = urllib.parse.urlencode(
@@ -594,12 +882,14 @@ def prove_admin_login(
     now=None,
 ):
     username, hostname = _recovery_login_settings(config_path)
-    form = _build_admin_login_form(
-        username,
-        password,
-        seed,
-        time.time() if now is None else now,
-    )
+    timestamp = time.time() if now is None else now
+    form = urllib.parse.urlencode(
+        {
+            "action": "login",
+            "username": username,
+            "password": validate_password(password),
+        }
+    ).encode("ascii")
     connection = None
     try:
         connection = connection_factory(
@@ -619,14 +909,55 @@ def prove_admin_login(
             },
         )
         response = connection.getresponse()
-        response_body = response.read(64 * 1024 + 1)
+        response.read(64 * 1024 + 1)
         headers = response.getheaders()
         locations = [value for name, value in headers if name.lower() == "location"]
+        if response.status != 303 or locations != ["/allow-ip/admin"] or not _pending_login_cookie(headers):
+            raise AdminRecoveryError("administrator login proof failed")
+        pending_cookie = _cookie_value(headers)
+
+        connection.request(
+            "GET",
+            "/allow-ip/admin",
+            headers={
+                "Accept": "text/html",
+                "Cookie": pending_cookie,
+                "User-Agent": "sub2api-gate-admin-recovery/1",
+            },
+        )
+        form_page = connection.getresponse()
+        form_body = form_page.read(64 * 1024 + 1)
+        csrf_match = re.search(rb'name="csrf" value="([0-9a-f]+)"', form_body)
+        if form_page.status != 200 or csrf_match is None:
+            raise AdminRecoveryError("administrator login proof failed")
+
+        totp_form = urllib.parse.urlencode(
+            {
+                "action": "login_totp",
+                "csrf": csrf_match.group(1).decode("ascii"),
+                "token": _totp(seed, timestamp),
+            }
+        ).encode("ascii")
+        connection.request(
+            "POST",
+            "/allow-ip/admin",
+            body=totp_form,
+            headers={
+                "Accept": "text/html",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Cookie": pending_cookie,
+                "User-Agent": "sub2api-gate-admin-recovery/1",
+            },
+        )
+        final_response = connection.getresponse()
+        final_body = final_response.read(64 * 1024 + 1)
+        final_headers = final_response.getheaders()
+        final_locations = [value for name, value in final_headers if name.lower() == "location"]
         if (
-            len(response_body) > 64 * 1024
-            or response.status != 303
-            or locations != ["/allow-ip/admin"]
-            or not _validate_login_cookie(headers)
+            len(final_body) > 64 * 1024
+            or final_response.status != 303
+            or final_locations != ["/allow-ip/admin"]
+            or not _validate_login_cookie(final_headers)
         ):
             raise AdminRecoveryError("administrator login proof failed")
     except (OSError, http.client.HTTPException, ssl.SSLError) as error:
@@ -721,12 +1052,26 @@ def main(
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("check",), nargs="?")
     parser.add_argument("--apply", action="store_true", help="replace the administrator password and canonical TOTP seed after private confirmation")
+    parser.add_argument(
+        "--password-file",
+        type=pathlib.Path,
+        help="absolute mode-0600 file containing the new administrator password as a single line",
+    )
+    parser.add_argument(
+        "--totp-seed-file",
+        type=pathlib.Path,
+        help="absolute mode-0600 file containing the new administrator TOTP Base32 seed as a single line",
+    )
     parser.add_argument("--node", type=pathlib.Path, default=NODE)
     parser.add_argument("--home", type=pathlib.Path, default=pathlib.Path(os.environ.get("HOME", "")))
     parser.add_argument("--wrangler-config", type=pathlib.Path, default=CONFIG)
     arguments = parser.parse_args(argv)
     if arguments.mode == "check" and arguments.apply:
         parser.error("'check' cannot be combined with --apply")
+    if (arguments.password_file is None) != (arguments.totp_seed_file is None):
+        parser.error("--password-file and --totp-seed-file must be used together")
+    if arguments.password_file is not None and not arguments.apply:
+        parser.error("--password-file requires --apply")
     try:
         streams = (sys.stdin, sys.stdout, sys.stderr) if tty_streams is None else tty_streams
         if arguments.apply and (os.geteuid() == 0 or not all(stream.isatty() for stream in streams)):
@@ -759,12 +1104,26 @@ def main(
             return 0
         if input_func("Type RESET ADMIN ACCESS to continue: ") != "RESET ADMIN ACCESS":
             raise AdminRecoveryError("administrator recovery was not confirmed")
-        password = getpass_func("New administrator password: ")
-        if password != getpass_func("Confirm new administrator password: "):
-            raise AdminRecoveryError("new administrator passwords do not match")
-        seed = getpass_func("New administrator TOTP Base32 seed: ")
-        if seed != getpass_func("Confirm new administrator TOTP Base32 seed: "):
-            raise AdminRecoveryError("new administrator TOTP seeds do not match")
+        if arguments.password_file is not None:
+            password = _read_private_secret_line(
+                arguments.password_file,
+                expected_uid=os.geteuid(),
+                max_characters=MAX_ADMIN_PASSWORD_CHARACTERS,
+                label="administrator password file",
+            )
+            seed = _read_private_secret_line(
+                arguments.totp_seed_file,
+                expected_uid=os.geteuid(),
+                max_characters=MAX_ADMIN_TOTP_SEED_CHARACTERS,
+                label="administrator TOTP seed file",
+            )
+        else:
+            password = getpass_func("New administrator password: ")
+            if password != getpass_func("Confirm new administrator password: "):
+                raise AdminRecoveryError("new administrator passwords do not match")
+            seed = getpass_func("New administrator TOTP Base32 seed: ")
+            if seed != getpass_func("Confirm new administrator TOTP Base32 seed: "):
+                raise AdminRecoveryError("new administrator TOTP seeds do not match")
         _validate_private_inputs(password, seed)
         try:
             run_recovery_candidate(

@@ -23,6 +23,7 @@ worker-allow-ip/.dev.vars.*
 !.env.*.example
 .local/
 /.local/worker-secret-state/
+.admin-recovery/
 **/config.local.yaml
 **/secrets.local.*
 postgres_data/

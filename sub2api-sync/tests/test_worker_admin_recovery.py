@@ -20,7 +20,8 @@ SPEC.loader.exec_module(RECOVERY)
 
 
 class RecoveryRunner:
-    VERSION_ID = "11111111-1111-4111-8111-111111111111"
+    SOURCE_VERSION_ID = "11111111-1111-4111-8111-111111111111"
+    VERSION_ID = "33333333-3333-4333-8333-333333333333"
     DEPLOYMENT_ID = "22222222-2222-4222-8222-222222222222"
 
     def __init__(
@@ -30,6 +31,8 @@ class RecoveryRunner:
         version_readback_matches=True,
         deployment_readback_matches=True,
         upload_returncode=0,
+        credential_returncode=0,
+        credential_creates_version=True,
         deploy_returncode=0,
         write_upload_output=True,
         write_deploy_output=True,
@@ -43,11 +46,16 @@ class RecoveryRunner:
         self.version_readback_matches = version_readback_matches
         self.deployment_readback_matches = deployment_readback_matches
         self.upload_returncode = upload_returncode
+        self.credential_returncode = credential_returncode
+        self.credential_creates_version = credential_creates_version
         self.deploy_returncode = deploy_returncode
         self.write_upload_output = write_upload_output
         self.write_deploy_output = write_deploy_output
         self.version_readback_failures = version_readback_failures
         self.deployment_readback_failures = deployment_readback_failures
+        self.uploaded = False
+        self.credentials_migrated = False
+        self.credential_payloads = []
 
     def __call__(self, arguments, **kwargs):
         command = tuple(map(str, arguments))
@@ -55,29 +63,52 @@ class RecoveryRunner:
         self.events.append(command)
         if command[-1:] == ("--version",):
             return subprocess.CompletedProcess(command, 0, "4.112.0\n", "")
-        if "secret" in command and "list" in command:
+        if "secret" in command and "list" in command and "versions" not in command:
             payload = [{"name": name, "type": "secret_text"} for name in self.required_secrets]
             return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+        if "secret" in command and "bulk" in command:
+            self.credential_payloads.append(kwargs.get("input", ""))
+            self.credentials_migrated = self.credential_creates_version
+            return subprocess.CompletedProcess(command, self.credential_returncode, "", "private detail")
         if "versions" in command and "upload" in command:
-            self.secret_file = pathlib.Path(command[command.index("--secrets-file") + 1])
-            self.assert_private_secret_file(self.secret_file)
+            self.uploaded = True
             if self.write_upload_output:
                 pathlib.Path(kwargs["env"]["WRANGLER_OUTPUT_FILE_PATH"]).write_text(
                     json.dumps({
                         "type": "version-upload",
                         "version": 1,
-                        "version_id": self.VERSION_ID,
+                        "version_id": self.SOURCE_VERSION_ID,
                     }) + "\n",
                     encoding="ascii",
                 )
             return subprocess.CompletedProcess(command, self.upload_returncode, "", "private detail")
+        elif "versions" in command and "list" in command:
+            versions = []
+            if self.credentials_migrated:
+                versions.append({
+                    "id": self.VERSION_ID,
+                    "annotations": {
+                        "workers/tag": RECOVERY.RECOVERY_TAG,
+                        "workers/message": RECOVERY.RECOVERY_MESSAGE,
+                    },
+                })
+            if self.uploaded:
+                versions.append({
+                    "id": self.SOURCE_VERSION_ID,
+                    "annotations": {
+                        "workers/tag": RECOVERY.RECOVERY_TAG,
+                        "workers/message": RECOVERY.RECOVERY_MESSAGE,
+                    },
+                })
+            return subprocess.CompletedProcess(command, 0, json.dumps(versions), "")
         elif "versions" in command and "view" in command:
             if self.version_readback_failures > 0:
                 self.version_readback_failures -= 1
                 return subprocess.CompletedProcess(command, 1, "", "private detail")
             bindings = [{"name": name, "type": "secret_text"} for name in self.required_secrets]
+            requested_version = command[command.index("view") + 1]
             return subprocess.CompletedProcess(command, 0, json.dumps({
-                "id": self.VERSION_ID,
+                "id": requested_version,
                 "annotations": {
                     "workers/tag": RECOVERY.RECOVERY_TAG if self.version_readback_matches else "unexpected-version",
                     "workers/message": RECOVERY.RECOVERY_MESSAGE,
@@ -113,7 +144,7 @@ class RecoveryRunner:
         document = json.loads(path.read_text(encoding="ascii"))
         if set(document) != {"ADMIN_PASSWORD_PBKDF2", "ADMIN_TOTP_SECRET"}:
             raise AssertionError("unexpected Secret file fields")
-        if not document["ADMIN_PASSWORD_PBKDF2"].startswith("pbkdf2_sha256$310000$"):
+        if not document["ADMIN_PASSWORD_PBKDF2"].startswith("pbkdf2_sha256$100000$"):
             raise AssertionError("password record is not protected")
         if document["ADMIN_TOTP_SECRET"] != "JBSWY3DPEHPK3PXP":
             raise AssertionError("TOTP seed was not normalized")
@@ -267,9 +298,9 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
                     login_prover=lambda *_args: None,
                 )
 
-            self.assertEqual(len(attempted), 3)
-            self.assertEqual(list(stage.glob(".wrangler-*.json")), [])
-            self.assertEqual(len(list(stage.glob(".admin-recovery-secrets-*.json"))), 1)
+            self.assertEqual(len(attempted), 2)
+            self.assertEqual(len(list(stage.glob(".wrangler-*.json"))), 1)
+            self.assertEqual(list(stage.glob(".admin-recovery-secrets-*.json")), [])
 
     def test_successful_recovery_reports_cleanup_failure_and_keeps_cleaning(self):
         required_secrets = {
@@ -337,10 +368,155 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
 
     def test_password_record_uses_strong_pbkdf2_and_does_not_reuse_input(self):
         record = RECOVERY.password_record("local-test-password-with-sufficient-length")
-        self.assertRegex(record, r"^pbkdf2_sha256\$310000\$[A-Za-z0-9_-]+\$[A-Za-z0-9_-]+$")
+        self.assertRegex(record, r"^pbkdf2_sha256\$100000\$[A-Za-z0-9_-]+\$[A-Za-z0-9_-]+$")
         self.assertNotIn("local-test-password", record)
         with self.assertRaises(RECOVERY.AdminRecoveryError):
             RECOVERY.password_record("too-short")
+
+    def test_version_attestation_allows_only_the_known_legacy_password_hash(self):
+        required = {"ADMIN_PASSWORD_PBKDF2", "ADMIN_TOTP_SECRET"}
+        payload = {
+            "id": RecoveryRunner.VERSION_ID,
+            "annotations": {
+                "workers/tag": RECOVERY.RECOVERY_TAG,
+                "workers/message": RECOVERY.RECOVERY_MESSAGE,
+            },
+            "resources": {"bindings": [
+                {"name": name, "type": "secret_text"}
+                for name in required | {"ADMIN_PASSWORD_HASH"}
+            ]},
+        }
+        RECOVERY._validate_version_view(json.dumps(payload), RecoveryRunner.VERSION_ID, required)
+        payload["resources"]["bindings"].append({"name": "UNEXPECTED", "type": "secret_text"})
+        with self.assertRaisesRegex(RECOVERY.AdminRecoveryError, "attestation"):
+            RECOVERY._validate_version_view(json.dumps(payload), RecoveryRunner.VERSION_ID, required)
+
+    def test_remote_credential_metadata_and_ambiguous_readbacks_fail_closed(self):
+        completed = lambda returncode, stdout="": subprocess.CompletedProcess([], returncode, stdout, "")
+        runners = (
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unavailable")),
+            lambda *_args, **_kwargs: completed(1),
+            lambda *_args, **_kwargs: completed(0, "{}"),
+            lambda *_args, **_kwargs: completed(0, "[null]"),
+            lambda *_args, **_kwargs: completed(0, '[{"name":1}]'),
+        )
+        for runner in runners:
+            with self.subTest(runner=runner), self.assertRaisesRegex(
+                RECOVERY.AdminRecoveryError,
+                r"^remote_outcome_unknown\b",
+            ):
+                RECOVERY._remote_secret_names(
+                    "/node", "/wrangler", "/config", env={}, cwd=ROOT, runner=runner,
+                )
+
+        required = {"ADMIN_PASSWORD_PBKDF2", "ADMIN_TOTP_SECRET"}
+        secret_list = json.dumps([
+            {"name": name, "type": "secret_text"}
+            for name in required | {"ADMIN_PASSWORD_HASH"}
+        ])
+        names = RECOVERY._remote_secret_names(
+            "/node",
+            "/wrangler",
+            "/config",
+            env={},
+            cwd=ROOT,
+            runner=lambda *_args, **_kwargs: completed(0, secret_list),
+        )
+        self.assertEqual(names, required | {"ADMIN_PASSWORD_HASH"})
+        RECOVERY._validate_credential_secret_names(names, required)
+        for invalid in (
+            {"ADMIN_PASSWORD_PBKDF2"},
+            required | {"UNEXPECTED_SECRET"},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                RECOVERY.AdminRecoveryError,
+                "Secret name set",
+            ):
+                RECOVERY._validate_credential_secret_names(invalid, required)
+
+        for runner in (
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unavailable")),
+            lambda *_args, **_kwargs: completed(1),
+            lambda *_args, **_kwargs: completed(0, "{}"),
+        ):
+            with self.subTest(version_runner=runner), self.assertRaisesRegex(
+                RECOVERY.AdminRecoveryError,
+                r"^remote_outcome_unknown\b",
+            ):
+                RECOVERY._remote_version_ids(
+                    "/node", "/wrangler", "/config", env={}, cwd=ROOT, runner=runner,
+                )
+
+        with self.assertRaisesRegex(RECOVERY.AdminRecoveryError, r"^remote_outcome_unknown\b"):
+            RECOVERY._recover_uploaded_version_id([], [])
+        with self.assertRaisesRegex(RECOVERY.AdminRecoveryError, r"^remote_outcome_unknown\b"):
+            RECOVERY._recover_uploaded_version_id([], [
+                {
+                    "id": RecoveryRunner.VERSION_ID,
+                    "annotations": {
+                        "workers/tag": RECOVERY.RECOVERY_TAG,
+                        "workers/message": RECOVERY.RECOVERY_MESSAGE,
+                    },
+                },
+                {"id": RecoveryRunner.SOURCE_VERSION_ID, "annotations": {}},
+            ])
+        for versions in (
+            [],
+            [None],
+            [{"id": RecoveryRunner.SOURCE_VERSION_ID, "annotations": {}}],
+            [{
+                "id": RecoveryRunner.VERSION_ID,
+                "annotations": {
+                    "workers/tag": RECOVERY.RECOVERY_TAG,
+                    "workers/message": RECOVERY.RECOVERY_MESSAGE,
+                },
+            }],
+        ):
+            with self.subTest(latest_versions=versions):
+                with self.assertRaisesRegex(RECOVERY.AdminRecoveryError, r"^remote_outcome_unknown\b"):
+                    RECOVERY._validate_latest_reviewed_version(
+                        versions,
+                        RecoveryRunner.SOURCE_VERSION_ID,
+                    )
+        with self.assertRaisesRegex(RECOVERY.AdminRecoveryError, r"^remote_outcome_unknown\b"):
+            RECOVERY._recover_deployment_id("{}", RecoveryRunner.VERSION_ID)
+
+    def test_credential_bulk_failure_reconciles_once_without_repeating_the_write(self):
+        required = {"ADMIN_PASSWORD_PBKDF2", "ADMIN_TOTP_SECRET"}
+        for creates_version, succeeds in ((True, True), (False, False)):
+            with self.subTest(creates_version=creates_version), tempfile.TemporaryDirectory() as temporary:
+                runner = RecoveryRunner(
+                    required,
+                    credential_returncode=1,
+                    credential_creates_version=creates_version,
+                )
+                runner.uploaded = True
+                manifest = pathlib.Path(temporary) / "required-secrets.json"
+                manifest.write_text(
+                    json.dumps({"version": 1, "required": sorted(required)}),
+                    encoding="ascii",
+                )
+                if succeeds:
+                    version_id = RECOVERY.migrate_admin_credentials(
+                        "/node", "/wrangler", "/config", manifest,
+                        "local-test-password-with-sufficient-length",
+                        "JBSWY3DPEHPK3PXP",
+                        RecoveryRunner.SOURCE_VERSION_ID,
+                        env={}, cwd=ROOT, runner=runner,
+                    )
+                    self.assertEqual(version_id, RecoveryRunner.VERSION_ID)
+                else:
+                    with self.assertRaisesRegex(RECOVERY.AdminRecoveryError, r"^remote_outcome_unknown\b"):
+                        RECOVERY.migrate_admin_credentials(
+                            "/node", "/wrangler", "/config", manifest,
+                            "local-test-password-with-sufficient-length",
+                            "JBSWY3DPEHPK3PXP",
+                            RecoveryRunner.SOURCE_VERSION_ID,
+                            env={}, cwd=ROOT, runner=runner,
+                        )
+
+                commands = [call[0] for call in runner.calls]
+                self.assertEqual(sum("bulk" in command for command in commands), 1)
 
     def test_login_proof_requires_303_and_a_strict_secure_session_cookie(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -352,17 +528,31 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
                 },
             }), encoding="ascii")
             config.chmod(0o600)
-            connection = LoginConnection(LoginResponse(
-                303,
-                [
-                    ("Location", "/allow-ip/admin"),
-                    (
-                        "Set-Cookie",
-                        "sub2api_allow_admin=" + "a" * 64
-                        + "; Path=/allow-ip/admin; Max-Age=604800; HttpOnly; Secure; SameSite=Strict",
-                    ),
-                ],
-            ))
+            connection = LoginConnection([
+                LoginResponse(
+                    303,
+                    [
+                        ("Location", "/allow-ip/admin"),
+                        (
+                            "Set-Cookie",
+                            "sub2api_allow_admin=" + "a" * 64
+                            + "; Path=/allow-ip/admin; Max-Age=300; HttpOnly; Secure; SameSite=Strict",
+                        ),
+                    ],
+                ),
+                LoginResponse(200, [], b'<input type="hidden" name="csrf" value="b" />'),
+                LoginResponse(
+                    303,
+                    [
+                        ("Location", "/allow-ip/admin"),
+                        (
+                            "Set-Cookie",
+                            "sub2api_allow_admin=" + "c" * 64
+                            + "; Path=/allow-ip/admin; Max-Age=604800; HttpOnly; Secure; SameSite=Strict",
+                        ),
+                    ],
+                ),
+            ])
 
             RECOVERY.prove_admin_login(
                 config,
@@ -373,16 +563,21 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
             )
 
         self.assertEqual(connection.host, "api.example.test")
-        self.assertEqual(connection.path, "/allow-ip/admin")
-        fields = urllib.parse.parse_qs(connection.body.decode("ascii"), strict_parsing=True)
+        self.assertEqual(len(connection.requests), 3)
+        self.assertEqual(connection.requests[0][1], "/allow-ip/admin")
+        fields = urllib.parse.parse_qs(connection.requests[0][2].decode("ascii"), strict_parsing=True)
         self.assertEqual(fields["action"], ["login"])
         self.assertEqual(fields["username"], ["admin-test-user"])
         self.assertEqual(fields["password"], ["local-test-password-with-sufficient-length"])
-        self.assertRegex(fields["token"][0], r"^\d{6}$")
+        self.assertNotIn("token", fields)
+        totp_fields = urllib.parse.parse_qs(connection.requests[2][2].decode("ascii"), strict_parsing=True)
+        self.assertEqual(totp_fields["action"], ["login_totp"])
+        self.assertEqual(totp_fields["csrf"], ["b"])
+        self.assertRegex(totp_fields["token"][0], r"^\d{6}$")
         self.assertTrue(connection.closed)
 
         for status, headers in (
-            (200, connection.response.headers),
+            (200, []),
             (303, [("Location", "/allow-ip/admin"), ("Set-Cookie", "sub2api_allow_admin=" + "b" * 64 + "; Secure; HttpOnly")]),
             (303, [
                 ("Location", "/allow-ip/admin"),
@@ -402,7 +597,7 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
                     },
                 }), encoding="ascii")
                 config.chmod(0o600)
-                failing = LoginConnection(LoginResponse(status, headers))
+                failing = LoginConnection([LoginResponse(status, headers)])
                 with self.assertRaisesRegex(RECOVERY.AdminRecoveryError, "login proof failed"):
                     RECOVERY.prove_admin_login(
                         config,
@@ -435,6 +630,21 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
         cookie = "sub2api_allow_admin=" + "a" * 64 + "; Path=/allow-ip/admin; Max-Age=604800; HttpOnly; Secure; SameSite=Strict"
         self.assertFalse(RECOVERY._validate_login_cookie([("Set-Cookie", cookie), ("Set-Cookie", cookie)]))
         self.assertFalse(RECOVERY._validate_login_cookie([("Set-Cookie", "sub2api_allow_admin=invalid; Secure")]))
+        with self.assertRaisesRegex(RECOVERY.AdminRecoveryError, "login proof failed"):
+            RECOVERY._cookie_value([])
+        with self.assertRaisesRegex(RECOVERY.AdminRecoveryError, "login proof failed"):
+            RECOVERY._cookie_value([("Set-Cookie", "sub2api_allow_admin=invalid; Secure")])
+        pending_value = "sub2api_allow_admin=" + "b" * 64
+        for headers in (
+            [],
+            [("Set-Cookie", pending_value), ("Set-Cookie", pending_value)],
+            [("Set-Cookie", "sub2api_allow_admin=invalid; Secure")],
+            [("Set-Cookie", pending_value + "; Path=/allow-ip/admin; Path=/allow-ip/admin")],
+            [("Set-Cookie", pending_value + "; Secure; Secure")],
+            [("Set-Cookie", pending_value + "; Path=/allow-ip/admin; Max-Age=300; HttpOnly; Secure; SameSite=Strict; Domain=api.example.test")],
+        ):
+            with self.subTest(pending_headers=headers):
+                self.assertFalse(RECOVERY._pending_login_cookie(headers))
 
     def test_recovery_uploads_and_deploys_one_attested_version_before_login_proof(self):
         required_secrets = {
@@ -470,25 +680,32 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
 
         commands = [call[0] for call in runner.calls]
         joined = "\n".join(" ".join(command) for command in commands)
-        self.assertNotIn(" secret bulk ", f" {joined} ")
+        self.assertIn(" versions secret bulk ", f" {joined} ")
         self.assertNotIn("local-test-password", joined)
         self.assertNotIn("JBSWY3DPEHPK3PXP", joined)
-        command_inputs = "\n".join(str(call[1].get("input") or "") for call in runner.calls)
-        self.assertNotIn("local-test-password", command_inputs)
-        self.assertNotIn("JBSWY3DPEHPK3PXP", command_inputs)
+        self.assertNotIn("local-test-password", joined)
         self.assertIn(" versions upload ", f" {joined} ")
-        self.assertIn("--secrets-file", joined)
+        self.assertNotIn("--secrets-file", joined)
+        self.assertEqual(len(runner.credential_payloads), 1)
+        self.assertEqual(
+            set(json.loads(runner.credential_payloads[0])),
+            {"ADMIN_PASSWORD_PBKDF2", "ADMIN_TOTP_SECRET"},
+        )
         self.assertIn("--strict", joined)
         self.assertIn(f"{RecoveryRunner.VERSION_ID}@100%", joined)
-        self.assertFalse(runner.secret_file.exists())
+        self.assertIsNone(runner.secret_file)
         self.assertEqual(result["version_id"], RecoveryRunner.VERSION_ID)
         self.assertEqual(result["deployment_id"], RecoveryRunner.DEPLOYMENT_ID)
         upload_position = next(index for index, event in enumerate(events) if isinstance(event, tuple) and "upload" in event)
-        view_position = next(index for index, event in enumerate(events) if isinstance(event, tuple) and "view" in event)
+        view_positions = [index for index, event in enumerate(events) if isinstance(event, tuple) and "view" in event]
+        bulk_position = next(index for index, event in enumerate(events) if isinstance(event, tuple) and "bulk" in event)
         deploy_position = next(index for index, event in enumerate(events) if isinstance(event, tuple) and "deploy" in event)
         status_position = next(index for index, event in enumerate(events) if isinstance(event, tuple) and "status" in event)
-        self.assertLess(upload_position, view_position)
-        self.assertLess(view_position, deploy_position)
+        self.assertEqual(len(view_positions), 2)
+        self.assertLess(upload_position, view_positions[0])
+        self.assertLess(view_positions[0], bulk_position)
+        self.assertLess(bulk_position, view_positions[1])
+        self.assertLess(view_positions[1], deploy_position)
         self.assertLess(deploy_position, status_position)
         self.assertEqual(events[-1], "login-proof")
 
@@ -554,7 +771,7 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
         self.assertTrue(any("versions" in command and "deploy" in command for command in commands))
         self.assertEqual(result["version_id"], RecoveryRunner.VERSION_ID)
 
-    def test_unproven_upload_raises_stable_unknown_without_deploying(self):
+    def test_upload_readback_recovers_missing_structured_output(self):
         required_secrets = {
             "TURNSTILE_SECRET_KEY",
             "CLOUDFLARE_API_TOKEN",
@@ -573,19 +790,19 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
             stage = pathlib.Path(temporary)
             prepare_recovery_stage(stage, required_secrets)
 
-            with self.assertRaisesRegex(RECOVERY.AdminRecoveryError, r"^remote_outcome_unknown\b"):
-                RECOVERY.publish_recovery_version(
-                    stage,
-                    "local-test-password-with-sufficient-length",
-                    "JBSWY3DPEHPK3PXP",
-                    pathlib.Path("/opt/node/bin/node"),
-                    env={"HOME": "/home/operator"},
-                    runner=runner,
-                    login_prover=lambda *_args: None,
-                )
+            result = RECOVERY.publish_recovery_version(
+                stage,
+                "local-test-password-with-sufficient-length",
+                "JBSWY3DPEHPK3PXP",
+                pathlib.Path("/opt/node/bin/node"),
+                env={"HOME": "/home/operator"},
+                runner=runner,
+                login_prover=lambda *_args: None,
+            )
 
         commands = [call[0] for call in runner.calls]
-        self.assertFalse(any("versions" in command and "deploy" in command for command in commands))
+        self.assertTrue(any("versions" in command and "deploy" in command for command in commands))
+        self.assertEqual(result["version_id"], RecoveryRunner.VERSION_ID)
 
     def test_invalid_uploaded_version_id_raises_stable_unknown(self):
         required_secrets = {
@@ -613,7 +830,7 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
                     login_prover=lambda *_args: None,
                 )
 
-    def test_unproven_deploy_raises_stable_unknown_without_login_proof(self):
+    def test_deploy_readback_recovers_missing_structured_output(self):
         required_secrets = {
             "TURNSTILE_SECRET_KEY",
             "CLOUDFLARE_API_TOKEN",
@@ -637,18 +854,18 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
                 nonlocal login_proved
                 login_proved = True
 
-            with self.assertRaisesRegex(RECOVERY.AdminRecoveryError, r"^remote_outcome_unknown\b"):
-                RECOVERY.publish_recovery_version(
-                    stage,
-                    "local-test-password-with-sufficient-length",
-                    "JBSWY3DPEHPK3PXP",
-                    pathlib.Path("/opt/node/bin/node"),
-                    env={"HOME": "/home/operator"},
-                    runner=runner,
-                    login_prover=login_prover,
-                )
+            result = RECOVERY.publish_recovery_version(
+                stage,
+                "local-test-password-with-sufficient-length",
+                "JBSWY3DPEHPK3PXP",
+                pathlib.Path("/opt/node/bin/node"),
+                env={"HOME": "/home/operator"},
+                runner=runner,
+                login_prover=login_prover,
+            )
 
-        self.assertFalse(login_proved)
+        self.assertTrue(login_proved)
+        self.assertEqual(result["deployment_id"], RecoveryRunner.DEPLOYMENT_ID)
 
     def test_transient_version_readback_is_reconciled_without_reuploading(self):
         required_secrets = {
@@ -678,7 +895,7 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
 
         commands = [call[0] for call in runner.calls]
         self.assertEqual(sum("versions" in command and "upload" in command for command in commands), 1)
-        self.assertEqual(sum("versions" in command and "view" in command for command in commands), 2)
+        self.assertEqual(sum("versions" in command and "view" in command for command in commands), 3)
         self.assertEqual(result["version_id"], RecoveryRunner.VERSION_ID)
 
     def test_transient_deployment_readback_is_reconciled_without_redeploying(self):
@@ -759,7 +976,7 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
                 deployed = any("versions" in command and "deploy" in command for command in commands)
                 self.assertEqual(deployed, expected_deploy)
                 self.assertFalse(login_called)
-                self.assertFalse(runner.secret_file.exists())
+                self.assertIsNone(runner.secret_file)
 
     def test_recovery_attestation_binds_the_full_source_and_toolchain_hashes(self):
         self.assertLessEqual(len(RECOVERY.RECOVERY_MESSAGE), 120)
@@ -935,8 +1152,132 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
         self.assertEqual(call.args[:2], (password, seed))
         self.assertTrue(call.kwargs["apply"])
 
+    def test_cli_apply_reads_paired_secret_files_without_getpass(self):
+        password = "local-test-password-with-sufficient-length"
+        seed = "JBSWY3DPEHPK3PXP"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = root / "wrangler.private.jsonc"
+            config.write_text("{}\n", encoding="ascii")
+            config.chmod(0o600)
+            secret_dir = root / "secrets"
+            secret_dir.mkdir(mode=0o700)
+            password_file = secret_dir / "password"
+            seed_file = secret_dir / "totp"
+            password_file.write_bytes((password + " \n").encode("utf-8"))
+            seed_file.write_bytes((seed.lower() + "\n").encode("ascii"))
+            password_file.chmod(0o600)
+            seed_file.chmod(0o600)
+            output = io.StringIO()
+            errors = io.StringIO()
+
+            def fail_getpass(_prompt):
+                raise AssertionError("getpass must not run when secret files are provided")
+
+            with (
+                mock.patch.object(RECOVERY, "run_recovery_candidate", return_value={}) as candidate,
+                contextlib.redirect_stdout(output),
+                contextlib.redirect_stderr(errors),
+            ):
+                result = RECOVERY.main(
+                    [
+                        "--apply",
+                        "--password-file", str(password_file),
+                        "--totp-seed-file", str(seed_file),
+                        "--node", "/usr/bin/node",
+                        "--home", str(root),
+                        "--wrangler-config", str(config),
+                    ],
+                    input_func=lambda _prompt: "RESET ADMIN ACCESS",
+                    getpass_func=fail_getpass,
+                    tty_streams=(PrivateTty(), PrivateTty(), PrivateTty()),
+                )
+
+        self.assertEqual(result, 0)
+        self.assertNotIn(password, output.getvalue() + errors.getvalue())
+        self.assertNotIn(seed, output.getvalue() + errors.getvalue())
+        self.assertEqual(candidate.call_args.args[:2], (password + " ", seed.lower()))
+
+    def test_private_secret_file_rejects_unsafe_or_multiline_inputs(self):
+        password = "local-test-password-with-sufficient-length"
+        with tempfile.TemporaryDirectory() as temporary:
+            outside = pathlib.Path(temporary)
+            worktree = outside / "repo"
+            worktree.mkdir()
+            secret_dir = outside / "secrets"
+            secret_dir.mkdir(mode=0o700)
+            safe = secret_dir / "password"
+            safe.write_text(password + "\n", encoding="ascii")
+            safe.chmod(0o600)
+            self.assertEqual(
+                RECOVERY._read_private_secret_line(
+                    safe,
+                    expected_uid=os.getuid(),
+                    max_characters=RECOVERY.MAX_ADMIN_PASSWORD_CHARACTERS,
+                    label="administrator password file",
+                ),
+                password,
+            )
+            with self.assertRaisesRegex(RECOVERY.AdminRecoveryError, "must be absolute"):
+                RECOVERY._read_private_secret_line(
+                    pathlib.Path("password"),
+                    expected_uid=os.getuid(),
+                    max_characters=RECOVERY.MAX_ADMIN_PASSWORD_CHARACTERS,
+                    label="administrator password file",
+                )
+            inside = worktree / "password"
+            inside.write_text(password + "\n", encoding="ascii")
+            inside.chmod(0o600)
+            allowed_dir = worktree / ".admin-recovery"
+            allowed_dir.mkdir(mode=0o700)
+            allowed = allowed_dir / "password"
+            allowed.write_text(password + "\n", encoding="ascii")
+            allowed.chmod(0o600)
+            with mock.patch.object(RECOVERY, "ROOT", worktree):
+                with self.assertRaisesRegex(RECOVERY.AdminRecoveryError, r"must be under \.admin-recovery/"):
+                    RECOVERY._read_private_secret_line(
+                        inside,
+                        expected_uid=os.getuid(),
+                        max_characters=RECOVERY.MAX_ADMIN_PASSWORD_CHARACTERS,
+                        label="administrator password file",
+                    )
+                self.assertEqual(
+                    RECOVERY._read_private_secret_line(
+                        allowed,
+                        expected_uid=os.getuid(),
+                        max_characters=RECOVERY.MAX_ADMIN_PASSWORD_CHARACTERS,
+                        label="administrator password file",
+                    ),
+                    password,
+                )
+            world_readable = secret_dir / "world"
+            world_readable.write_text(password + "\n", encoding="ascii")
+            world_readable.chmod(0o644)
+            with self.assertRaisesRegex(RECOVERY.AdminRecoveryError, "is invalid"):
+                RECOVERY._read_private_secret_line(
+                    world_readable,
+                    expected_uid=os.getuid(),
+                    max_characters=RECOVERY.MAX_ADMIN_PASSWORD_CHARACTERS,
+                    label="administrator password file",
+                )
+            multiline = secret_dir / "multiline"
+            multiline.write_text(password + "\nextra\n", encoding="ascii")
+            multiline.chmod(0o600)
+            with self.assertRaisesRegex(RECOVERY.AdminRecoveryError, "is invalid"):
+                RECOVERY._read_private_secret_line(
+                    multiline,
+                    expected_uid=os.getuid(),
+                    max_characters=RECOVERY.MAX_ADMIN_PASSWORD_CHARACTERS,
+                    label="administrator password file",
+                )
+
     def test_cli_rejects_conflicting_modes_and_unknown_arguments(self):
-        for arguments in (("check", "--apply"), ("--unknown",)):
+        for arguments in (
+            ("check", "--apply"),
+            ("--unknown",),
+            ("check", "--password-file", "/tmp/password"),
+            ("--apply", "--password-file", "/tmp/password"),
+        ):
             with self.subTest(arguments=arguments):
                 with contextlib.redirect_stderr(io.StringIO()):
                     with self.assertRaises(SystemExit) as raised:
@@ -986,24 +1327,23 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
             candidate.assert_not_called()
 
 class LoginResponse:
-    def __init__(self, status, headers):
+    def __init__(self, status, headers, body=b""):
         self.status = status
         self.headers = headers
+        self.body = body
 
     def getheaders(self):
         return self.headers
 
     def read(self, _size):
-        return b""
+        return self.body
 
 
 class LoginConnection:
-    def __init__(self, response):
-        self.response = response
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
         self.host = None
-        self.path = None
-        self.body = None
-        self.headers = None
         self.closed = False
 
     def factory(self, host, _port, **_kwargs):
@@ -1011,13 +1351,10 @@ class LoginConnection:
         return self
 
     def request(self, method, path, body=None, headers=None):
-        self.path = path
-        self.body = body
-        self.headers = headers
-        self.method = method
+        self.requests.append((method, path, body, headers))
 
     def getresponse(self):
-        return self.response
+        return self.responses.pop(0)
 
     def close(self):
         self.closed = True

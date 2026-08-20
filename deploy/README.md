@@ -278,6 +278,26 @@ browser-login proof. Do not replace this controller with a bare `wrangler
 deploy`, and do not use it for final-source until the documented promoted-seed
 proof has completed.
 
+`deploy/recover-worker-admin.py --apply` can read the new password and TOTP
+seed from a pair of operator-owned mode-`0600` files instead of `getpass`,
+which often truncates or corrupts pasted input. Both files must be absolute
+paths, contain a single UTF-8 line, and keep a trailing newline only. Inside
+this repository they must live under gitignored `.admin-recovery/`. Paths
+outside the worktree are still accepted. Do not put those values on the
+command line, in tracked files, or in chat. After a successful login, delete
+the files. The `--apply` confirmation phrase and private TTY requirement are
+unchanged. The recovery controller uploads one reviewed source version without
+changing traffic, verifies that exact version, and then uses `wrangler versions
+secret bulk` on standard input to clone it while replacing only
+`ADMIN_PASSWORD_PBKDF2` and `ADMIN_TOTP_SECRET`. It identifies and verifies the
+single resulting credential version before one explicit `100%` deployment and
+the complete password, TOTP, and secure-cookie login proof. A non-zero or
+missing Wrangler result is reconciled only through bounded read-only version
+and deployment queries; no upload, Secret write, or deployment is retried.
+`ADMIN_PASSWORD_HASH` is accepted only as a known legacy Secret name during
+recovery and is not read or changed by this flow. Any other unknown Secret name
+fails closed.
+
 Use this procedure only when the registered migration verifier exists and the
 old administrator Base32 seed is unavailable. Do not delete the verifier, its
 replay-state file, or its lock file to make `enroll --apply` work. The supported
