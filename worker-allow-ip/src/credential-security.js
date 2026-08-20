@@ -163,8 +163,19 @@ export async function verifyPbkdf2Password(password, record) {
     const expected = base64UrlDecode(parts[3]);
     if (salt.byteLength < 16 || expected.byteLength !== 32) return false;
     const actual = await derivePbkdf2(password, salt, iterations);
-    return timingSafeBytesEqual(actual, expected);
+    const passwordOk = await timingSafeBytesEqual(actual, expected);
+    console.warn(JSON.stringify({
+      message: "admin_pbkdf2_runtime_diagnostic",
+      derivation_ok: true,
+      password_ok: passwordOk,
+    }));
+    return passwordOk;
   } catch {
+    console.warn(JSON.stringify({
+      message: "admin_pbkdf2_runtime_diagnostic",
+      derivation_ok: false,
+      password_ok: false,
+    }));
     return false;
   }
 }

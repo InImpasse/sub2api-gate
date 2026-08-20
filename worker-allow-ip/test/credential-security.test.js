@@ -296,8 +296,19 @@ test("admin passwords use a salted PBKDF2 record and reject tampering", async ()
 
 test("admin password verification matches an independent PBKDF2 fixed vector", async () => {
   const record = "pbkdf2_sha256$100000$AAECAwQFBgcICQoLDA0ODw$qCj5jsXKsJd7TBBNk5JduIxnrurIUwcg5rDmjfGwquc";
-  assert.equal(await verifyPbkdf2Password("pbkdf2-production-vector", record), true);
-  assert.equal(await verifyPbkdf2Password("pbkdf2-production-vector\n", record), false);
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (value) => warnings.push(JSON.parse(String(value)));
+  try {
+    assert.equal(await verifyPbkdf2Password("pbkdf2-production-vector", record), true);
+    assert.equal(await verifyPbkdf2Password("pbkdf2-production-vector\n", record), false);
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.deepEqual(warnings, [
+    { message: "admin_pbkdf2_runtime_diagnostic", derivation_ok: true, password_ok: true },
+    { message: "admin_pbkdf2_runtime_diagnostic", derivation_ok: true, password_ok: false },
+  ]);
 });
 
 test("secret comparisons hash inputs before constant-time comparison", async () => {
