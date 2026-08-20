@@ -765,6 +765,12 @@ async function handleAdminLogin(form, env, request) {
   const passwordOk = await verifyPbkdf2Password(password, env.ADMIN_PASSWORD_PBKDF2);
 
   if (!usernameOk || !passwordOk) {
+    console.warn(JSON.stringify({
+      message: "admin_login_diagnostic",
+      username_ok: usernameOk,
+      password_record_valid: isValidAdminPasswordRecord(env.ADMIN_PASSWORD_PBKDF2),
+      password_ok: passwordOk,
+    }));
     return html(renderLogin("The username or password is incorrect."), 403);
   }
   await resetAuthAttempts(env, "admin", attemptKey);
