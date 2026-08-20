@@ -137,7 +137,7 @@ export async function passwordHashFingerprint(secret, passwordHash) {
   return hmacHex(secret, `sub2api-password-hash:${String(passwordHash || "")}`);
 }
 
-export async function pbkdf2PasswordRecord(password, iterations = 310_000, salt = null) {
+export async function pbkdf2PasswordRecord(password, iterations = 100_000, salt = null) {
   if (!Number.isInteger(iterations) || iterations < 100_000 || iterations > 2_000_000) {
     throw new Error("PBKDF2 iterations are outside the supported range");
   }
@@ -163,19 +163,8 @@ export async function verifyPbkdf2Password(password, record) {
     const expected = base64UrlDecode(parts[3]);
     if (salt.byteLength < 16 || expected.byteLength !== 32) return false;
     const actual = await derivePbkdf2(password, salt, iterations);
-    const passwordOk = await timingSafeBytesEqual(actual, expected);
-    console.warn(JSON.stringify({
-      message: "admin_pbkdf2_runtime_diagnostic",
-      derivation_ok: true,
-      password_ok: passwordOk,
-    }));
-    return passwordOk;
+    return timingSafeBytesEqual(actual, expected);
   } catch {
-    console.warn(JSON.stringify({
-      message: "admin_pbkdf2_runtime_diagnostic",
-      derivation_ok: false,
-      password_ok: false,
-    }));
     return false;
   }
 }

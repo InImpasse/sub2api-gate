@@ -285,10 +285,10 @@ test("unmigrated invites keep UUID access only until credentials are issued", as
 test("admin passwords use a salted PBKDF2 record and reject tampering", async () => {
   const record = await pbkdf2PasswordRecord(
     "correct horse battery staple",
-    310_000,
+    100_000,
     new Uint8Array(16).fill(7),
   );
-  assert.match(record, /^pbkdf2_sha256\$310000\$[A-Za-z0-9_-]+\$[A-Za-z0-9_-]+$/);
+  assert.match(record, /^pbkdf2_sha256\$100000\$[A-Za-z0-9_-]+\$[A-Za-z0-9_-]+$/);
   assert.equal(await verifyPbkdf2Password("correct horse battery staple", record), true);
   assert.equal(await verifyPbkdf2Password("wrong password", record), false);
   assert.equal(await verifyPbkdf2Password("correct horse battery staple", `${record}x`), false);
@@ -296,19 +296,8 @@ test("admin passwords use a salted PBKDF2 record and reject tampering", async ()
 
 test("admin password verification matches an independent PBKDF2 fixed vector", async () => {
   const record = "pbkdf2_sha256$100000$AAECAwQFBgcICQoLDA0ODw$qCj5jsXKsJd7TBBNk5JduIxnrurIUwcg5rDmjfGwquc";
-  const warnings = [];
-  const originalWarn = console.warn;
-  console.warn = (value) => warnings.push(JSON.parse(String(value)));
-  try {
-    assert.equal(await verifyPbkdf2Password("pbkdf2-production-vector", record), true);
-    assert.equal(await verifyPbkdf2Password("pbkdf2-production-vector\n", record), false);
-  } finally {
-    console.warn = originalWarn;
-  }
-  assert.deepEqual(warnings, [
-    { message: "admin_pbkdf2_runtime_diagnostic", derivation_ok: true, password_ok: true },
-    { message: "admin_pbkdf2_runtime_diagnostic", derivation_ok: true, password_ok: false },
-  ]);
+  assert.equal(await verifyPbkdf2Password("pbkdf2-production-vector", record), true);
+  assert.equal(await verifyPbkdf2Password("pbkdf2-production-vector\n", record), false);
 });
 
 test("secret comparisons hash inputs before constant-time comparison", async () => {
