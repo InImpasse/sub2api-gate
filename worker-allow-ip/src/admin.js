@@ -5142,12 +5142,13 @@ function page(title, body, layout = "narrow") {
       display: grid;
       grid-template-columns: minmax(0, 1fr);
       place-items: center;
-      padding: 40px 20px;
+      padding: 48px 28px;
+      font-size: 15px;
       background: #f5f5f7;
     }
     .wide-layout { align-items: start; }
-    main { width: 100%; max-width: 420px; min-width: 0; justify-self: center; }
-    main.wide { max-width: 1320px; }
+    main { width: 100%; max-width: 480px; min-width: 0; justify-self: center; }
+    main.wide { max-width: 1280px; }
     form, .message, .admin, .create, .hero {
       display: grid;
       grid-template-columns: minmax(0, 1fr);
@@ -5195,8 +5196,8 @@ function page(title, body, layout = "narrow") {
       min-height: 36px;
     }
     .section-head h2, .subhead h3 { margin: 0; color: #1d1d1f; line-height: 1.2; }
-    .section-head h2 { font-size: 20px; font-weight: 700; letter-spacing: 0; }
-    .subhead h3 { font-size: 14px; font-weight: 600; }
+    .section-head h2 { font-size: 18px; font-weight: 700; letter-spacing: 0; }
+    .subhead h3 { font-size: 15px; font-weight: 600; }
     .invite-list, .trash-list { display: grid; gap: 16px; }
     .invite-card { display: grid; gap: 20px; }
     .invite-main {
@@ -5275,7 +5276,7 @@ function page(title, body, layout = "narrow") {
     .field { display: grid; gap: 6px; min-width: 0; }
     .span-2 { grid-column: 1 / -1; }
     .panel, .message {
-      padding: 20px;
+      padding: 24px;
       border: 0.5px solid rgba(255, 255, 255, 0.62);
       border-radius: 20px;
       background: rgba(255, 255, 255, 0.64);
@@ -5298,6 +5299,7 @@ function page(title, body, layout = "narrow") {
     }
     .topbar form { display: block; }
     .topbar p, .muted, small, .lede, .eyebrow { color: #5f6065; }
+    small { font-size: 14px; line-height: 1.45; }
     .eyebrow {
       margin: 0;
       font-size: 13px;
@@ -5313,7 +5315,7 @@ function page(title, body, layout = "narrow") {
     }
     label {
       color: #1d1d1f;
-      font-size: 13px;
+      font-size: 14px;
       font-weight: 600;
       letter-spacing: 0;
     }
@@ -5451,7 +5453,7 @@ function page(title, body, layout = "narrow") {
     }
     .invite-edit { display: grid; gap: 14px; min-width: 0; }
     .inline-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-    .hint { color: #5f6065; font-size: 13px; line-height: 1.4; }
+    .hint { color: #5f6065; font-size: 14px; line-height: 1.45; }
     .invite-meta strong { display: block; overflow-wrap: anywhere; }
     td > strong, td > small { display: block; overflow-wrap: anywhere; }
     .stat-row {
@@ -5617,13 +5619,14 @@ function page(title, body, layout = "narrow") {
       }
     }
     @media (max-width: 1100px) {
+      body { padding: 32px 24px 40px; }
       .invite-main { grid-template-columns: minmax(0, 1fr); }
     }
     @media (max-width: 920px) {
       .inspector-filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 680px) {
-      body { place-items: start; padding: 20px 16px; }
+      body { place-items: start; padding: 20px 14px 32px; }
       .topbar, .section-head, .subhead, .invite-meta, .trash-meta, .form-footer, .ip-group-summary, .pagination {
         display: grid;
         grid-template-columns: minmax(0, 1fr);
@@ -5649,7 +5652,7 @@ function page(title, body, layout = "narrow") {
       .ip-preview { max-width: 100%; }
       th, td { padding: 10px 8px; }
       h1 { font-size: 28px; }
-      .panel, .message { padding: 16px; border-radius: 16px; }
+      .panel, .message { padding: 18px; border-radius: 16px; }
       .admin-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .admin-tabs .nav-link:last-child { grid-column: 1 / -1; }
     }

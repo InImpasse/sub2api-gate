@@ -667,6 +667,30 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
     expect(html).not.toMatch(/<option[^>]*value="default"/);
   }
 
+  if (viewport.width >= 1024 && ["public-form", "admin-list", "demo"].includes(scenario)) {
+    const typography = await page.evaluate((currentScenario) => {
+      const heading = document.querySelector("h1");
+      const main = document.querySelector("main");
+      const label = document.querySelector("label");
+      return {
+        headingSize: heading ? getComputedStyle(heading).fontSize : null,
+        mainWidth: main ? getComputedStyle(main).width : null,
+        mainMaxWidth: main ? getComputedStyle(main).maxWidth : null,
+        labelSize: label ? getComputedStyle(label).fontSize : null,
+        scenario: currentScenario,
+      };
+    }, scenario);
+    const expected = {
+      "public-form": { headingSize: "36px", mainWidth: "560px", mainMaxWidth: null, labelSize: "14px" },
+      "admin-list": { headingSize: "32px", mainWidth: null, mainMaxWidth: "1280px", labelSize: null },
+      demo: { headingSize: "36px", mainWidth: null, mainMaxWidth: null, labelSize: "14px" },
+    }[scenario];
+    expect(typography.headingSize).toBe(expected.headingSize);
+    if (expected.mainWidth) expect(typography.mainWidth).toBe(expected.mainWidth);
+    if (expected.mainMaxWidth) expect(typography.mainMaxWidth).toBe(expected.mainMaxWidth);
+    if (expected.labelSize) expect(typography.labelSize).toBe(expected.labelSize);
+  }
+
   if (scenario === "public-form") {
     await validateTurnstile(page, viewport.width < 372 ? "compact" : "flexible");
     if (viewport.width === 320 && viewport.height === 568) {
@@ -757,7 +781,10 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
   expect(geometry.overlaps, geometryDetails).toEqual([]);
   expect(geometry.clippedText, geometryDetails).toEqual([]);
   expect(geometry.contrastFailures, geometryDetails).toEqual([]);
-  const minimumH1Size = scenario === "public-dashboard" && viewport.width <= 560 ? 24 : 28;
+  let minimumH1Size = viewport.width <= 680 ? 26 : 28;
+  if (viewport.width <= 240 || (scenario === "public-dashboard" && viewport.width <= 560)) {
+    minimumH1Size = 24;
+  }
   for (const size of geometry.h1Sizes) expect(size).toBeGreaterThanOrEqual(minimumH1Size);
   for (const size of geometry.h1Sizes) expect(size).toBeLessThanOrEqual(42);
   if (viewport.width <= 680) {

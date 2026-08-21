@@ -941,14 +941,16 @@ function page(title, body) {
       margin: 0;
       display: grid;
       place-items: center;
-      padding: 40px 20px;
+      padding: 48px 24px;
+      font-size: 16px;
       background: #f5f5f7;
     }
-    main { width: min(100%, 480px); }
+    main { width: min(100%, 560px); }
     .hero, form, .message { display: grid; gap: 20px; }
     .dashboard { display: grid; gap: 16px; }
     .hero {
-      margin-bottom: 32px;
+      gap: 14px;
+      margin-bottom: 40px;
       text-align: center;
     }
     .identity-title { overflow-wrap: anywhere; }
@@ -981,11 +983,11 @@ function page(title, body) {
     }
     .hint {
       color: #6e6e73;
-      font-size: 13px;
-      line-height: 1.45;
+      font-size: 14px;
+      line-height: 1.5;
     }
     .panel, .message {
-      padding: 24px;
+      padding: 28px;
       border: 0.5px solid rgba(255, 255, 255, 0.62);
       border-radius: 20px;
       background: rgba(255, 255, 255, 0.64);
@@ -997,7 +999,7 @@ function page(title, body) {
     }
     label {
       color: #1d1d1f;
-      font-size: 13px;
+      font-size: 14px;
       font-weight: 600;
       letter-spacing: 0;
     }
@@ -1124,7 +1126,7 @@ function page(title, body) {
     h1 {
       margin: 0;
       max-width: 100%;
-      font-size: 40px;
+      font-size: 36px;
       font-weight: 700;
       line-height: 1.1;
       letter-spacing: 0;
@@ -1133,7 +1135,7 @@ function page(title, body) {
     p { margin: 0; line-height: 1.53; }
     code {
       font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-      font-size: 12px;
+      font-size: 13px;
       overflow-wrap: anywhere;
     }
     .success { color: #248a3d; font-weight: 600; }
@@ -1149,7 +1151,7 @@ function page(title, body) {
     .api-card strong {
       overflow-wrap: anywhere;
     }
-    .api-card label { color: #6e6e73; font-size: 12px; font-weight: 500; }
+    .api-card label { color: #6e6e73; font-size: 14px; font-weight: 500; }
     .copy-line {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -1217,16 +1219,20 @@ function page(title, body) {
         transition: none !important;
       }
     }
+    @media (max-width: 768px) {
+      body { padding: 32px 20px 40px; }
+      .panel, .message { padding: 24px; }
+    }
     @media (max-width: 560px) {
       body {
         place-items: start center;
-        padding: 12px 10px 24px;
+        padding: 20px 14px 32px;
       }
       .hero {
         grid-template-columns: 56px minmax(0, 1fr);
         align-items: center;
         gap: 4px 12px;
-        margin-bottom: 16px;
+        margin-bottom: 24px;
         text-align: left;
       }
       .hero .sub2api-icon {
@@ -1239,13 +1245,13 @@ function page(title, body) {
       .hero .lede {
         grid-column: 1 / -1;
         margin-top: 6px;
-        font-size: 14px;
-        line-height: 1.42;
+        font-size: 15px;
+        line-height: 1.45;
       }
       form { gap: 12px; }
-      h1 { font-size: 28px; }
+      h1 { font-size: 30px; }
       .identity-title { font-size: 24px; line-height: 1.15; }
-      .panel, .message { padding: 16px; border-radius: 16px; }
+      .panel, .message { padding: 20px; border-radius: 16px; }
       .copy-line, .secret-copy-line { grid-template-columns: minmax(0, 1fr); }
       button, a { width: 100%; }
       button.ghost, button.compact { width: auto; }
@@ -1259,7 +1265,7 @@ function page(title, body) {
     }
     @media (max-width: 240px) {
       body { padding: 16px 6px; }
-      h1 { font-size: 28px; }
+      h1 { font-size: 24px; }
       .panel, .message { padding: 12px 6px; }
       .turnstile-widget {
         width: 130px;
