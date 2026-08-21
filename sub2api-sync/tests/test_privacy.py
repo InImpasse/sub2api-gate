@@ -325,7 +325,12 @@ class PrivacyContractTests(unittest.TestCase):
             SYNC.database_error_sqlstate(f"ERROR: 23505: {sentinel}"),
             "23505",
         )
+        self.assertEqual(
+            SYNC.database_error_sqlstate(b"ERROR: 55P03: ignored"),
+            "55P03",
+        )
         self.assertIsNone(SYNC.database_error_sqlstate(sentinel))
+        self.assertIsNone(SYNC.database_error_sqlstate(object()))
         error = SYNC.DatabaseCommandError("23505")
         self.assertEqual(str(error), "database_command_failed")
         self.assertEqual(error.sqlstate, "23505")

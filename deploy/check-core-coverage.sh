@@ -14,8 +14,7 @@ fi
 worker_report="$temporary_dir/worker-coverage.txt"
 if ! (
   cd "$repo_dir/worker-allow-ip"
-  node --test --experimental-test-coverage \
-    --experimental-test-isolation=none >"$worker_report" 2>&1
+  node --test --experimental-test-coverage >"$worker_report" 2>&1
 ); then
   tail -n 80 "$worker_report" >&2 || true
   exit 1
