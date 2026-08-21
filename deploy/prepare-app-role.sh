@@ -39,6 +39,11 @@ fi
 repo_dir="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 role_sql="$repo_dir/migrations/000_prepare_app_role.sql"
 grant_sql="$repo_dir/migrations/005_app_least_privilege.sql"
+schema_guard_sql="$repo_dir/migrations/006_allow_sub2api_schema_migrations.sql"
+function_guard_sql="$repo_dir/migrations/007_allow_sub2api_function_trigger_migrations.sql"
+alter_guard_sql="$repo_dir/migrations/008_allow_sub2api_additive_alter_migrations.sql"
+deny_list_guard_sql="$repo_dir/migrations/009_allow_sub2api_deny_list_ddl_guard.sql"
+guard_body_sql="$repo_dir/migrations/sub2api_gate_guard_app_ddl.sql"
 pg_env_exec="$repo_dir/deploy/pg-env-exec.py"
 private_env_parser="$repo_dir/deploy/private_env.py"
 
@@ -53,7 +58,9 @@ for command_name in python3 timeout base64 tr sha256sum; do
   fi
 done
 
-sha256sum "$role_sql" "$grant_sql" "$pg_env_exec" "$private_env_parser"
+sha256sum "$role_sql" "$grant_sql" "$schema_guard_sql" "$function_guard_sql" \
+  "$alter_guard_sql" "$deny_list_guard_sql" "$guard_body_sql" \
+  "$pg_env_exec" "$private_env_parser"
 if [ "$mode" != "--apply" ]; then
   echo "check only; no database connection was opened and no role was changed"
   echo "private environment file was not read"
@@ -126,6 +133,10 @@ if ! {
   printf "\\set app_password_b64 '%s'\n" "$password_b64"
   printf "\\i '%s'\n" "$role_sql"
   printf "\\i '%s'\n" "$grant_sql"
+  printf "\\i '%s'\n" "$schema_guard_sql"
+  printf "\\i '%s'\n" "$function_guard_sql"
+  printf "\\i '%s'\n" "$alter_guard_sql"
+  printf "\\i '%s'\n" "$deny_list_guard_sql"
 } | timeout --foreground -s TERM -k 1 30 \
   python3 "$pg_env_exec" --target-private-env-file "$env_file" \
     psql --quiet --no-psqlrc -v ON_ERROR_STOP=1 >/dev/null 2>/dev/null; then

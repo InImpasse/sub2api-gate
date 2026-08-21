@@ -61,6 +61,10 @@ CREATE TABLE audit_logs (
   request_body text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE channel_monitor_histories (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
 CREATE TABLE sub2api_sync_invite_owners (
   user_id bigint PRIMARY KEY,
   invite_fingerprint text NOT NULL UNIQUE,
@@ -109,6 +113,14 @@ SQL
 
 docker exec -i "$container_name" psql -U postgres -d app_role_test -v ON_ERROR_STOP=1 \
   < "$repo_dir/migrations/005_app_least_privilege.sql"
+docker exec -i "$container_name" psql -U postgres -d app_role_test -v ON_ERROR_STOP=1 \
+  < "$repo_dir/migrations/006_allow_sub2api_schema_migrations.sql"
+docker exec -i "$container_name" psql -U postgres -d app_role_test -v ON_ERROR_STOP=1 \
+  < "$repo_dir/migrations/007_allow_sub2api_function_trigger_migrations.sql"
+docker exec -i "$container_name" psql -U postgres -d app_role_test -v ON_ERROR_STOP=1 \
+  < "$repo_dir/migrations/008_allow_sub2api_additive_alter_migrations.sql"
+docker exec -i "$container_name" psql -U postgres -d app_role_test -v ON_ERROR_STOP=1 \
+  < "$repo_dir/migrations/009_allow_sub2api_deny_list_ddl_guard.sql"
 
 docker exec -i "$container_name" psql -U postgres -d app_role_test -v ON_ERROR_STOP=1 <<'SQL'
 DO $$
@@ -136,6 +148,7 @@ BEGIN
     RAISE EXCEPTION 'future-object default grants survived';
   END IF;
   IF NOT has_schema_privilege('sub2api_app', 'public', 'CREATE')
+     OR NOT has_table_privilege('sub2api_app', 'public.usage_logs', 'TRIGGER')
      OR has_database_privilege('sub2api_app', current_database(), 'TEMPORARY')
      OR has_table_privilege('sub2api_app', 'public.audit_logs', 'TRIGGER')
      OR has_table_privilege('sub2api_app', 'public.audit_logs', 'REFERENCES')
@@ -190,9 +203,34 @@ docker exec -i "$container_name" psql -U sub2api_app -d app_role_test -v ON_ERRO
 docker exec -i "$container_name" psql -U sub2api_app -d app_role_test -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE groups ADD COLUMN IF NOT EXISTS long_context_pricing_enabled BOOLEAN NOT NULL DEFAULT TRUE;' \
   >/dev/null
+docker exec -i "$container_name" psql -U sub2api_app -d app_role_test -v ON_ERROR_STOP=1 <<'SQL'
+CREATE OR REPLACE FUNCTION invalidate_group_usage_rollup_state()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN COALESCE(NEW, OLD);
+END
+$$;
+DROP TRIGGER IF EXISTS usage_logs_group_rollup_invalidate_insert ON usage_logs;
+CREATE TRIGGER usage_logs_group_rollup_invalidate_insert
+AFTER INSERT ON usage_logs
+FOR EACH ROW
+EXECUTE FUNCTION invalidate_group_usage_rollup_state();
+SQL
 
-if docker exec -i "$container_name" psql -U postgres -d app_role_test -v ON_ERROR_STOP=1 \
-  -c 'SET ROLE sub2api_app; ALTER TABLE audit_logs DISABLE TRIGGER strip_conversation_content;' \
+# Sub2API 0.1.178 goose 226-style additive ALTER on a privacy-adjacent table.
+docker exec -i "$container_name" psql -U sub2api_app -d app_role_test -v ON_ERROR_STOP=1 <<'SQL'
+ALTER TABLE channel_monitor_histories
+  ADD COLUMN IF NOT EXISTS quota JSONB;
+ALTER TABLE audit_logs
+  ADD COLUMN IF NOT EXISTS extra text;
+COMMENT ON COLUMN channel_monitor_histories.quota IS 'quota snapshot';
+CREATE VIEW sub2api_gate_probe_view AS SELECT 1 AS ok;
+CREATE FUNCTION sub2api_gate_probe_fn() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;
+DROP FUNCTION sub2api_gate_probe_fn();
+SQL
+
+if docker exec -i "$container_name" psql -U sub2api_app -d app_role_test -v ON_ERROR_STOP=1 \
+  -c 'ALTER TABLE audit_logs DISABLE TRIGGER strip_conversation_content;' \
   >/dev/null 2>&1; then
   echo "sub2api_app could disable a privacy trigger" >&2
   exit 1
@@ -200,11 +238,20 @@ fi
 for forbidden_sql in \
   'CREATE TABLE audit_logs (value text);' \
   'CREATE TABLE IF NOT EXISTS audit_logs (value text);' \
-  'CREATE FUNCTION bypass_content() RETURNS text LANGUAGE sql AS $$ SELECT current_user $$;' \
+  'CREATE FUNCTION strip_conversation_content() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;' \
+  'CREATE FUNCTION bypass_owner() RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN END $$;' \
+  'CREATE TRIGGER strip_conversation_content BEFORE INSERT ON usage_logs FOR EACH ROW EXECUTE FUNCTION strip_test_content();' \
+  'CREATE TRIGGER sneak_audit BEFORE INSERT ON audit_logs FOR EACH ROW EXECUTE FUNCTION strip_test_content();' \
   'ALTER TABLE audit_logs DISABLE TRIGGER strip_conversation_content;' \
-  'ALTER TABLE audit_logs ADD COLUMN extra text;' \
+  'ALTER TABLE audit_logs ADD COLUMN full_prompt text;' \
+  'ALTER TABLE audit_logs DROP COLUMN request_body;' \
+  'ALTER TABLE audit_logs RENAME TO audit_logs_moved;' \
+  'DROP TRIGGER strip_conversation_content ON usage_logs;' \
   'DROP TRIGGER strip_conversation_content ON audit_logs;' \
-  'DROP TABLE audit_logs;'; do
+  'DROP TABLE audit_logs;' \
+  'GRANT SELECT ON TABLE audit_logs TO PUBLIC;' \
+  'CREATE RULE skip_audit AS ON INSERT TO audit_logs DO INSTEAD NOTHING;' \
+  'CREATE EXTENSION pg_trgm;'; do
   if docker exec -i "$container_name" psql -U sub2api_app -d app_role_test \
     -v ON_ERROR_STOP=1 -c "$forbidden_sql" >/dev/null 2>&1; then
     echo "sub2api_app executed unreviewed persistent DDL" >&2
@@ -250,8 +297,20 @@ fi
 # Replaying the grant migration must preserve the same non-owner boundary.
 docker exec -i "$container_name" psql -U postgres -d app_role_test -v ON_ERROR_STOP=1 \
   < "$repo_dir/migrations/005_app_least_privilege.sql"
-if docker exec -i "$container_name" psql -U postgres -d app_role_test -v ON_ERROR_STOP=1 \
-  -c 'SET ROLE sub2api_app; ALTER TABLE audit_logs DISABLE TRIGGER ALL;' \
+docker exec -i "$container_name" psql -U postgres -d app_role_test -v ON_ERROR_STOP=1 \
+  < "$repo_dir/migrations/009_allow_sub2api_deny_list_ddl_guard.sql"
+docker exec -i "$container_name" psql -U postgres -d app_role_test -v ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF NOT has_table_privilege('sub2api_app', 'public.usage_logs', 'TRIGGER')
+     OR has_table_privilege('sub2api_app', 'public.audit_logs', 'TRIGGER') THEN
+    RAISE EXCEPTION 'replayed 005/009 lost the usage_logs TRIGGER grant';
+  END IF;
+END
+$$;
+SQL
+if docker exec -i "$container_name" psql -U sub2api_app -d app_role_test -v ON_ERROR_STOP=1 \
+  -c 'ALTER TABLE audit_logs DISABLE TRIGGER ALL;' \
   >/dev/null 2>&1; then
   echo "replayed app-role migration allowed trigger bypass" >&2
   exit 1

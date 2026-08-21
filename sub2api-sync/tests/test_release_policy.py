@@ -35,6 +35,10 @@ class ReleasePolicyTests(unittest.TestCase):
         "migrations/002_remove_conversation_capture.sql",
         "migrations/005_app_least_privilege.sql",
         "migrations/006_allow_sub2api_schema_migrations.sql",
+        "migrations/007_allow_sub2api_function_trigger_migrations.sql",
+        "migrations/008_allow_sub2api_additive_alter_migrations.sql",
+        "migrations/009_allow_sub2api_deny_list_ddl_guard.sql",
+        "migrations/sub2api_gate_guard_app_ddl.sql",
         "migrations/221_group_model_pricing.sql",
         "sub2api-sync/Dockerfile",
     )

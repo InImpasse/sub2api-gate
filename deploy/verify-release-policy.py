@@ -202,6 +202,9 @@ def verify(policy=None, *, root=ROOT):
         "deploy/test-app-role-least-privilege-pg18.sh",
         "migrations/002_remove_conversation_capture.sql",
         "migrations/005_app_least_privilege.sql",
+        "migrations/007_allow_sub2api_function_trigger_migrations.sql",
+        "migrations/008_allow_sub2api_additive_alter_migrations.sql",
+        "migrations/009_allow_sub2api_deny_list_ddl_guard.sql",
     ):
         path = root / relative
         text = _read(path)

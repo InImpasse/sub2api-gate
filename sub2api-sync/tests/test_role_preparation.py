@@ -19,6 +19,11 @@ ROLE_CASES = (
         "sql_files": (
             "000_prepare_app_role.sql",
             "005_app_least_privilege.sql",
+            "006_allow_sub2api_schema_migrations.sql",
+            "007_allow_sub2api_function_trigger_migrations.sql",
+            "008_allow_sub2api_additive_alter_migrations.sql",
+            "009_allow_sub2api_deny_list_ddl_guard.sql",
+            "sub2api_gate_guard_app_ddl.sql",
         ),
         "error_code": "sub2api_app_role_prepare_failed",
     },

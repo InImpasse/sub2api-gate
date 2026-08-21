@@ -632,13 +632,17 @@ rollback itself cannot be proven complete.
 
 The reviewed recreate baseline is Sub2API 0.1.176. Stable Compose gives the
 `sub2api` service a writable root so the admin UI can replace `/app/sub2api`.
-After restart, additive goose migrations (`CREATE TABLE`/`INDEX`, `ALTER TABLE
-ADD COLUMN`, `COMMENT`) are allowed for `sub2api_app` on non-privacy tables.
+After restart, additive goose migrations fail open for unknown CREATE/ALTER
+tags. Apply `migrations/009_allow_sub2api_deny_list_ddl_guard.sql` after
+`005` so `sub2api_app` owns application tables, keeps `TRIGGER` on
+`usage_logs`, and uses the deny-list guard. Replaying `005` alone revokes
+the trigger grant until `009` is replayed.
 
-The event trigger still blocks trigger disable/drop, function creation, and
-DDL against conversation-bearing tables. Recreate or re-pull still returns to
-the reviewed digest until `deploy/release-policy.json` and Compose change
-together.
+The event trigger still blocks `GRANT`/`REVOKE`, extensions, FDW, replacing
+privacy functions, `SECURITY DEFINER`, trigger disable/drop on other privacy
+tables, `DROP COLUMN`/rename of privacy tables, and adding content-capable
+columns. Recreate or re-pull still returns to the reviewed digest until
+`deploy/release-policy.json` and Compose change together.
 
 ## Migrated-target traffic canary
 
@@ -1002,6 +1006,23 @@ sudo python3 deploy/sync-canary.py start --apply \
 sudo python3 deploy/sync-canary.py verify \
   --env-file /path/to/private.env
 ```
+
+When a signed provisioning request returns a retryable failure, the stable sync
+process retains at most 64 in-memory, content-free diagnostics for 15 minutes.
+From the same private root TTY, query the request ID without writing data or
+changing services:
+
+```bash
+sudo python3 deploy/sync-canary.py diagnostics \
+  --env-file /path/to/private.env \
+  --request-id worker-example-request-id
+```
+
+The command prompts for the existing sync HMAC and prints only request ID,
+action, failure category, optional PostgreSQL SQLSTATE, and timestamp. It never
+prints database stderr, SQL, request data, credentials, or response content.
+`diagnostics` queries the active loopback `3021` service directly and is not a
+traffic-canary status command.
 
 Promotion stops only the fixed legacy `sub2api-sync.service`, confirms loopback
 3021 is free, starts the reviewed container on `127.0.0.1:3021`, repeats the

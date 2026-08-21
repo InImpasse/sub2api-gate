@@ -539,6 +539,53 @@ class DeploymentConfigTests(unittest.TestCase):
         )
         self.assertNotIn("GRANT TRIGGER", sql)
         self.assertNotIn("GRANT TRUNCATE", sql)
+        function_guard = (
+            ROOT / "migrations" / "007_allow_sub2api_function_trigger_migrations.sql"
+        ).read_text()
+        self.assertIn("GRANT TRIGGER ON TABLE public.usage_logs TO sub2api_app", function_guard)
+        self.assertIn("CREATE FUNCTION", function_guard)
+        self.assertIn("CREATE TRIGGER", function_guard)
+        self.assertIn("strip_conversation_content", function_guard)
+        self.assertIn("security definer", function_guard)
+        self.assertIn("0.1.176", function_guard)
+        alter_guard = (
+            ROOT / "migrations" / "008_allow_sub2api_additive_alter_migrations.sql"
+        ).read_text()
+        self.assertIn("GRANT TRIGGER ON TABLE public.usage_logs TO sub2api_app", alter_guard)
+        self.assertIn("add column( if not exists)?|alter column", alter_guard)
+        self.assertIn("channel_monitor_histories", alter_guard)
+        self.assertIn("OWNER TO sub2api_app", alter_guard)
+        self.assertIn("0.1.176", alter_guard)
+        self.assertIn("0.1.178", alter_guard)
+        self.assertIn("007_allow_sub2api_function_trigger_migrations.sql", PREPARE_APP_ROLE.read_text())
+        self.assertIn("006_allow_sub2api_schema_migrations.sql", PREPARE_APP_ROLE.read_text())
+        self.assertIn("008_allow_sub2api_additive_alter_migrations.sql", PREPARE_APP_ROLE.read_text())
+        deny_list_guard = (
+            ROOT / "migrations" / "009_allow_sub2api_deny_list_ddl_guard.sql"
+        ).read_text()
+        self.assertIn("GRANT TRIGGER ON TABLE public.usage_logs TO sub2api_app", deny_list_guard)
+        self.assertIn("'GRANT'", deny_list_guard)
+        self.assertIn("'CREATE EXTENSION'", deny_list_guard)
+        self.assertIn("unknown additive goose", deny_list_guard)
+        self.assertIn("0.1.176", deny_list_guard)
+        self.assertIn("009_allow_sub2api_deny_list_ddl_guard.sql", PREPARE_APP_ROLE.read_text())
+        self.assertIn("sub2api_gate_guard_app_ddl.sql", PREPARE_APP_ROLE.read_text())
+        guard_span_start = "CREATE OR REPLACE FUNCTION public.sub2api_gate_guard_app_ddl()"
+        guard_span_end = "EXECUTE FUNCTION public.sub2api_gate_guard_app_ddl();"
+        canonical = (ROOT / "migrations" / "sub2api_gate_guard_app_ddl.sql").read_text()
+        self.assertTrue(canonical.startswith(guard_span_start))
+        self.assertTrue(canonical.rstrip().endswith(guard_span_end))
+        for relative in (
+            "migrations/005_app_least_privilege.sql",
+            "migrations/006_allow_sub2api_schema_migrations.sql",
+            "migrations/007_allow_sub2api_function_trigger_migrations.sql",
+            "migrations/008_allow_sub2api_additive_alter_migrations.sql",
+            "migrations/009_allow_sub2api_deny_list_ddl_guard.sql",
+        ):
+            text = (ROOT / relative).read_text()
+            start = text.index(guard_span_start)
+            end = text.index(guard_span_end, start) + len(guard_span_end)
+            self.assertEqual(text[start:end].strip(), canonical.strip())
         self.assertNotIn("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES", sql)
         self.assertIn("pg_default_acl", sql)
         prepare_app = PREPARE_APP_ROLE.read_text()
