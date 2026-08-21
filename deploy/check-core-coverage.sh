@@ -14,7 +14,8 @@ fi
 worker_report="$temporary_dir/worker-coverage.txt"
 if ! (
   cd "$repo_dir/worker-allow-ip"
-  node --test --experimental-test-coverage >"$worker_report" 2>&1
+  node --test --experimental-test-coverage \
+    --experimental-test-isolation=none >"$worker_report" 2>&1
 ); then
   tail -n 80 "$worker_report" >&2 || true
   exit 1
@@ -32,7 +33,9 @@ worker = baseline.get("worker")
 if not isinstance(worker, dict) or not worker:
     raise SystemExit("core coverage baseline has no Worker thresholds")
 
-row = re.compile(r"^\s*\N{INFORMATION SOURCE}\s+(.+?)\s+\|\s+([0-9.]+)\s+\|\s+([0-9.]+)\s+\|")
+# Node 22 prefixes its native coverage table with `#`; Node 24 uses the
+# information symbol. Both reports carry the same bounded numeric columns.
+row = re.compile(r"^\s*(?:\N{INFORMATION SOURCE}|#)\s+(.+?)\s+\|\s+([0-9.]+)\s+\|\s+([0-9.]+)\s+\|")
 observed = {}
 for line in report_path.read_text(encoding="utf-8", errors="replace").splitlines():
     match = row.match(line)

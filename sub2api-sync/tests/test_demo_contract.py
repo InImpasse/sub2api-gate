@@ -53,9 +53,9 @@ class DemoContractTests(unittest.TestCase):
         self.assertIn("app.classList.toggle(\"no-entry-motion\", renderCount > 0)", DEMO)
 
     def test_typography_and_responsive_breakpoints_are_bounded(self):
-        self.assertIn("font-size: 42px;", DEMO)
-        self.assertIn(".hero-title, .workspace-copy h1, h1 { font-size: 32px; }", DEMO)
-        self.assertIn("@media (max-width: 980px)", DEMO)
+        self.assertIn("font-size: 36px;", DEMO)
+        self.assertIn(".hero-title, .workspace-copy h1, h1 { font-size: 30px; }", DEMO)
+        self.assertIn("@media (max-width: 860px)", DEMO)
         self.assertIn("@media (max-width: 680px)", DEMO)
         self.assertNotRegex(DEMO, r"font-size:[^;]*\b(vw|vh|vmin|vmax)\b")
         self.assertNotRegex(DEMO, r"letter-spacing:\s*-")
