@@ -5,16 +5,16 @@
   },
   "worker": {
     "src/admin.js": {
-      "line": 86.1,
-      "branch": 65.2
+      "line": 85.4,
+      "branch": 65.4
     },
     "src/auth-state.js": {
       "line": 29.0,
-      "branch": 65.9
+      "branch": 66.6
     },
     "src/index.js": {
-      "line": 90.5,
-      "branch": 72.8
+      "line": 90.4,
+      "branch": 72.5
     }
   }
 }
