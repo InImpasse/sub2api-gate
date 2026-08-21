@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from contextlib import contextmanager
 from usage_metadata import (
     get_usage_log_detail as metadata_usage_log_detail,
@@ -49,8 +50,16 @@ KEY_TEST_UPSTREAM_TIMEOUT_SECONDS = 2
 MAX_KEY_TEST_RESPONSE_BYTES = 16 * 1024
 MAX_GROUP_CATALOG = 32
 GROUP_CATALOG_TTL_SECONDS = 30
+MAX_DATABASE_ERROR_BYTES = 128
+MAX_FAILURE_DIAGNOSTICS = 64
+FAILURE_DIAGNOSTIC_TTL_SECONDS = 15 * 60
 GROUP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
+REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
+SQLSTATE_RE = re.compile(r"[0-9A-DF-HJ-Z][0-9A-Z]{4}\Z")
+SQLSTATE_MESSAGE_RE = re.compile(
+    r"(?:SQLSTATE|ERROR:)\s*([0-9A-DF-HJ-Z][0-9A-Z]{4})\b"
+)
 FORBIDDEN_GROUP_NAMES = frozenset({"default"})
 INTERNAL_LOGIN_PATH = "/api/v1/auth/login"
 INTERNAL_MODELS_PATH = "/v1/models"
@@ -79,6 +88,7 @@ SYNC_ACTIONS = frozenset({
     "usage_log_detail",
     "list_groups",
     "test_api_key",
+    "diagnostics",
 })
 LOGIN_USER_FIELDS = (
     "id",
@@ -96,6 +106,14 @@ _DATABASE_TRANSACTION = threading.local()
 _REQUEST_CONTEXT = threading.local()
 _GROUP_CATALOG_LOCK = threading.Lock()
 _GROUP_CATALOG = {"expires_at": 0.0, "groups": None}
+_FAILURE_DIAGNOSTICS_LOCK = threading.Lock()
+_FAILURE_DIAGNOSTICS = deque(maxlen=MAX_FAILURE_DIAGNOSTICS)
+
+
+class DatabaseCommandError(RuntimeError):
+    def __init__(self, sqlstate=None):
+        self.sqlstate = sqlstate if isinstance(sqlstate, str) and SQLSTATE_RE.fullmatch(sqlstate) else None
+        super().__init__("database_command_failed")
 
 
 def env_int(name, default):
@@ -194,6 +212,7 @@ def _database_connection(statement_timeout_ms):
         "--no-align",
         "--field-separator", "\t",
         "--set", "ON_ERROR_STOP=1",
+        "--set", "VERBOSITY=sqlstate",
     ]
     process_env = os.environ.copy()
     process_env["PGPASSWORD"] = database_password
@@ -201,6 +220,17 @@ def _database_connection(statement_timeout_ms):
         f"-c statement_timeout={statement_timeout_ms} -c lock_timeout=2000"
     )
     return command, process_env
+
+
+def database_error_sqlstate(stderr):
+    if isinstance(stderr, bytes):
+        stderr = stderr[:MAX_DATABASE_ERROR_BYTES].decode("ascii", errors="ignore")
+    elif isinstance(stderr, str):
+        stderr = stderr[:MAX_DATABASE_ERROR_BYTES]
+    else:
+        return None
+    match = SQLSTATE_MESSAGE_RE.search(stderr)
+    return match.group(1) if match else None
 
 
 def _validated_statement_timeout(statement_timeout_ms):
@@ -234,7 +264,7 @@ class DatabaseTransaction:
             command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             bufsize=0,
             env=process_env,
         )
@@ -268,7 +298,7 @@ class DatabaseTransaction:
 
     def execute(self, sql, timeout=None):
         if self.process is None or self.process.poll() is not None:
-            raise RuntimeError("database_command_failed")
+            raise self._command_error()
         marker = "__sub2api_sync_" + secrets.token_hex(16) + "__"
         try:
             self.process.stdin.write((str(sql).rstrip() + "\n").encode())
@@ -288,7 +318,16 @@ class DatabaseTransaction:
             self._abort()
             raise
         except (BrokenPipeError, OSError):
-            raise RuntimeError("database_command_failed") from None
+            raise self._command_error() from None
+
+    def _command_error(self):
+        stderr = b""
+        if self.process is not None and self.process.stderr is not None:
+            try:
+                stderr = self.process.stderr.read(MAX_DATABASE_ERROR_BYTES)
+            except (OSError, ValueError):
+                pass
+        return DatabaseCommandError(database_error_sqlstate(stderr))
 
     def _readline(self, deadline, timeout):
         try:
@@ -296,7 +335,7 @@ class DatabaseTransaction:
         except (AttributeError, OSError):
             line = self.process.stdout.readline()
             if line in (b"", ""):
-                raise RuntimeError("database_command_failed")
+                raise self._command_error()
             if isinstance(line, bytes):
                 line = line.decode("utf-8", errors="replace")
             return line.rstrip("\r\n")
@@ -312,7 +351,7 @@ class DatabaseTransaction:
                 raise subprocess.TimeoutExpired("psql", timeout)
             chunk = os.read(descriptor, 4096)
             if not chunk:
-                raise RuntimeError("database_command_failed")
+                raise self._command_error()
             self.output_buffer += chunk
         line, self.output_buffer = self.output_buffer.split(b"\n", 1)
         return line.rstrip(b"\r").decode("utf-8", errors="replace")
@@ -345,6 +384,10 @@ class DatabaseTransaction:
         except (AttributeError, OSError):
             pass
         try:
+            self.process.stderr.close()
+        except (AttributeError, OSError):
+            pass
+        try:
             self.process.wait(timeout=2)
         except subprocess.TimeoutExpired:
             self.process.kill()
@@ -374,13 +417,13 @@ def psql(sql, timeout=None, statement_timeout_ms=DEFAULT_DB_STATEMENT_TIMEOUT_MS
         input=sql,
         text=True,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         env=process_env,
         timeout=timeout,
         check=False,
     )
     if result.returncode != 0:
-        raise RuntimeError("database_command_failed")
+        raise DatabaseCommandError(database_error_sqlstate(result.stderr))
     return result.stdout.strip()
 
 
@@ -1579,6 +1622,56 @@ def verify_request(headers, body):
     return claim_nonce(nonce)
 
 
+def record_failure_diagnostic(request_id, action, category, sqlstate=None):
+    if not REQUEST_ID_RE.fullmatch(str(request_id or "")):
+        return
+    safe_action = action if action in SYNC_ACTIONS else "unknown"
+    safe_category = category if category in {
+        "redis_unavailable", "database_unavailable", "database_error",
+        "dependency_timeout",
+    } else "unknown"
+    safe_sqlstate = (
+        sqlstate if isinstance(sqlstate, str) and SQLSTATE_RE.fullmatch(sqlstate)
+        else None
+    )
+    now = time.time()
+    with _FAILURE_DIAGNOSTICS_LOCK:
+        while _FAILURE_DIAGNOSTICS and (
+            now - _FAILURE_DIAGNOSTICS[0]["recordedAt"]
+            > FAILURE_DIAGNOSTIC_TTL_SECONDS
+        ):
+            _FAILURE_DIAGNOSTICS.popleft()
+        _FAILURE_DIAGNOSTICS.append({
+            "requestId": request_id,
+            "action": safe_action,
+            "category": safe_category,
+            "sqlstate": safe_sqlstate,
+            "recordedAt": now,
+        })
+
+
+def failure_diagnostic(request_id):
+    if not REQUEST_ID_RE.fullmatch(str(request_id or "")):
+        raise ValueError("diagnostic not found")
+    now = time.time()
+    with _FAILURE_DIAGNOSTICS_LOCK:
+        while _FAILURE_DIAGNOSTICS and (
+            now - _FAILURE_DIAGNOSTICS[0]["recordedAt"]
+            > FAILURE_DIAGNOSTIC_TTL_SECONDS
+        ):
+            _FAILURE_DIAGNOSTICS.popleft()
+        for item in reversed(_FAILURE_DIAGNOSTICS):
+            if hmac.compare_digest(item["requestId"], request_id):
+                return {
+                    "requestId": item["requestId"],
+                    "action": item["action"],
+                    "category": item["category"],
+                    "sqlstate": item["sqlstate"],
+                    "recordedAt": int(item["recordedAt"]),
+                }
+    raise ValueError("diagnostic not found")
+
+
 def dispatch_action(action, payload):
     if action == "provision":
         return provision(payload)
@@ -1598,6 +1691,12 @@ def dispatch_action(action, payload):
         return list_groups(payload)
     if action == "test_api_key":
         return test_api_key(payload)
+    if action == "diagnostics":
+        return {
+            "ok": True,
+            "action": "diagnostics",
+            "diagnostic": failure_diagnostic(payload.get("requestId")),
+        }
     raise ValueError("invalid action")
 
 
@@ -1765,11 +1864,17 @@ class Handler(BaseHTTPRequestHandler):
             with action_deadline("pre_request", self.request_started_at):
                 verified = verify_request(self.headers, body)
         except (TimeoutError, socket.timeout, subprocess.TimeoutExpired):
+            record_failure_diagnostic(
+                self.request_id, "unknown", "dependency_timeout"
+            )
             self.respond_error(
                 504, "dependency_timeout", retryable=True, retry_after=1
             )
             return
         except (OSError, RuntimeError):
+            record_failure_diagnostic(
+                self.request_id, "unknown", "redis_unavailable"
+            )
             self.respond_error(
                 503, "dependency_unavailable", retryable=True, retry_after=1
             )
@@ -1805,7 +1910,9 @@ class Handler(BaseHTTPRequestHandler):
             }), flush=True)
             self.respond_error(400, "invalid_json", retryable=False)
         except ValueError as error:
-            if error.args and error.args[0] == "usage log not found":
+            if error.args and error.args[0] in {
+                "usage log not found", "diagnostic not found"
+            }:
                 print(json.dumps({
                     "level": "warning",
                     "error_code": "sync_resource_not_found",
@@ -1826,6 +1933,9 @@ class Handler(BaseHTTPRequestHandler):
                 400, "invalid_request", retryable=False, action=action
             )
         except (TimeoutError, socket.timeout, subprocess.TimeoutExpired):
+            record_failure_diagnostic(
+                self.request_id, action, "dependency_timeout"
+            )
             print(json.dumps({
                 "level": "warning",
                 "error_code": "sync_dependency_timeout",
@@ -1876,6 +1986,14 @@ class Handler(BaseHTTPRequestHandler):
                 "database_command_failed",
                 "database_configuration_invalid",
             }:
+                record_failure_diagnostic(
+                    self.request_id,
+                    action,
+                    "database_error"
+                    if isinstance(error, DatabaseCommandError)
+                    else "database_unavailable",
+                    error.sqlstate if isinstance(error, DatabaseCommandError) else None,
+                )
                 print(json.dumps({
                     "level": "error",
                     "error_code": "sync_dependency_unavailable",

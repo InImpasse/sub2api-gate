@@ -413,6 +413,74 @@ class SyncHttpContractTests(unittest.TestCase):
         self.assertEqual(payload["error"], "dependency_unavailable")
         self.assertTrue(payload["retryable"])
 
+    def test_database_failure_keeps_a_signed_bounded_diagnostic(self):
+        request_id = "req-diagnostic-db"
+        with SYNC._FAILURE_DIAGNOSTICS_LOCK:
+            SYNC._FAILURE_DIAGNOSTICS.clear()
+        with RunningSyncServer() as server:
+            status, _headers, payload = self.signed_action_request(
+                server,
+                "status",
+                request_id=request_id,
+                side_effect=SYNC.DatabaseCommandError("23505"),
+            )
+            self.assertEqual(status, 503)
+            self.assertEqual(payload["error"], "dependency_unavailable")
+
+            body = json.dumps({
+                "action": "diagnostics", "requestId": request_id,
+            }).encode()
+            headers = {
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+                "X-Request-ID": "req-diagnostic-query",
+            }
+            with mock.patch.object(SYNC, "verify_request", return_value=True):
+                status, _headers, payload = server.request(
+                    "POST", "/provision", body=body, headers=headers
+                )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["action"], "diagnostics")
+        self.assertEqual(payload["diagnostic"], {
+            "requestId": request_id,
+            "action": "status",
+            "category": "database_error",
+            "sqlstate": "23505",
+            "recordedAt": payload["diagnostic"]["recordedAt"],
+        })
+        self.assertIsInstance(payload["diagnostic"]["recordedAt"], int)
+
+    def test_diagnostics_require_a_signature_and_expire_without_persistence(self):
+        request_id = "req-diagnostic-expired"
+        with SYNC._FAILURE_DIAGNOSTICS_LOCK:
+            SYNC._FAILURE_DIAGNOSTICS.clear()
+        with mock.patch.object(SYNC.time, "time", return_value=100):
+            SYNC.record_failure_diagnostic(
+                request_id, "provision", "database_error", "23505"
+            )
+        with mock.patch.object(
+            SYNC.time, "time", return_value=100 + SYNC.FAILURE_DIAGNOSTIC_TTL_SECONDS + 1
+        ):
+            with self.assertRaisesRegex(ValueError, "diagnostic not found"):
+                SYNC.failure_diagnostic(request_id)
+
+        body = json.dumps({
+            "action": "diagnostics", "requestId": request_id,
+        }).encode()
+        headers = {
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+            "X-Request-ID": "req-diagnostic-unsigned",
+        }
+        with mock.patch.object(SYNC, "verify_request", return_value=False):
+            with RunningSyncServer() as server:
+                status, _headers, payload = server.request(
+                    "POST", "/provision", body=body, headers=headers
+                )
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["error"], "unauthorized")
+
     def test_login_upstream_failure_maps_to_bad_gateway(self):
         with RunningSyncServer() as server:
             status, _response_headers, payload = self.signed_action_request(

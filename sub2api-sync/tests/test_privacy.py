@@ -311,12 +311,25 @@ class PrivacyContractTests(unittest.TestCase):
 
     def test_sync_source_never_logs_database_or_sub2api_response_details(self):
         source = MODULE_PATH.read_text()
-        self.assertNotIn("result.stderr", source)
         self.assertNotIn("capture_output=True", source)
-        self.assertIn("stderr=subprocess.DEVNULL", source)
+        self.assertIn('"--set", "VERBOSITY=sqlstate"', source)
+        self.assertIn("stderr=subprocess.PIPE", source)
+        self.assertIn("MAX_DATABASE_ERROR_BYTES", source)
         self.assertNotIn("error.read()", source)
         self.assertNotIn('"error": str(error)', source)
         self.assertIn('"--no-psqlrc"', source)
+
+    def test_database_error_sqlstate_is_bounded_and_content_free(self):
+        sentinel = "sk-private-database-detail"
+        self.assertEqual(
+            SYNC.database_error_sqlstate(f"ERROR: 23505: {sentinel}"),
+            "23505",
+        )
+        self.assertIsNone(SYNC.database_error_sqlstate(sentinel))
+        error = SYNC.DatabaseCommandError("23505")
+        self.assertEqual(str(error), "database_command_failed")
+        self.assertEqual(error.sqlstate, "23505")
+        self.assertNotIn(sentinel, repr(error))
 
     def test_unknown_action_is_normalized_before_error_logging(self):
         handler = object.__new__(SYNC.Handler)

@@ -111,6 +111,8 @@ SYNC_IMAGE_LABELS = {
 }
 IMAGE_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 GIT_HEAD_PATTERN = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
+REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
+SQLSTATE_PATTERN = re.compile(r"[0-9A-DF-HJ-Z][0-9A-Z]{4}\Z")
 
 
 class CanaryError(RuntimeError):
@@ -767,6 +769,12 @@ def require_apply_context(stdin, stdout, stderr):
     require_local_docker_socket()
 
 
+def require_readonly_context(stdin, stdout, stderr):
+    require_production_apply_context(
+        ROOT, streams=(stdin, stdout, stderr)
+    )
+
+
 def require_storage_layout():
     required = {
         DATA_ROOT / "redis" / "nonce": (True, 0o700, 999, 1000),
@@ -1007,6 +1015,87 @@ def signed_status_request(port, secret, *, timestamp=None, nonce=None, probe_uui
     return status, response_body, headers, body
 
 
+def signed_diagnostic_request(port, secret, request_id, *, timestamp=None, nonce=None):
+    if len(secret) < 32:
+        raise CanaryError("sync HMAC secret is invalid")
+    if not REQUEST_ID_PATTERN.fullmatch(str(request_id or "")):
+        raise CanaryError("diagnostic request ID is invalid")
+    timestamp = str(int(time.time()) if timestamp is None else timestamp)
+    nonce = nonce or os.urandom(16).hex()
+    body = json.dumps(
+        {"action": "diagnostics", "requestId": request_id},
+        separators=(",", ":"),
+    ).encode()
+    signature = hmac.new(
+        secret.encode(), timestamp.encode() + b"." + nonce.encode() + b"." + body,
+        hashlib.sha256,
+    ).hexdigest()
+    headers = {
+        "content-type": "application/json",
+        "content-length": str(len(body)),
+        "x-sub2api-sync-timestamp": timestamp,
+        "x-sub2api-sync-nonce": nonce,
+        "x-sub2api-sync-signature": signature,
+        "x-request-id": os.urandom(16).hex(),
+        "connection": "close",
+    }
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=6)
+    try:
+        connection.request("POST", "/provision", body=body, headers=headers)
+        response = connection.getresponse()
+        status = response.status
+        response_body = read_bounded_response(response)
+    except (OSError, http.client.HTTPException) as error:
+        raise CanaryError("sync diagnostics probe is unavailable") from error
+    finally:
+        connection.close()
+    return status, response_body
+
+
+def print_diagnostic(port, secret, request_id, *, stdout):
+    status, body = signed_diagnostic_request(port, secret, request_id)
+    if status == 404:
+        raise CanaryError("sync diagnostic was not found")
+    if status != 200:
+        raise CanaryError("sync diagnostics probe failed")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+        record = payload["diagnostic"]
+    except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CanaryError("sync diagnostics response is invalid") from error
+    if not isinstance(record, dict):
+        raise CanaryError("sync diagnostics response is invalid")
+    category = record.get("category")
+    sqlstate = record.get("sqlstate")
+    recorded_at = record.get("recordedAt")
+    action = record.get("action")
+    if (
+        payload.get("ok") is not True
+        or payload.get("action") != "diagnostics"
+        or record.get("requestId") != request_id
+        or action not in {
+            "unknown", "provision", "status", "login", "deprovision", "purge",
+            "usage_logs_list", "usage_log_detail", "list_groups", "test_api_key",
+            "diagnostics",
+        }
+        or category not in {
+            "redis_unavailable", "database_unavailable", "database_error",
+            "dependency_timeout",
+        }
+        or (sqlstate is not None and not SQLSTATE_PATTERN.fullmatch(sqlstate))
+        or isinstance(recorded_at, bool)
+        or not isinstance(recorded_at, int)
+    ):
+        raise CanaryError("sync diagnostics response is invalid")
+    print(json.dumps({
+        "requestId": request_id,
+        "action": action,
+        "category": category,
+        "sqlstate": sqlstate,
+        "recordedAt": recorded_at,
+    }, separators=(",", ":")), file=stdout)
+
+
 def replay_request(port, headers, body):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=6)
     try:
@@ -1203,12 +1292,14 @@ def parser():
             "promote",
             "rollback",
             "status",
+            "diagnostics",
         ),
         nargs="?",
         default="check",
     )
     result.add_argument("--apply", action="store_true")
     result.add_argument("--env-file", type=pathlib.Path)
+    result.add_argument("--request-id")
     return result
 
 
@@ -1216,11 +1307,13 @@ def main(argv=None, *, runner=run_command, stdin=sys.stdin, stdout=sys.stdout, s
     options = parser().parse_args(argv)
     try:
         validate_contract()
-        requires_privileged_context = (
+        requires_apply_context = (
             (options.apply and options.action != "check")
             or options.action in {"status", "verify"}
         )
-        if requires_privileged_context:
+        if options.action == "diagnostics":
+            require_readonly_context(stdin, stdout, stderr)
+        elif requires_apply_context:
             require_apply_context(stdin, stdout, stderr)
 
         if options.action == "check":
@@ -1231,6 +1324,20 @@ def main(argv=None, *, runner=run_command, stdin=sys.stdin, stdout=sys.stdout, s
 
         if options.action in {"prepare-image", "start", "promote", "rollback"} and not options.apply:
             print(f"sync canary {options.action} dry-run passed; add --apply from a private root TTY to change services", file=stdout)
+            return 0
+
+        if options.action == "diagnostics":
+            if options.apply:
+                raise CanaryError("diagnostics does not accept --apply")
+            if options.env_file is None or not options.env_file.is_absolute():
+                raise CanaryError("an absolute private --env-file is required")
+            if not REQUEST_ID_PATTERN.fullmatch(str(options.request_id or "")):
+                raise CanaryError("diagnostic request ID is invalid")
+            private_values = parse_private_env(options.env_file)
+            secret = prompt_secret(secret_reader)
+            if not hmac.compare_digest(secret, private_values["SUB2API_SYNC_SECRET"]):
+                raise CanaryError("provided sync HMAC secret does not match the private environment")
+            print_diagnostic(SYNC_STABLE_PORT, secret, options.request_id, stdout=stdout)
             return 0
 
         runner([str(CLEAN_WORKTREE)], timeout=15)

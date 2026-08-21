@@ -230,6 +230,35 @@ class SyncCanaryToolTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(calls, [])
 
+    def test_diagnostics_uses_private_readonly_context_without_docker_or_release_gate(self):
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("diagnostics ran a local command")
+
+        stdout = TtyBuffer()
+        with mock.patch.object(self.tool, "require_readonly_context") as context, \
+             mock.patch.object(
+                 self.tool, "parse_private_env", return_value={"SUB2API_SYNC_SECRET": "s" * 32}
+             ), mock.patch.object(
+                 self.tool, "print_diagnostic"
+             ) as diagnostic:
+            result = self.tool.main(
+                [
+                    "diagnostics", "--env-file", "/private/env",
+                    "--request-id", "worker-diagnostic-main",
+                ],
+                runner=forbidden,
+                stdin=TtyBuffer(),
+                stdout=stdout,
+                stderr=TtyBuffer(),
+                secret_reader=lambda _prompt: "s" * 32,
+            )
+
+        self.assertEqual(result, 0)
+        context.assert_called_once()
+        diagnostic.assert_called_once_with(
+            3021, "s" * 32, "worker-diagnostic-main", stdout=stdout
+        )
+
     def test_apply_rejects_noncanonical_release_before_private_access_or_commands(self):
         calls = []
 
@@ -639,6 +668,75 @@ class SyncCanaryToolTests(unittest.TestCase):
         self.assertEqual(headers["x-sub2api-sync-signature"], expected)
         self.assertEqual(requests[0][0:2], ("POST", "/provision"))
         self.assertNotIn(secret, json.dumps(headers))
+
+    def test_signed_diagnostics_uses_bounded_request_metadata(self):
+        secret = "s" * 32
+        request_id = "worker-diagnostic-1"
+        response_body = b'{"ok":true,"action":"diagnostics","diagnostic":{"requestId":"worker-diagnostic-1","action":"provision","category":"database_error","sqlstate":"23505","recordedAt":1}}'
+
+        class Response:
+            status = 200
+
+            def getheader(self, name):
+                return str(len(response_body)) if name.lower() == "content-length" else None
+
+            def read(self, _size):
+                return response_body
+
+        requests = []
+
+        class Connection:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def request(self, method, path, body, headers):
+                requests.append((method, path, body, headers))
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                return None
+
+        with mock.patch.object(self.tool.http.client, "HTTPConnection", Connection):
+            status, _body = self.tool.signed_diagnostic_request(
+                3021, secret, request_id, timestamp=1_750_000_000, nonce="b" * 32
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(requests[0][0:2], ("POST", "/provision"))
+        self.assertEqual(json.loads(requests[0][2]), {
+            "action": "diagnostics", "requestId": request_id,
+        })
+        self.assertNotIn(secret, json.dumps(requests[0][3]))
+
+    def test_print_diagnostic_rejects_unbounded_or_private_response_data(self):
+        stdout = io.StringIO()
+        record = {
+            "requestId": "worker-diagnostic-2",
+            "action": "provision",
+            "category": "database_error",
+            "sqlstate": "23505",
+            "recordedAt": 1,
+            "private": "sk-private-sentinel",
+        }
+        body = json.dumps({
+            "ok": True, "action": "diagnostics", "diagnostic": record,
+        }).encode()
+        with mock.patch.object(
+            self.tool, "signed_diagnostic_request", return_value=(200, body)
+        ):
+            self.tool.print_diagnostic(
+                3021, "s" * 32, "worker-diagnostic-2", stdout=stdout
+            )
+        self.assertEqual(json.loads(stdout.getvalue()), {
+            "requestId": "worker-diagnostic-2",
+            "action": "provision",
+            "category": "database_error",
+            "sqlstate": "23505",
+            "recordedAt": 1,
+        })
+        self.assertNotIn("sk-private-sentinel", stdout.getvalue())
 
     def test_verify_requires_successful_status_and_rejected_replay(self):
         body = b'{"ok":true,"action":"status","exists":false}'
