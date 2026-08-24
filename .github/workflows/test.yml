@@ -23,9 +23,25 @@ jobs:
         with:
           python-version: '3.12'
       - uses: astral-sh/setup-uv@v6
-      - run: npm ci
+      - name: Install Worker dependencies
+        run: npm ci
         working-directory: worker-allow-ip
-      - run: npx playwright install --with-deps chromium
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
         working-directory: worker-allow-ip
-      - run: bash deploy/verify-local.sh
-      - run: bash deploy/check-release-candidate.sh
+      - name: Verify release policy
+        run: python3 -I deploy/verify-release-policy.py
+      - name: Audit Worker dependencies
+        run: npm --prefix worker-allow-ip audit --audit-level=high --package-lock-only --ignore-scripts
+      - name: Check core coverage
+        run: bash deploy/check-core-coverage.sh
+      - name: Check release tool coverage
+        run: bash deploy/check-release-tool-coverage.sh
+      - name: Test sync dependencies
+        run: bash deploy/run-sync-dependency-integration.sh
+      - name: Test browser UI
+        run: npm --prefix worker-allow-ip run test:browser-ui
+      - name: Check patch formatting
+        run: git diff --check
+      - name: Check release candidate
+        run: bash deploy/check-release-candidate.sh

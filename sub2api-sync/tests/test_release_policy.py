@@ -108,6 +108,28 @@ class ReleasePolicyTests(unittest.TestCase):
             gate,
         )
 
+    def test_ci_exposes_every_local_gate_as_a_named_step(self):
+        gate = (ROOT / "deploy" / "verify-local.sh").read_text(encoding="utf-8")
+        workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text(
+            encoding="utf-8"
+        )
+        commands = (
+            "python3 -I deploy/verify-release-policy.py",
+            "npm --prefix worker-allow-ip audit --audit-level=high "
+            "--package-lock-only --ignore-scripts",
+            "bash deploy/check-core-coverage.sh",
+            "bash deploy/check-release-tool-coverage.sh",
+            "bash deploy/run-sync-dependency-integration.sh",
+            "npm --prefix worker-allow-ip run test:browser-ui",
+            "git diff --check",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIn(command, gate)
+                self.assertIn(f"run: {command}", workflow)
+
+        self.assertNotIn("run: bash deploy/verify-local.sh", workflow)
+
     def test_verifier_reads_every_release_consumer_from_the_supplied_root(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = pathlib.Path(directory)
