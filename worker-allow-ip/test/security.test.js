@@ -2396,7 +2396,7 @@ test("public Turnstile uses explicit rendering with a compact mobile breakpoint"
   assert.doesNotMatch(body, /data-sitekey=/);
 });
 
-test("public helper text meets AA contrast and long headings can wrap", async () => {
+test("public helper text meets AA contrast and long headings stay bounded", async () => {
   const response = await worker.fetch(
     new Request("https://api.example.test/allow-ip"),
     { ALLOWED_HOSTNAMES: "api.example.test", TURNSTILE_SITE_KEY: "site" },
@@ -2407,7 +2407,7 @@ test("public helper text meets AA contrast and long headings can wrap", async ()
   assert.ok(ledeColor, "the helper-text color must be explicit");
   assert.ok(contrastRatio(ledeColor, "#f5f5f7") >= 4.5);
   assert.match(body, /h1\s*{[^}]*overflow-wrap:\s*anywhere/is);
-  assert.match(body, /\.identity-title \{ overflow-wrap: anywhere; \}/);
+  assert.match(body, /\.identity-title\s*{[^}]*overflow:\s*hidden[^}]*overflow-wrap:\s*anywhere[^}]*-webkit-line-clamp:\s*2/is);
   assert.match(
     body,
     /@media \(max-width: 560px\)[\s\S]*?\.identity-title \{ font-size: 24px; line-height: 1\.15; \}/,

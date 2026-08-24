@@ -371,7 +371,7 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
     <section class="hero">
       ${sub2apiIcon()}
       <p class="eyebrow">Sub2API Access</p>
-      <h1 class="identity-title">${escapeHtml(invite.name || "Signed in")}</h1>
+      <h1 class="identity-title" title="${escapeHtml(invite.name || "Signed in")}">${escapeHtml(invite.name || "Signed in")}</h1>
       <p class="lede">UUID ${escapeHtml(invite.uuid)} is signed in on this browser.</p>
     </section>
     <section class="panel dashboard">
@@ -632,7 +632,7 @@ function renderApiConfig(config, { csrf = "", uuid = "", action = "/allow-ip" } 
       <strong>${escapeHtml(displayApiName(config.name))}</strong>
       ${groupLabel ? `<p class="hint">Key group: ${escapeHtml(groupLabel)}</p>` : ""}
       <label>Base URL</label>
-      <div class="copy-line"><code>${escapeHtml(config.baseUrl)}</code><button class="ghost compact copy-value" type="button" data-copy="${escapeHtml(config.baseUrl)}">Copy</button></div>
+      <div class="copy-line"><code title="${escapeHtml(config.baseUrl)}">${escapeHtml(config.baseUrl)}</code><button class="ghost compact copy-value" type="button" data-copy="${escapeHtml(config.baseUrl)}">Copy</button></div>
       <label>API key</label>
       <div class="secret-copy-line">
         <input class="copy-secret" type="password" value="${escapeHtml(key || "Not configured")}" readonly autocomplete="off" spellcheck="false" aria-label="API key" />
@@ -677,7 +677,7 @@ function renderSub2ApiLogin(invite) {
       ${hasLogin
         ? `<a class="ghost-wide" href="/allow-ip/sub2api-login">Open Sub2API</a>`
         : `<p class="warning">Sub2API login is not ready for this UUID. Contact the administrator to refresh this account.</p>`}
-      ${loginUrl ? `<div class="copy-line"><code>${escapeHtml(loginUrl)}</code><button class="ghost compact copy-value" type="button" data-copy="${escapeHtml(loginUrl)}">Copy URL</button></div>` : ""}
+      ${loginUrl ? `<div class="copy-line"><code title="${escapeHtml(loginUrl)}">${escapeHtml(loginUrl)}</code><button class="ghost compact copy-value" type="button" data-copy="${escapeHtml(loginUrl)}">Copy URL</button></div>` : ""}
     </div>
   `;
 }
@@ -987,15 +987,24 @@ function page(title, body) {
       font-size: 16px;
       background: #f5f5f7;
     }
-    main { width: min(100%, 560px); }
+    main { width: min(100%, 880px); }
     .hero, form, .message { display: grid; gap: 20px; }
     .dashboard { display: grid; gap: 16px; }
     .hero {
       gap: 14px;
-      margin-bottom: 40px;
+      width: min(100%, 720px);
+      margin: 0 auto 32px;
       text-align: center;
     }
-    .identity-title { overflow-wrap: anywhere; }
+    .identity-title {
+      display: -webkit-box;
+      max-width: 100%;
+      overflow: hidden;
+      font-size: 30px;
+      overflow-wrap: anywhere;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+    }
     .sub2api-icon {
       width: 72px;
       height: 72px;
@@ -1038,6 +1047,10 @@ function page(title, body) {
         0 8px 24px rgba(0, 0, 0, 0.06);
       backdrop-filter: blur(20px) saturate(180%);
       -webkit-backdrop-filter: blur(20px) saturate(180%);
+    }
+    #allow-network-form.panel, .message {
+      width: min(100%, 640px);
+      margin-inline: auto;
     }
     label {
       color: #1d1d1f;
@@ -1183,6 +1196,11 @@ function page(title, body) {
     .success { color: #248a3d; font-weight: 600; }
     .warning { color: #c77c11; font-weight: 600; }
     .api-list, .api-card { display: grid; gap: 12px; }
+    .api-list {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-items: start;
+      gap: 16px;
+    }
     .api-card {
       padding: 16px;
       border: 0.5px solid rgba(255, 255, 255, 0.55);
@@ -1212,9 +1230,12 @@ function page(title, body) {
     .secret-format {
       display: block;
       min-width: 0;
+      overflow: hidden;
       padding: 10px 12px;
       border-radius: 8px;
       background: rgba(0, 0, 0, 0.04);
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .copy-secret {
       height: 36px;
@@ -1294,6 +1315,7 @@ function page(title, body) {
       h1 { font-size: 30px; }
       .identity-title { font-size: 24px; line-height: 1.15; }
       .panel, .message { padding: 20px; border-radius: 16px; }
+      .api-list { grid-template-columns: minmax(0, 1fr); }
       .copy-line, .secret-copy-line { grid-template-columns: minmax(0, 1fr); }
       button, a { width: 100%; }
       button.ghost, button.compact { width: auto; }

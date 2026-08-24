@@ -521,6 +521,9 @@ async function collectVitals(page) {
       .find((entry) => entry.name === "first-contentful-paint");
     const values = window.__browserUiVitals || {};
     const eventDurations = (values.events || []).map((entry) => entry.duration);
+    const interactionDurations = (values.events || [])
+      .filter((entry) => Number(entry.interactionId || 0) > 0)
+      .map((entry) => entry.duration);
     return {
       playwrightObservedLcpMs: values.lcp ? Number(values.lcp) : null,
       playwrightObservedCls: Number(values.cls || 0),
@@ -530,7 +533,7 @@ async function collectVitals(page) {
       eventObserverSupported: Boolean(values.eventObserverSupported),
       observedEventCount: eventDurations.length,
       maxObservedEventDurationMs: eventDurations.length ? Math.max(...eventDurations) : null,
-      eventTimingUpperBoundMs: eventDurations.length ? Math.max(...eventDurations) : 16,
+      eventTimingUpperBoundMs: interactionDurations.length ? Math.max(...interactionDurations) : 16,
       observedEvents: (values.events || []).slice(-16).map((entry) => ({
         name: String(entry.name || "").slice(0, 32),
         duration: Number(entry.duration || 0),
@@ -554,11 +557,9 @@ async function exerciseInteraction(page, scenario) {
     await expect(addTab).toHaveAttribute("aria-controls", "tab-add");
     await expect(page.locator("#tab-users")).toHaveAttribute("aria-labelledby", "tab-users-button");
     await expect(page.locator("#tab-add")).toHaveAttribute("aria-labelledby", "tab-add-button");
-    await page.evaluate(() => document.activeElement?.blur());
-    for (let index = 0; index < 20; index += 1) {
-      if (await usersTab.evaluate((element) => element === document.activeElement)) break;
-      await page.keyboard.press("Tab");
-    }
+    await usersTab.focus();
+    await page.keyboard.press("Shift+Tab");
+    await page.keyboard.press("Tab");
     await expect(usersTab).toBeFocused();
     const focusOutline = await usersTab.evaluate((element) => ({
       style: getComputedStyle(element).outlineStyle,
@@ -699,7 +700,7 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
     expect(html).not.toMatch(/<option[^>]*value="default"/);
   }
 
-  if (viewport.width >= 1024 && ["public-form", "admin-list", "demo"].includes(scenario)) {
+  if (viewport.width >= 1024 && ["public-form", "public-dashboard", "admin-list", "demo"].includes(scenario)) {
     const typography = await page.evaluate((currentScenario) => {
       const heading = document.querySelector("h1");
       const main = document.querySelector("main");
@@ -713,7 +714,8 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
       };
     }, scenario);
     const expected = {
-      "public-form": { headingSize: "36px", mainWidth: "560px", mainMaxWidth: null, labelSize: "14px" },
+      "public-form": { headingSize: "36px", mainWidth: "880px", mainMaxWidth: null, labelSize: "14px" },
+      "public-dashboard": { headingSize: "30px", mainWidth: "880px", mainMaxWidth: null, labelSize: "14px" },
       "admin-list": { headingSize: "32px", mainWidth: null, mainMaxWidth: "1280px", labelSize: null },
       demo: { headingSize: "36px", mainWidth: null, mainMaxWidth: null, labelSize: "14px" },
     }[scenario];
@@ -725,6 +727,13 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
 
   if (scenario === "public-form") {
     await validateTurnstile(page, viewport.width < 372 ? "compact" : "flexible");
+    if (viewport.width >= 1024) {
+      const formWidth = await page.locator("#allow-network-form.panel").evaluate(
+        (element) => element.getBoundingClientRect().width,
+      );
+      expect(formWidth).toBeGreaterThanOrEqual(620);
+      expect(formWidth).toBeLessThanOrEqual(660);
+    }
     if (viewport.width === 320 && viewport.height === 568) {
       const primaryActionBounds = await page.locator("#submit-button").boundingBox();
       expect(primaryActionBounds).not.toBeNull();
@@ -736,11 +745,54 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
     await expect(page.getByRole("button", { name: "Test API key" })).toBeVisible();
     await expect(page.getByText("Key group:", { exact: false })).toBeVisible();
     expect(requests.some((value) => value.startsWith("https://challenges.cloudflare.com/"))).toBe(false);
+    const dashboardLayout = await page.evaluate(() => {
+      const title = document.querySelector(".identity-title");
+      const titleStyle = title ? getComputedStyle(title) : null;
+      const titleRect = title?.getBoundingClientRect();
+      const apiList = document.querySelector(".api-list");
+      const dashboard = document.querySelector(".dashboard");
+      const urlCode = document.querySelector(".api-card .copy-line code");
+      const urlCodeStyle = urlCode ? getComputedStyle(urlCode) : null;
+      return {
+        titleLines: titleRect && titleStyle
+          ? titleRect.height / Number.parseFloat(titleStyle.lineHeight)
+          : null,
+        dashboardWidth: dashboard?.getBoundingClientRect().width ?? null,
+        apiColumns: apiList ? getComputedStyle(apiList).gridTemplateColumns.trim().split(/\s+/).length : 0,
+        urlWhiteSpace: urlCodeStyle?.whiteSpace ?? null,
+        urlTextOverflow: urlCodeStyle?.textOverflow ?? null,
+      };
+    });
+    expect(dashboardLayout.titleLines).not.toBeNull();
+    expect(dashboardLayout.titleLines).toBeLessThanOrEqual(2.1);
+    expect(dashboardLayout.urlWhiteSpace).toBe("nowrap");
+    expect(dashboardLayout.urlTextOverflow).toBe("ellipsis");
+    if (viewport.width >= 1024) {
+      expect(dashboardLayout.dashboardWidth).toBeGreaterThanOrEqual(840);
+      expect(dashboardLayout.apiColumns).toBe(2);
+    }
   }
   if (scenario === "admin-list") {
     await expect(page.locator('.admin-tabs [aria-current="page"]')).toHaveText("UUIDs");
     await expect(page.locator(".invite-list")).toBeVisible();
     await expect(page.locator(".selected-invite-detail, .create-panel, .trash-list")).toHaveCount(0);
+    const adminLayout = await page.evaluate(() => ({
+      listColumns: getComputedStyle(document.querySelector(".invite-list")).gridTemplateColumns.trim().split(/\s+/).length,
+      tabColumns: getComputedStyle(document.querySelector(".admin-tabs")).gridTemplateColumns.trim().split(/\s+/).length,
+      firstCardHeight: document.querySelector(".invite-summary-card")?.getBoundingClientRect().height ?? null,
+    }));
+    if (viewport.width >= 1200) {
+      expect(adminLayout.listColumns).toBe(2);
+      expect(adminLayout.firstCardHeight).not.toBeNull();
+      expect(adminLayout.firstCardHeight).toBeLessThanOrEqual(156);
+    } else if (viewport.width >= 1024) {
+      expect(adminLayout.listColumns).toBe(1);
+      expect(adminLayout.firstCardHeight).not.toBeNull();
+      expect(adminLayout.firstCardHeight).toBeLessThanOrEqual(156);
+    }
+    if (viewport.width >= 320 && viewport.width <= 680) {
+      expect(adminLayout.tabColumns).toBe(3);
+    }
   }
   if (scenario === "admin-create") {
     await expect(page.locator('.admin-tabs [aria-current="page"]')).toHaveText("Create");
@@ -1402,6 +1454,15 @@ test("static demo mirrors verification, focused errors, and clipboard recovery",
   await expect(copyButton).toHaveText("Copy failed");
   await expect(page.locator("#copyStatus")).toHaveAttribute("role", "alert");
   await expect(page.locator("#copyStatus")).toContainText("Select the value and copy it manually");
+
+  await page.locator("#goAdmin").click();
+  const usersTab = page.locator("#tab-users-button");
+  await page.evaluate(() => document.activeElement?.blur());
+  for (let index = 0; index < 20; index += 1) {
+    if (await usersTab.evaluate((element) => element === document.activeElement)) break;
+    await page.keyboard.press("Tab");
+  }
+  await expect(usersTab).toBeFocused();
 });
 
 for (const viewport of VIEWPORTS) {

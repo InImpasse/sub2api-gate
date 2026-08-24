@@ -5210,7 +5210,18 @@ function page(title, body, layout = "narrow") {
     .section-head h2 { font-size: 18px; font-weight: 700; letter-spacing: 0; }
     .subhead h3 { font-size: 15px; font-weight: 600; }
     .invite-list, .trash-list { display: grid; gap: 16px; }
-    .invite-card { display: grid; gap: 20px; }
+    .invite-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .invite-list > .section-head,
+    .invite-list > .pagination,
+    .invite-list > .empty { grid-column: 1 / -1; }
+    .invite-card { display: grid; gap: 16px; }
+    .invite-summary-card { gap: 0; padding: 16px; }
+    .invite-summary-card .invite-meta {
+      align-items: start;
+      padding-bottom: 0;
+      border-bottom: 0;
+    }
+    .invite-summary-card .invite-heading { gap: 5px; }
     .invite-main {
       display: grid;
       grid-template-columns: minmax(420px, 1.05fr) minmax(380px, 0.95fr);
@@ -5629,8 +5640,9 @@ function page(title, body, layout = "narrow") {
         transition: none !important;
       }
     }
-    @media (max-width: 1100px) {
+    @media (max-width: 1180px) {
       body { padding: 32px 24px 40px; }
+      .invite-list { grid-template-columns: minmax(0, 1fr); }
       .invite-main { grid-template-columns: minmax(0, 1fr); }
     }
     @media (max-width: 920px) {
@@ -5662,10 +5674,15 @@ function page(title, body, layout = "narrow") {
       .ip-preview-list { justify-content: flex-start; }
       .ip-preview { max-width: 100%; }
       th, td { padding: 10px 8px; }
-      h1 { font-size: 28px; }
-      .panel, .message { padding: 18px; border-radius: 16px; }
-      .admin-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .admin-tabs .nav-link:last-child { grid-column: 1 / -1; }
+      .admin { gap: 20px; }
+      h1 { font-size: 26px; }
+      .panel, .message { padding: 16px; border-radius: 16px; }
+      .invite-summary-card { padding: 16px; }
+      .admin-tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .admin-tabs .nav-link { padding-inline: 3px; font-size: 13px; }
+    }
+    @media (max-width: 280px) {
+      .admin-tabs { grid-template-columns: minmax(0, 1fr); }
     }
     @media (max-width: 240px) {
       body { padding: 16px 6px; }
