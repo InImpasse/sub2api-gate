@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -259,8 +260,13 @@ class WorkerRuntimeAttestationTests(unittest.TestCase):
             environment["NPM_CONFIG_USERCONFIG"],
             environment["NPM_CONFIG_GLOBALCONFIG"],
         )
+        node_binary = shutil.which("node")
+        npm_binary = shutil.which("npm")
+        self.assertIsNotNone(node_binary)
+        self.assertIsNotNone(npm_binary)
+        npm_cli = pathlib.Path(npm_binary).resolve()
         result = subprocess.run(
-            [TOOL.NPM_BINARY, "config", "list", "--json"],
+            [node_binary, npm_cli, "config", "list", "--json"],
             env=environment,
             capture_output=True,
             text=True,

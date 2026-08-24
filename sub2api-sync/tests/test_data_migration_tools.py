@@ -1046,6 +1046,8 @@ class DataMigrationToolTests(unittest.TestCase):
             app_migration.EXPECTED_DATA_ROOT = root
             app_migration.DATA_ROOT_UID = os.getuid()
             app_migration.DATA_ROOT_GID = os.getgid()
+            app_migration.APP_UID = os.getuid()
+            app_migration.APP_GID = os.getgid()
             with mock.patch.dict(
                 os.environ,
                 {
@@ -1060,10 +1062,13 @@ class DataMigrationToolTests(unittest.TestCase):
             self.assertEqual(copied, 1)
             destination = target / "model_pricing.json"
             info = destination.stat()
-            self.assertEqual((info.st_uid, info.st_gid), (1000, 1000))
+            self.assertEqual((info.st_uid, info.st_gid), (os.getuid(), os.getgid()))
             self.assertEqual(info.st_mode & 0o777, 0o600)
             marker_info = (target / ".installed").stat()
-            self.assertEqual((marker_info.st_uid, marker_info.st_gid), (1000, 1000))
+            self.assertEqual(
+                (marker_info.st_uid, marker_info.st_gid),
+                (os.getuid(), os.getgid()),
+            )
             self.assertEqual(marker_info.st_mode & 0o777, 0o400)
             self.assertNotIn("password", (target / ".installed").read_text())
             self.assertFalse(any(".partial-" in item.name for item in target.iterdir()))

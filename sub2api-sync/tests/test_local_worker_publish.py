@@ -4,6 +4,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -16,6 +17,7 @@ TOOL_PATH = ROOT / "deploy" / "local-worker-publish.py"
 SPEC = importlib.util.spec_from_file_location("local_worker_publish", TOOL_PATH)
 PUBLISHER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PUBLISHER)
+NODE = pathlib.Path(shutil.which("node") or "")
 
 
 class LocalWorkerPublishTests(unittest.TestCase):
@@ -340,7 +342,7 @@ class LocalWorkerPublishTests(unittest.TestCase):
                 ):
                     result = PUBLISHER.main([
                         *arguments,
-                        "--node", "/usr/bin/node",
+                        "--node", str(NODE),
                         "--home", temporary,
                         "--wrangler-config", str(self.config),
                     ])
@@ -409,7 +411,7 @@ class LocalWorkerPublishTests(unittest.TestCase):
         cases = (
             ([], {"euid": 0}, "OAuth-owning operator"),
             (["--node", str(self.root / "missing-node")], {"euid": os.geteuid()}, "unavailable"),
-            (["--node", "/usr/bin/node", "--home", "."], {"euid": os.geteuid()}, "OAuth home"),
+            (["--node", str(NODE), "--home", "."], {"euid": os.geteuid()}, "OAuth home"),
         )
         for extra, options, expected in cases:
             with self.subTest(extra=extra), tempfile.TemporaryDirectory() as temporary:

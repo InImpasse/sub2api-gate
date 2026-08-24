@@ -1105,7 +1105,7 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
             ):
                 result = RECOVERY.main([
                     "check",
-                    "--node", "/usr/bin/node",
+                    "--node", str(RECOVERY.NODE),
                     "--home", str(root),
                     "--wrangler-config", str(config),
                 ])
@@ -1135,7 +1135,7 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
                 result = RECOVERY.main(
                     [
                         "--apply",
-                        "--node", "/usr/bin/node",
+                        "--node", str(RECOVERY.NODE),
                         "--home", str(root),
                         "--wrangler-config", str(config),
                     ],
@@ -1184,7 +1184,7 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
                         "--apply",
                         "--password-file", str(password_file),
                         "--totp-seed-file", str(seed_file),
-                        "--node", "/usr/bin/node",
+                        "--node", str(RECOVERY.NODE),
                         "--home", str(root),
                         "--wrangler-config", str(config),
                     ],
@@ -1298,7 +1298,15 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
             config = root / "wrangler.private.jsonc"
             config.write_text("{}\n", encoding="ascii")
             config.chmod(0o600)
-            base = ["--apply", "--node", "/usr/bin/node", "--home", str(root), "--wrangler-config", str(config)]
+            base = [
+                "--apply",
+                "--node",
+                str(RECOVERY.NODE),
+                "--home",
+                str(root),
+                "--wrangler-config",
+                str(config),
+            ]
             for kwargs, extra, expected in scenarios:
                 with self.subTest(expected=expected):
                     stderr = io.StringIO()
@@ -1320,7 +1328,13 @@ class WorkerAdminRecoveryTests(unittest.TestCase):
             stderr = io.StringIO()
             with mock.patch.object(RECOVERY, "run_recovery_candidate") as candidate, contextlib.redirect_stderr(stderr):
                 result = RECOVERY.main([
-                    "check", "--node", "/usr/bin/node", "--home", ".", "--wrangler-config", str(config),
+                    "check",
+                    "--node",
+                    str(RECOVERY.NODE),
+                    "--home",
+                    ".",
+                    "--wrangler-config",
+                    str(config),
                 ])
             self.assertEqual(result, 1)
             self.assertIn("must be absolute", stderr.getvalue())
