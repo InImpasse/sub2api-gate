@@ -128,6 +128,15 @@ class ReleasePolicyTests(unittest.TestCase):
                 self.assertIn(command, gate)
                 self.assertIn(f"run: {command}", workflow)
 
+        trusted_node = (
+            'run: sudo install -o root -g root -m 0755 "$(command -v node)" '
+            "/usr/bin/node"
+        )
+        self.assertIn(trusted_node, workflow)
+        self.assertLess(
+            workflow.index(trusted_node),
+            workflow.index("run: bash deploy/check-core-coverage.sh"),
+        )
         self.assertNotIn("run: bash deploy/verify-local.sh", workflow)
 
     def test_verifier_reads_every_release_consumer_from_the_supplied_root(self):

@@ -19,6 +19,8 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: worker-allow-ip/package-lock.json
+      - name: Install trusted Node path
+        run: sudo install -o root -g root -m 0755 "$(command -v node)" /usr/bin/node
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
