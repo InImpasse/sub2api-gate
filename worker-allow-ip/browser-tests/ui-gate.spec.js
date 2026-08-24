@@ -176,6 +176,25 @@ function syncResponse(request) {
         syncedAt: "2026-07-21T12:30:00.000Z",
       });
     }
+    if (body.action === "login") {
+      return Response.json({
+        ok: true,
+        action: body.action,
+        uuid: body.uuid,
+        auth: {
+          access_token: "browser-ui-access-token",
+          refresh_token: "browser-ui-refresh-token",
+          expires_in: 3600,
+          user: {
+            id: 11,
+            username: "browser-user",
+            email: "browser-user@example.test",
+            role: "user",
+            status: "active",
+          },
+        },
+      });
+    }
     return Response.json({ ok: true, action: body.action });
   });
 }
@@ -236,6 +255,19 @@ async function seedWorker() {
   });
   const responseBody = await response.text();
   expect(response.status, responseBody).toBe(200);
+}
+
+async function fulfillWorkerGet(route) {
+  const request = route.request();
+  const response = await miniflare.dispatchFetch(request.url(), {
+    method: "GET",
+    headers: request.headers(),
+  });
+  await route.fulfill({
+    status: response.status,
+    headers: Object.fromEntries(response.headers),
+    body: Buffer.from(await response.arrayBuffer()),
+  });
 }
 
 async function turnstileRoute(route) {
@@ -924,6 +956,81 @@ test.afterAll(async () => {
     playwrightVersion: packageJson.devDependencies["@playwright/test"],
     results: RESULTS,
   }, null, 2)}\n`);
+});
+
+test("Sub2API bridge verifies the issued session before redirecting", async ({ page, context }) => {
+  await context.addCookies([{
+    name: "sub2api_allow_uuid",
+    value: PUBLIC_SESSION_TOKEN,
+    url: "https://api.example.test",
+  }]);
+  await page.route("https://api.example.test/allow-ip/sub2api-login", fulfillWorkerGet);
+  let authorization = "";
+  await page.route("**/api/v1/auth/me", async (route) => {
+    authorization = route.request().headers().authorization || "";
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify({ code: 0, data: { id: 11, role: "user" } }),
+    });
+  });
+  await page.route("**/login", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html; charset=utf-8",
+      body: "<!doctype html><title>Sub2API target</title><h1>Sub2API target</h1>",
+    });
+  });
+
+  await page.goto("https://api.example.test/allow-ip/sub2api-login", { waitUntil: "networkidle" });
+
+  await expect(page.getByRole("heading", { name: "Sub2API target" })).toBeVisible();
+  expect(authorization).toBe("Bearer browser-ui-access-token");
+  expect(await page.evaluate(() => ({
+    accessToken: localStorage.getItem("auth_token"),
+    refreshToken: localStorage.getItem("refresh_token"),
+    user: JSON.parse(localStorage.getItem("auth_user") || "null"),
+  }))).toEqual({
+    accessToken: "browser-ui-access-token",
+    refreshToken: "browser-ui-refresh-token",
+    user: {
+      id: 11,
+      username: "browser-user",
+      email: "browser-user@example.test",
+      role: "user",
+      status: "active",
+    },
+  });
+});
+
+test("Sub2API bridge clears partial auth and exposes a bounded verification request ID", async ({ page, context }) => {
+  await context.addCookies([{
+    name: "sub2api_allow_uuid",
+    value: PUBLIC_SESSION_TOKEN,
+    url: "https://api.example.test",
+  }]);
+  await page.route("https://api.example.test/allow-ip/sub2api-login", fulfillWorkerGet);
+  await page.route("**/api/v1/auth/me", async (route) => {
+    await route.fulfill({
+      status: 401,
+      headers: { "x-request-id": "req-browser-auth-verify" },
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify({ code: 401, message: "fixture detail must stay hidden" }),
+    });
+  });
+
+  await page.goto("https://api.example.test/allow-ip/sub2api-login", { waitUntil: "networkidle" });
+
+  await expect(page.getByRole("heading", { name: "Signing in" })).toBeVisible();
+  await expect(page.locator("#login-status")).toContainText("req-browser-auth-verify");
+  await expect(page.locator("#login-status")).not.toContainText("fixture detail");
+  expect(page.url()).toContain("/allow-ip/sub2api-login");
+  expect(await page.evaluate(() => [
+    localStorage.getItem("auth_token"),
+    localStorage.getItem("refresh_token"),
+    localStorage.getItem("token_expires_at"),
+    localStorage.getItem("auth_user"),
+  ])).toEqual([null, null, null, null]);
 });
 
 test("public Turnstile load failure is visible and retryable without shifting the form", async ({ page, context }) => {

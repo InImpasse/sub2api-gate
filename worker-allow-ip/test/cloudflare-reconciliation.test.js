@@ -145,6 +145,23 @@ test("a pre-existing List item is never deleted when the local records write fai
   assert.equal(fixture.activeRecordLeaseCount, 0);
 });
 
+test("a pre-existing List item is linked to another invite without being duplicated", async () => {
+  const fixture = fixtureEnv({ invites: [invite()] });
+  fixture.listItems.push({ id: "pre-existing", ip: VALUE, comment: "managed elsewhere" });
+
+  await withExternalMocks(fixture, async () => {
+    const result = await authorizeVisitorIps(fixture.env, request(), invite(), visitorIps());
+    assert.equal(result.ok, true);
+    assert.equal(result.items[0].listItemId, "pre-existing");
+    assert.equal(result.items[0].alreadyListed, true);
+  });
+
+  assert.deepEqual(fixture.listItems.map((item) => item.id), ["pre-existing"]);
+  assert.deepEqual(fixture.deletedIds, []);
+  assert.match(fixture.values.get(`records:${UUID}`), /pre-existing/);
+  assert.equal(fixture.activeRecordLeaseCount, 0);
+});
+
 test("delete failure leaves a leased marker and the scheduler later reconciles it", async () => {
   const fixture = fixtureEnv({ invites: [invite()], failRecordPuts: 1 });
   fixture.failDeletes = true;

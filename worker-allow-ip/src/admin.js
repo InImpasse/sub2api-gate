@@ -442,6 +442,17 @@ class Sub2ApiSyncError extends Error {
   }
 }
 
+export function sub2ApiSyncFailureMetadata(error) {
+  if (!(error instanceof Sub2ApiSyncError)) return null;
+  return {
+    status: error.status,
+    code: error.code,
+    retryable: error.retryable,
+    requestId: error.requestId,
+    action: error.action,
+  };
+}
+
 export async function findInvite(env, input) {
   if (!input) {
     return null;

@@ -6,6 +6,7 @@ import { protectInviteCredentials } from "../src/credential-security.js";
 
 
 const UUID = "7c484f74-6d93-43d1-9441-00c7d8d4ab11";
+const OTHER_UUID = "8d595f85-7e04-44e2-a552-11d8e9c5bc22";
 const AES_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 const HMAC_KEY = "test-only-hmac-key-with-at-least-32-bytes";
 
@@ -404,7 +405,18 @@ test("Sub2API auto-login fetches a token when the login URL has the request orig
       ok: true,
       action: "login",
       uuid: UUID,
-      auth: { access_token: "same-origin-access-token" },
+      auth: {
+        access_token: "same-origin-access-token",
+        refresh_token: "same-origin-refresh-token",
+        expires_in: 3600,
+        user: {
+          id: 17,
+          username: "alice",
+          email: "alice@example.test",
+          role: "user",
+          status: "active",
+        },
+      },
     });
   };
 
@@ -439,6 +451,53 @@ test("Sub2API auto-login fetches a token when the login URL has the request orig
     );
     assert.match(body, /Signing in/);
     assert.match(body, /same-origin-access-token/);
+    assert.match(body, /\/api\/v1\/auth\/me/);
+
+    globalThis.fetch = async () => Response.json({
+      ok: true,
+      action: "login",
+      uuid: UUID,
+      auth: { access_token: "incomplete-auth-must-not-be-rendered" },
+    });
+    const incompleteResponse = await worker.fetch(new Request("https://api.example.test/allow-ip/sub2api-login", {
+      headers: { Cookie: `sub2api_allow_uuid=${token}` },
+    }), {
+      INVITE_STORE: memoryKv(values),
+      ALLOWED_HOSTNAMES: "api.example.test",
+      CREDENTIAL_ENCRYPTION_KEY: AES_KEY,
+      INVITE_ACCESS_HMAC_KEY: HMAC_KEY,
+      SUB2API_SYNC_URL: "https://api.example.test/_sub2api-sync/provision",
+      SUB2API_SYNC_SECRET: "s".repeat(32),
+    });
+    const incompleteBody = await incompleteResponse.text();
+    assert.match(incompleteBody, /Sub2API login unavailable/);
+    assert.doesNotMatch(incompleteBody, /incomplete-auth-must-not-be-rendered/);
+
+    globalThis.fetch = async () => Response.json({
+      ok: false,
+      action: "login",
+      error: "upstream_invalid_response",
+      retryable: true,
+      requestId: "worker-public-login-test",
+      detail: "private upstream detail must stay hidden",
+    }, {
+      status: 502,
+      headers: { "x-request-id": "worker-public-login-test" },
+    });
+    const failedResponse = await worker.fetch(new Request("https://api.example.test/allow-ip/sub2api-login", {
+      headers: { Cookie: `sub2api_allow_uuid=${token}` },
+    }), {
+      INVITE_STORE: memoryKv(values),
+      ALLOWED_HOSTNAMES: "api.example.test",
+      CREDENTIAL_ENCRYPTION_KEY: AES_KEY,
+      INVITE_ACCESS_HMAC_KEY: HMAC_KEY,
+      SUB2API_SYNC_URL: "https://api.example.test/_sub2api-sync/provision",
+      SUB2API_SYNC_SECRET: "s".repeat(32),
+    });
+    const failedBody = await failedResponse.text();
+    assert.match(failedBody, /upstream_invalid_response/);
+    assert.match(failedBody, /worker-public-login-test/);
+    assert.doesNotMatch(failedBody, /private upstream detail/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -485,6 +544,51 @@ test("an already-authorized dashboard does not load the Turnstile client", async
   assert.match(body, /Current network authorization is active/);
   assert.doesNotMatch(body, /<script[^>]+src="https:\/\/challenges\.cloudflare\.com\/turnstile\/v0\/api\.js/);
   assert.doesNotMatch(body, /id="turnstile-widget"/);
+});
+
+test("a network linked by another user is described as unlinked, not unauthorized", async () => {
+  const token = "cross-user-network-session";
+  const sessionKey = `uuid-session:${await sha256Hex(token)}`;
+  const storedInvite = await protectInviteCredentials({
+    uuid: UUID,
+    credentialVersion: 2,
+    accessCredentialVersion: 1,
+    username: "bob",
+  }, AES_KEY, HMAC_KEY);
+  const values = new Map([
+    ["invites", JSON.stringify([storedInvite])],
+    [sessionKey, JSON.stringify({
+      uuid: UUID,
+      csrf: "csrf-token",
+      authenticationMethod: "access_key",
+      accessCredentialVersion: 1,
+      expiresAt: Date.now() + 60_000,
+    })],
+    [`records:${UUID}`, "[]"],
+    [`records:${OTHER_UUID}`, JSON.stringify([{
+      id: "other-user-network",
+      expiresAt: "2099-07-01T00:00:00.000Z",
+      ips: [{ ip: "198.51.100.9", cidr: "198.51.100.0/24" }],
+    }])],
+  ]);
+
+  const response = await worker.fetch(new Request("https://api.example.test/allow-ip", {
+    headers: {
+      Cookie: `sub2api_allow_uuid=${token}`,
+      "CF-Connecting-IP": "198.51.100.9",
+    },
+  }), {
+    INVITE_STORE: memoryKv(values),
+    ALLOWED_HOSTNAMES: "api.example.test",
+    CREDENTIAL_ENCRYPTION_KEY: AES_KEY,
+    INVITE_ACCESS_HMAC_KEY: HMAC_KEY,
+  });
+  const body = await response.text();
+
+  assert.equal(response.status, 200);
+  assert.match(body, /Current network is not linked to this user yet/);
+  assert.match(body, /Link current network to this user/);
+  assert.doesNotMatch(body, /Current network is not authorized yet/);
 });
 
 function memoryKv(values) {

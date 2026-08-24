@@ -1,4 +1,4 @@
-import { authorizeVisitorIps, cleanupExpiredIpGroups, findInvite, getInviteApiConfigs, getInviteByUuid, getInviteIpRecords, handleAdmin, keyTestAttemptKey, keyTestNotice, loginInviteToSub2Api, sanitizeInviteForPublic, testInviteApiKey } from "./admin.js";
+import { authorizeVisitorIps, cleanupExpiredIpGroups, findInvite, getInviteApiConfigs, getInviteByUuid, getInviteIpRecords, handleAdmin, keyTestAttemptKey, keyTestNotice, loginInviteToSub2Api, sanitizeInviteForPublic, sub2ApiSyncFailureMetadata, testInviteApiKey } from "./admin.js";
 import { createAuthStateStore, isAuthStateBindingConfigured } from "./auth-state.js";
 import {
   rateLimitFingerprint,
@@ -380,7 +380,7 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
       ${shouldShowAddIp ? `<form id="allow-network-form" method="post" action="${escapeHtml(url.pathname)}">
         <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
         ${turnstileControl()}
-        <button id="submit-button" type="submit" disabled>Authorize current network</button>
+        <button id="submit-button" type="submit" disabled>Link current network to this user</button>
       </form>` : ""}
       <div class="api-list">
         ${renderSub2ApiLogin(invite)}
@@ -618,7 +618,7 @@ function renderCurrentIpStatus(status) {
     return `<p class="success">Current network authorization is active: ${escapeHtml(values)}</p>`;
   }
 
-  return `<p class="warning">Current network is not authorized yet: ${escapeHtml(values)}. IPv4 uses the full /24 network.</p>`;
+  return `<p class="warning">Current network is not linked to this user yet: ${escapeHtml(values)}. It may already be globally authorized through another user. IPv4 uses the full /24 network.</p>`;
 }
 
 function renderApiConfig(config, { csrf = "", uuid = "", action = "/allow-ip" } = {}) {
@@ -696,9 +696,20 @@ async function renderSub2ApiAutoLogin(env, invite, requestUrl) {
     const result = await loginInviteToSub2Api(env, invite);
     auth = result.auth || {};
   } catch (error) {
+    const failure = sub2ApiSyncFailureMetadata(error);
+    if (failure) {
+      const retry = failure.retryable ? " Try again after the dependency recovers." : "";
+      return renderMessage(
+        "Sub2API login unavailable",
+        `The sync service returned ${failure.code}. Request ID: ${failure.requestId}.${retry}`,
+      );
+    }
     return renderMessage("Sub2API login unavailable", "Automatic login failed. Contact the administrator to refresh this account.");
   }
-  if (!auth.access_token) {
+  if (!auth.access_token
+      || !auth.user
+      || !Number.isSafeInteger(auth.user.id)
+      || auth.user.id <= 0) {
     return renderMessage("Sub2API login unavailable", "Automatic login failed. Contact the administrator to refresh this account.");
   }
 
@@ -712,14 +723,45 @@ async function renderSub2ApiAutoLogin(env, invite, requestUrl) {
       (async () => {
         const status = document.getElementById("login-status");
         const fallback = document.getElementById("manual-login");
+        const clearPartialAuth = () => {
+          try {
+            ["auth_token", "refresh_token", "token_expires_at", "auth_user"]
+              .forEach((key) => localStorage.removeItem(key));
+          } catch {}
+        };
         try {
-          localStorage.setItem("auth_token", ${jsString(auth.access_token)});
+          const accessToken = ${jsString(auth.access_token)};
+          localStorage.setItem("auth_token", accessToken);
           ${auth.refresh_token ? `localStorage.setItem("refresh_token", ${jsString(auth.refresh_token)});` : `localStorage.removeItem("refresh_token");`}
           ${auth.expires_in ? `localStorage.setItem("token_expires_at", String(Date.now() + ${Number(auth.expires_in)} * 1000));` : `localStorage.removeItem("token_expires_at");`}
-          ${auth.user ? `localStorage.setItem("auth_user", ${jsString(JSON.stringify(auth.user))});` : `localStorage.removeItem("auth_user");`}
+          localStorage.setItem("auth_user", ${jsString(JSON.stringify(auth.user))});
+          const verification = await fetch("/api/v1/auth/me", {
+            method: "GET",
+            headers: {
+              accept: "application/json",
+              authorization: "Bearer " + accessToken,
+            },
+            cache: "no-store",
+            credentials: "omit",
+            redirect: "error",
+          });
+          if (!verification.ok) {
+            const candidateRequestId = verification.headers.get("x-request-id") || "";
+            const requestId = /^[A-Za-z0-9._-]{1,64}$/.test(candidateRequestId)
+              ? candidateRequestId
+              : "";
+            clearPartialAuth();
+            status.setAttribute("role", "alert");
+            status.textContent = "Automatic login could not establish a Sub2API session."
+              + (requestId ? " Request ID: " + requestId + "." : "");
+            fallback.textContent = "Open Sub2API";
+            return;
+          }
           window.location.replace(${jsString(loginUrl)});
         } catch (error) {
-          status.textContent = "Automatic login failed. Contact the administrator to refresh this account.";
+          clearPartialAuth();
+          status.setAttribute("role", "alert");
+          status.textContent = "Automatic login could not establish a Sub2API session. Try again later.";
           fallback.textContent = "Open Sub2API";
         }
       })();
