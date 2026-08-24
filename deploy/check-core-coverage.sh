@@ -94,17 +94,57 @@ if failures:
 PY
 
 cd "$repo_dir"
-uvx --python "$(command -v python3)" --from coverage==7.15.3 coverage run \
+sync_report="$temporary_dir/sync-tests.txt"
+if ! uvx --python "$(command -v python3)" --from coverage==7.15.3 coverage run \
   --branch \
   --data-file "$temporary_dir/sync-coverage.data" \
   --include 'sub2api-sync/sub2api_sync.py' \
-  -m unittest discover -s sub2api-sync/tests -q
-uvx --python "$(command -v python3)" --from coverage==7.15.3 coverage json \
+  -m unittest discover -s sub2api-sync/tests -q >"$sync_report" 2>&1
+then
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    sync_summary="$(python3 - "$sync_report" <<'PY'
+import pathlib
+import re
+import sys
+
+report = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+parts = []
+ran = re.search(r"^Ran ([0-9]+) tests? in ", report, flags=re.MULTILINE)
+if ran:
+    parts.append(f"tests={ran.group(1)}")
+outcome = re.search(r"^FAILED \(([-A-Za-z0-9=, ]{1,200})\)$", report, flags=re.MULTILINE)
+if outcome:
+    parts.append(outcome.group(1).replace(" ", ""))
+failures = re.findall(
+    r"^(ERROR|FAIL): ([A-Za-z0-9_.]+) \(([A-Za-z0-9_.]+)\)$",
+    report,
+    flags=re.MULTILINE,
+)
+for kind, name, suite in failures[:5]:
+    parts.append(f"{kind.lower()}={suite}.{name}")
+print(",".join(parts) if parts else "bounded test summary unavailable")
+PY
+)"
+    printf '::error title=Sync test gate failed::%s\n' "$sync_summary" >&2
+  fi
+  tail -n 80 "$sync_report" >&2 || true
+  exit 1
+fi
+cat "$sync_report"
+
+if ! uvx --python "$(command -v python3)" --from coverage==7.15.3 coverage json \
   --data-file "$temporary_dir/sync-coverage.data" \
   -o "$temporary_dir/sync-coverage.json"
+then
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    printf '%s\n' '::error title=Sync coverage gate failed::coverage report unavailable' >&2
+  fi
+  exit 1
+fi
 
 python3 - "$temporary_dir/sync-coverage.json" "$baseline_path" <<'PY'
 import json
+import os
 import pathlib
 import sys
 
@@ -120,9 +160,13 @@ line_minimum = float(threshold["line"])
 branch_minimum = float(threshold["branch"])
 print(f"sync sub2api_sync.py: line={line:.2f}% branch={branch:.2f}%")
 if line < line_minimum or branch < branch_minimum:
-    raise SystemExit(
+    message = (
         "sync coverage regression: "
         f"line={line:.2f}%/{line_minimum:.2f}% "
         f"branch={branch:.2f}%/{branch_minimum:.2f}%"
     )
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        annotation = message.replace("%", "%25")
+        print(f"::error title=Sync coverage gate failed::{annotation}")
+    raise SystemExit(message)
 PY
