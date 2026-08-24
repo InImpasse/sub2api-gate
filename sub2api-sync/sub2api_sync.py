@@ -1172,10 +1172,11 @@ def login(payload):
             legacy_username,
             username,
             user_id=user_id,
-            allow_bind=False,
+            allow_bind=user_id > 0,
         )
         if not user or str(user[4]).strip().lower() != email.lower():
             raise RuntimeError("invite_identity_mismatch")
+        user_id = int(user[0])
     body = json.dumps({"email": email, "password": password}, separators=(",", ":")).encode()
     request = urllib.request.Request(
         os.environ.get("SUB2API_INTERNAL_LOGIN_URL", "http://127.0.0.1:8080/api/v1/auth/login"),
@@ -1203,12 +1204,21 @@ def login(payload):
             raise RuntimeError("sub2api_login_rate_limited") from error
         raise RuntimeError("sub2api_login_rejected") from error
     if not isinstance(payload, dict) or payload.get("code") != 0:
-        raise RuntimeError("sub2api login failed")
+        raise RuntimeError("sub2api_login_rejected")
+    auth = sanitize_login_auth(payload.get("data"))
+    auth_user = auth.get("user")
+    if (
+        not isinstance(auth_user, dict)
+        or isinstance(auth_user.get("id"), bool)
+        or not isinstance(auth_user.get("id"), int)
+        or auth_user["id"] != user_id
+    ):
+        raise RuntimeError("sub2api_login_response_identity_mismatch")
     return {
         "ok": True,
         "action": "login",
         "uuid": uuid,
-        "auth": sanitize_login_auth(payload.get("data")),
+        "auth": auth,
         "syncedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 

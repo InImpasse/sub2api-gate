@@ -728,7 +728,10 @@ class SyncHttpContractTests(unittest.TestCase):
                 return False
 
             def read(self, _limit):
-                return b'{"code":0,"data":{"access_token":"test-token"}}'
+                return (
+                    b'{"code":0,"data":{"access_token":"test-token",'
+                    b'"user":{"id":9}}}'
+                )
 
         payload = {
             "uuid": "7c484f74-6d93-43d1-9441-00c7d8d4ab11",

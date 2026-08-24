@@ -319,7 +319,15 @@ class Sub2ApiCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(statements, [])
 
-    def test_login_requires_existing_invite_ownership_before_upstream_request(self):
+    def test_login_reconciles_an_unowned_explicit_user_before_upstream_request(self):
+        statements = []
+        secret = "s" * 32
+        owner = SYNC.hmac.new(
+            secret.encode(),
+            b"sub2api-invite-owner:v1:" + self.UUID.encode(),
+            SYNC.hashlib.sha256,
+        ).hexdigest()
+
         def first_row(sql):
             if "FROM users u" in sql and "u.id=9" in sql:
                 return [
@@ -331,29 +339,60 @@ class Sub2ApiCompatibilityTests(unittest.TestCase):
                     "bcrypt-hash",
                     "active",
                 ]
+            if "SELECT invite_fingerprint" in sql:
+                return [owner]
             raise AssertionError(sql)
+
+        class LoginResponse:
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return json.dumps({
+                    "code": 0,
+                    "data": {
+                        "access_token": "test-access-token",
+                        "user": {
+                            "id": 9,
+                            "username": "alice-example",
+                            "email": "alice@example.test",
+                            "role": "user",
+                            "status": "active",
+                        },
+                    },
+                }).encode()
 
         with mock.patch.dict(
             SYNC.os.environ,
-            {"SUB2API_SYNC_SECRET": "s" * 32},
+            {"SUB2API_SYNC_SECRET": secret},
             clear=True,
         ), mock.patch.object(
             SYNC, "database_transaction", return_value=nullcontext()
         ), mock.patch.object(
             SYNC, "first_row", side_effect=first_row
         ), mock.patch.object(
-            SYNC.urllib.request, "urlopen"
+            SYNC, "psql", side_effect=statements.append
+        ), mock.patch.object(
+            SYNC.urllib.request, "urlopen", return_value=LoginResponse()
         ) as urlopen:
-            with self.assertRaisesRegex(RuntimeError, "invite_identity_mismatch"):
-                SYNC.login({
-                    "uuid": self.UUID,
-                    "username": "alice-example",
-                    "sub2apiUserId": 9,
-                    "email": "alice@example.test",
-                    "loginPassword": "password",
-                })
+            result = SYNC.login({
+                "uuid": self.UUID,
+                "username": "alice-example",
+                "sub2apiUserId": 9,
+                "email": "alice@example.test",
+                "loginPassword": "password",
+            })
 
-        urlopen.assert_not_called()
+        self.assertEqual(result["auth"]["user"]["id"], 9)
+        self.assertEqual(len(statements), 1)
+        self.assertIn(owner, statements[0])
+        self.assertNotIn(self.UUID, statements[0])
+        urlopen.assert_called_once()
 
     def test_login_rejects_an_owned_user_when_database_email_does_not_match(self):
         secret = "s" * 32
@@ -516,6 +555,75 @@ class Sub2ApiCompatibilityTests(unittest.TestCase):
             },
         })
         self.assertEqual(auth["user"], {"username": "alice"})
+
+    def test_login_rejects_every_invalid_upstream_user_identity_shape(self):
+        secret = "s" * 32
+        owner = SYNC.hmac.new(
+            secret.encode(),
+            b"sub2api-invite-owner:v1:" + self.UUID.encode(),
+            SYNC.hashlib.sha256,
+        ).hexdigest()
+        owned_user = [
+            "9", "alice-example", "user", owner, "alice@example.test",
+            "bcrypt-hash", "active",
+        ]
+
+        class LoginResponse:
+            headers = {}
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return json.dumps(self.payload).encode()
+
+        request = {
+            "uuid": self.UUID,
+            "username": "alice-example",
+            "sub2apiUserId": 9,
+            "email": "alice@example.test",
+            "loginPassword": "password",
+        }
+        invalid_users = (
+            None,
+            {"id": True},
+            {"id": "9"},
+            {"id": 10},
+        )
+        with mock.patch.dict(
+            SYNC.os.environ,
+            {"SUB2API_SYNC_SECRET": secret},
+            clear=True,
+        ), mock.patch.object(
+            SYNC, "database_transaction", return_value=nullcontext()
+        ), mock.patch.object(
+            SYNC, "first_row", return_value=owned_user
+        ):
+            for invalid_user in invalid_users:
+                data = {"access_token": "test-access-token"}
+                if invalid_user is not None:
+                    data["user"] = invalid_user
+                with self.subTest(invalid_user=invalid_user), mock.patch.object(
+                    SYNC.urllib.request,
+                    "urlopen",
+                    return_value=LoginResponse({"code": 0, "data": data}),
+                ), self.assertRaisesRegex(
+                    RuntimeError, "sub2api_login_response_identity_mismatch"
+                ):
+                    SYNC.login(request)
+
+            with mock.patch.object(
+                SYNC.urllib.request,
+                "urlopen",
+                return_value=LoginResponse({"code": 1}),
+            ), self.assertRaisesRegex(RuntimeError, "sub2api_login_rejected"):
+                SYNC.login(request)
 
     def test_login_rejects_old_worker_payload_without_existing_ownership(self):
         with mock.patch.dict(

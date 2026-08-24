@@ -1,4 +1,6 @@
 import importlib.util
+import http.server
+import json
 import os
 import pathlib
 import shutil
@@ -6,9 +8,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
+from contextlib import contextmanager
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -21,6 +25,71 @@ SPEC.loader.exec_module(SYNC)
 POSTGRES_IMAGE = "postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15"
 REDIS_IMAGE = "redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005"
 TEST_PASSWORD = "local-sync-dependency-test-password"
+SYNC_SECRET = "s" * 32
+
+
+class LoginUpstream(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, expected):
+        self.expected = expected
+        self.requests = 0
+        super().__init__(("127.0.0.1", 0), LoginHandler)
+
+
+class LoginHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        body = json.loads(self.rfile.read(length))
+        self.server.requests += 1
+        if (
+            self.path != "/api/v1/auth/login"
+            or body.get("email") != self.server.expected["email"]
+            or body.get("password") != self.server.expected["password"]
+        ):
+            payload = {"code": 1}
+            status = 401
+        else:
+            payload = {
+                "code": 0,
+                "data": {
+                    "access_token": "isolated-access-token",
+                    "refresh_token": "isolated-refresh-token",
+                    "expires_in": 3600,
+                    "user": {
+                        "id": self.server.expected.get(
+                            "response_user_id", self.server.expected["user_id"]
+                        ),
+                        "username": self.server.expected["username"],
+                        "email": self.server.expected["email"],
+                        "role": "user",
+                        "status": "active",
+                    },
+                },
+            }
+            status = 200
+        encoded = json.dumps(payload, separators=(",", ":")).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format, *_args):
+        return
+
+
+@contextmanager
+def running_login_upstream(expected):
+    server = LoginUpstream(expected)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def docker(*arguments, **kwargs):
@@ -143,7 +212,107 @@ class SyncDependencyIntegrationTests(unittest.TestCase):
             "SUB2API_SYNC_REDIS_PORT": str(self.redis_port),
             "SUB2API_SYNC_REDIS_PASSWORD": TEST_PASSWORD,
             "SUB2API_SYNC_REDIS_USERNAME": "",
+            "SUB2API_SYNC_SECRET": SYNC_SECRET,
+            "SUB2API_SYNC_DEFAULT_GROUP": "openai-default",
+            "SUB2API_LOGIN_URL": "https://api.example.test",
+            "SUB2API_PUBLIC_BASE_URL": "https://api.example.test/v1",
         })
+
+    def _install_sync_schema(self):
+        SYNC.psql("""
+            CREATE EXTENSION pgcrypto;
+            CREATE TABLE users (
+                id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                email text NOT NULL UNIQUE,
+                password_hash text NOT NULL,
+                role text NOT NULL,
+                balance numeric NOT NULL DEFAULT 0,
+                concurrency integer NOT NULL DEFAULT 0,
+                status text NOT NULL,
+                username text NOT NULL UNIQUE,
+                notes text,
+                deleted_at timestamptz,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            );
+            CREATE TABLE groups (
+                id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                name text NOT NULL,
+                description text,
+                platform text,
+                subscription_type text,
+                rate_multiplier numeric,
+                status text NOT NULL,
+                allow_messages_dispatch boolean,
+                deleted_at timestamptz,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            );
+            CREATE UNIQUE INDEX groups_active_name_idx
+                ON groups (name) WHERE deleted_at IS NULL;
+            CREATE TABLE subscription_plans (
+                id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                group_id bigint NOT NULL REFERENCES groups(id),
+                name text NOT NULL,
+                description text,
+                price numeric,
+                original_price numeric,
+                validity_days integer,
+                validity_unit text,
+                features text,
+                product_name text,
+                for_sale boolean,
+                sort_order integer,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (group_id, name)
+            );
+            CREATE TABLE user_allowed_groups (
+                user_id bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                group_id bigint NOT NULL REFERENCES groups(id),
+                created_at timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (user_id, group_id)
+            );
+            CREATE TABLE user_subscriptions (
+                id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                user_id bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                group_id bigint NOT NULL REFERENCES groups(id),
+                starts_at timestamptz,
+                expires_at timestamptz,
+                status text,
+                assigned_at timestamptz,
+                notes text,
+                deleted_at timestamptz,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            );
+            CREATE UNIQUE INDEX user_subscriptions_active_idx
+                ON user_subscriptions (user_id, group_id)
+                WHERE deleted_at IS NULL;
+            CREATE TABLE api_keys (
+                id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                user_id bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                key text NOT NULL UNIQUE,
+                name text,
+                group_id bigint REFERENCES groups(id),
+                status text,
+                quota numeric NOT NULL DEFAULT 0,
+                quota_used numeric NOT NULL DEFAULT 0,
+                expires_at timestamptz,
+                deleted_at timestamptz,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            );
+            CREATE TABLE sub2api_sync_invite_owners (
+                user_id bigint PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                invite_fingerprint char(64) NOT NULL UNIQUE,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            );
+        """)
+
+    def _scalar(self, sql):
+        return SYNC.psql(sql).strip()
 
     def test_postgres_transaction_and_timeout_recovery_use_real_psql(self):
         direct = docker(
@@ -173,3 +342,145 @@ class SyncDependencyIntegrationTests(unittest.TestCase):
         with self.assertRaises((socket.timeout, TimeoutError)):
             SYNC.redis_command("PING", timeout=0.05)
         self.assertEqual(SYNC.redis_command("PING", timeout=1), "PONG")
+
+    def test_invite_identity_lifecycle_uses_real_postgres_and_login_http(self):
+        self._install_sync_schema()
+        invite_uuid = "7c484f74-6d93-43d1-9441-00c7d8d4ab11"
+        foreign_uuid = "8d595f85-7e04-44e2-a552-11d8e9c5bc22"
+        username = "temporary-flow"
+        email = "temporary-flow@example.test"
+        password = "temporary-password"
+        token = "sk-" + "a" * 48
+
+        SYNC.psql(
+            "INSERT INTO users "
+            "(email,password_hash,role,balance,concurrency,status,username,created_at,updated_at) "
+            f"VALUES ({SYNC.sql_quote(email)},crypt({SYNC.sql_quote(password)},gen_salt('bf')),'user',0,5,'active',"
+            f"{SYNC.sql_quote(username)},now(),now());"
+        )
+        legacy_user_id = int(self._scalar(
+            f"SELECT id FROM users WHERE username={SYNC.sql_quote(username)};"
+        ))
+        self.assertEqual(
+            self._scalar("SELECT count(*) FROM sub2api_sync_invite_owners;"),
+            "0",
+        )
+
+        expected = {
+            "user_id": legacy_user_id,
+            "response_user_id": legacy_user_id + 1,
+            "username": username,
+            "email": email,
+            "password": password,
+        }
+        os.environ["SUB2API_INTERNAL_LOGIN_URL"] = ""
+        with running_login_upstream(expected) as upstream:
+            os.environ["SUB2API_INTERNAL_LOGIN_URL"] = (
+                f"http://127.0.0.1:{upstream.server_port}/api/v1/auth/login"
+            )
+            login_payload = {
+                "uuid": invite_uuid,
+                "username": username,
+                "sub2apiUserId": legacy_user_id,
+                "email": email,
+                "loginPassword": password,
+            }
+            for rejected in (
+                {**login_payload, "username": "different-user"},
+                {**login_payload, "email": "different-user@example.test"},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "invite_identity_mismatch"):
+                    SYNC.login(rejected)
+            self.assertEqual(upstream.requests, 0)
+            self.assertEqual(
+                self._scalar("SELECT count(*) FROM sub2api_sync_invite_owners;"),
+                "0",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "sub2api_login_response_identity_mismatch"):
+                SYNC.login(login_payload)
+            self.assertEqual(upstream.requests, 1)
+            expected["response_user_id"] = legacy_user_id
+            self.assertEqual(SYNC.login(login_payload)["auth"]["user"]["id"], legacy_user_id)
+            self.assertEqual(SYNC.login(login_payload)["auth"]["user"]["id"], legacy_user_id)
+            self.assertEqual(upstream.requests, 3)
+            self.assertEqual(
+                self._scalar("SELECT count(*) FROM sub2api_sync_invite_owners;"),
+                "1",
+            )
+
+            for rejected in (
+                {**login_payload, "uuid": foreign_uuid},
+                {**login_payload, "sub2apiUserId": legacy_user_id + 1000},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "invite_identity_mismatch"):
+                    SYNC.login(rejected)
+            self.assertEqual(upstream.requests, 3)
+
+        SYNC.purge({
+            "uuid": invite_uuid,
+            "username": username,
+            "sub2apiUserId": legacy_user_id,
+        })
+        self.assertEqual(self._scalar("SELECT count(*) FROM users;"), "0")
+        self.assertEqual(
+            self._scalar("SELECT count(*) FROM sub2api_sync_invite_owners;"),
+            "0",
+        )
+
+        provision_payload = {
+            "uuid": invite_uuid,
+            "username": username,
+            "email": email,
+            "loginPassword": password,
+            "tokens": [{"tokenKey": token, "tokenName": "Temporary key"}],
+        }
+        provisioned = SYNC.provision(provision_payload)
+        reprovisioned = SYNC.provision({
+            **provision_payload,
+            "sub2apiUserId": provisioned["userId"],
+        })
+        self.assertEqual(reprovisioned["userId"], provisioned["userId"])
+        self.assertEqual(reprovisioned["apiKeyId"], provisioned["apiKeyId"])
+        status = SYNC.status({
+            "uuid": invite_uuid,
+            "username": username,
+            "sub2apiUserId": provisioned["userId"],
+        })
+        self.assertTrue(status["exists"])
+        self.assertEqual(status["userId"], provisioned["userId"])
+
+        expected["user_id"] = provisioned["userId"]
+        expected["response_user_id"] = provisioned["userId"]
+        with running_login_upstream(expected) as upstream:
+            os.environ["SUB2API_INTERNAL_LOGIN_URL"] = (
+                f"http://127.0.0.1:{upstream.server_port}/api/v1/auth/login"
+            )
+            login_payload = {
+                "uuid": invite_uuid,
+                "username": username,
+                "sub2apiUserId": provisioned["userId"],
+                "email": email,
+                "loginPassword": password,
+            }
+            self.assertEqual(SYNC.login(login_payload)["auth"]["user"]["id"], provisioned["userId"])
+            self.assertEqual(upstream.requests, 1)
+
+        SYNC.deprovision({
+            "uuid": invite_uuid,
+            "username": username,
+            "sub2apiUserId": provisioned["userId"],
+            "sub2apiApiKeyId": provisioned["apiKeyId"],
+        })
+        SYNC.purge({
+            "uuid": invite_uuid,
+            "username": username,
+            "sub2apiUserId": provisioned["userId"],
+            "sub2apiApiKeyId": provisioned["apiKeyId"],
+        })
+        recreated = SYNC.provision(provision_payload)
+        self.assertNotEqual(recreated["userId"], provisioned["userId"])
+        self.assertEqual(
+            self._scalar("SELECT count(*) FROM sub2api_sync_invite_owners;"),
+            "1",
+        )
