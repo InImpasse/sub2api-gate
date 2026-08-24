@@ -17,12 +17,27 @@ if ! (
   node --test --experimental-test-coverage \
     --experimental-test-isolation=none >"$worker_report" 2>&1
 ); then
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    worker_summary="$({
+      awk '
+        $2 ~ /^(tests|pass|fail|cancelled|skipped|todo)$/ && $3 ~ /^[0-9]+$/ {
+          printf "%s%s=%s", separator, $2, $3
+          separator=","
+        }
+      ' "$worker_report"
+    } || true)"
+    if [[ -z "$worker_summary" ]]; then
+      worker_summary="bounded test summary unavailable"
+    fi
+    printf '::error title=Worker test gate failed::%s\n' "$worker_summary" >&2
+  fi
   tail -n 80 "$worker_report" >&2 || true
   exit 1
 fi
 
 python3 - "$worker_report" "$baseline_path" <<'PY'
 import json
+import os
 import pathlib
 import re
 import sys
@@ -67,7 +82,15 @@ for suffix, threshold in worker.items():
             f"branch={branch:.2f}%/{branch_minimum:.2f}%"
         )
 if failures:
-    raise SystemExit("Worker coverage regression: " + "; ".join(failures))
+    message = "Worker coverage regression: " + "; ".join(failures)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        annotation = (
+            message.replace("%", "%25")
+            .replace("\r", "%0D")
+            .replace("\n", "%0A")
+        )
+        print(f"::error title=Worker coverage gate failed::{annotation}")
+    raise SystemExit(message)
 PY
 
 cd "$repo_dir"
