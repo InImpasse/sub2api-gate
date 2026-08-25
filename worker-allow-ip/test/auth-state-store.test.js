@@ -72,8 +72,10 @@ test("AuthState byte limits count UTF-8 bytes instead of JavaScript code units",
   );
 });
 
-test("AuthState admin sessions allow only the pending TOTP login phase", () => {
-  const expiresAt = Date.now() + 60_000;
+test("AuthState admin sessions allow only bounded authentication state", () => {
+  const now = Date.now();
+  const expiresAt = now + 60_000;
+  const totpVerifiedAt = now - 1_000;
   const totpBinding = "a".repeat(64);
   assert.deepEqual(
     authStateTest.normalizeAdminSession({
@@ -82,7 +84,7 @@ test("AuthState admin sessions allow only the pending TOTP login phase", () => {
       totpBinding,
       loginPhase: "totp",
       extra: "drop-me",
-    }, Date.now()),
+    }, now),
     { csrf: "pending-csrf", expiresAt, totpBinding, loginPhase: "totp" },
   );
   assert.deepEqual(
@@ -90,8 +92,10 @@ test("AuthState admin sessions allow only the pending TOTP login phase", () => {
       csrf: "full-csrf",
       expiresAt,
       totpBinding,
-    }, Date.now()),
-    { csrf: "full-csrf", expiresAt, totpBinding },
+      totpVerifiedAt,
+      extra: "drop-me",
+    }, now),
+    { csrf: "full-csrf", expiresAt, totpBinding, totpVerifiedAt },
   );
   assert.throws(
     () => authStateTest.normalizeAdminSession({
@@ -99,7 +103,7 @@ test("AuthState admin sessions allow only the pending TOTP login phase", () => {
       expiresAt,
       totpBinding,
       loginPhase: "authenticated",
-    }, Date.now()),
+    }, now),
     /auth_state_admin_session_invalid/,
   );
   assert.throws(
@@ -107,7 +111,28 @@ test("AuthState admin sessions allow only the pending TOTP login phase", () => {
       csrf: "missing-binding",
       expiresAt,
       loginPhase: "totp",
-    }, Date.now()),
+    }, now),
+    /auth_state_admin_session_invalid/,
+  );
+  for (const invalidVerifiedAt of [0, now + 1, expiresAt]) {
+    assert.throws(
+      () => authStateTest.normalizeAdminSession({
+        csrf: "invalid-verification-time",
+        expiresAt,
+        totpBinding,
+        totpVerifiedAt: invalidVerifiedAt,
+      }, now),
+      /auth_state_admin_session_invalid/,
+    );
+  }
+  assert.throws(
+    () => authStateTest.normalizeAdminSession({
+      csrf: "pending-with-verification-time",
+      expiresAt,
+      totpBinding,
+      loginPhase: "totp",
+      totpVerifiedAt,
+    }, now),
     /auth_state_admin_session_invalid/,
   );
 });
@@ -326,6 +351,12 @@ test("admin CAS conflicts return a safe HTTP 409 response", async () => {
     },
     async getAdminSession() {
       return { csrf, expiresAt: Date.now() + 60_000, totpBinding };
+    },
+    async putAdminSession(hash, payload) {
+      assert.equal(hash, await sha256Hex(sessionToken));
+      assert.equal(payload.csrf, csrf);
+      assert.ok(Number.isSafeInteger(payload.totpVerifiedAt));
+      return { ok: true, expiresAt: payload.expiresAt };
     },
     async getInvites() {
       return {

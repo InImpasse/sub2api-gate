@@ -800,6 +800,7 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
     await expect(page.locator('form.create select[name="key_group"]')).toBeVisible();
     await expect(page.locator('form.create select[name="key_group"] option[value="default"]')).toHaveCount(0);
     await expect(page.locator('form.create select[name="key_group"] option[value="openai-default"]')).toHaveCount(1);
+    await expect(page.locator('form.create input[name="step_up_token"]')).toHaveCount(0);
     await expect(page.locator(".invite-list, .selected-invite-detail, .trash-list")).toHaveCount(0);
   }
   if (scenario === "admin-maintenance") {
@@ -811,6 +812,9 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
   if (scenario === "admin-detail") {
     await expect(page.locator(".selected-invite-detail")).toBeVisible();
     await expect(page.getByRole("button", { name: "Test API key" }).first()).toBeVisible();
+    await expect(page.locator('form:has(input[name="action"][value="delete"]) input[name="step_up_token"]')).toHaveCount(0);
+    await expect(page.locator('form:has(input[name="action"][value="add_ip_group"]) input[name="step_up_token"]')).toHaveCount(0);
+    await expect(page.locator('form:has(input[name="action"][value="rotate_access_key"]) input[name="step_up_token"]')).toBeVisible();
     await expect(page.locator(".invite-list, .create-panel, .trash-list")).toHaveCount(0);
     if (viewport.width === 240) {
       const detailPosition = await page.evaluate(() => {
@@ -1394,6 +1398,8 @@ test("admin copy actions report clipboard rejection without unhandled errors", a
   );
   expect(editResponse?.status(), await page.locator("body").innerText()).toBe(200);
   await expect(page.locator('input[name="admin_context"][value$="v=e"]')).not.toHaveCount(0);
+  await expect(page.locator('form:has(input[name="action"][value="update_invite"]) input[name="step_up_token"]')).toHaveCount(0);
+  await expect(page.locator('form:has(input[name="action"][value="reset_sub2api_password"]) input[name="step_up_token"]')).toBeVisible();
   const copyRow = page.locator(".copy-row").first();
   await copyRow.click();
   await expect(copyRow).toHaveText("Copy failed");

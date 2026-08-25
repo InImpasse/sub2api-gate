@@ -1019,46 +1019,58 @@ test("orphan cleanup deletes only stale managed comments without active referenc
   assert.deepEqual(deletedIds, ["stale-managed"]);
 });
 
-test("every access-changing admin action requires TOTP step-up", () => {
-  for (const action of [
+test("admin actions use recent 2FA only for routine reversible changes", () => {
+  const routineActions = [
     "create",
+    "update_invite",
+    "delete",
+    "delete_ip_group",
+    "update_ip_group_expiration",
+    "add_ip_group",
+  ];
+  const alwaysStepUpActions = [
     "migrate_invite_credentials",
     "finalize_legacy_auth_state_cleanup",
     "rotate_access_key",
     "restore_uuid",
     "reset_sub2api_password",
-    "update_invite",
-    "delete",
     "purge_uuid",
-    "delete_ip_group",
     "restore_ip_group",
     "purge_ip_group",
-    "update_ip_group_expiration",
-    "add_ip_group",
-  ]) {
+  ];
+  const now = Date.now();
+  const recentSession = { totpVerifiedAt: now };
+  const expiredSession = { totpVerifiedAt: now - adminTest.RECENT_TOTP_WINDOW_MS - 1 };
+
+  for (const action of [...routineActions, ...alwaysStepUpActions]) {
     assert.equal(adminTest.requiresStepUpAction(action), true, action);
+  }
+  for (const action of routineActions) {
+    assert.equal(adminTest.alwaysRequiresStepUpAction(action), false, action);
+    assert.equal(adminTest.requiresStepUpForSession(action, recentSession, now), false, action);
+    assert.equal(adminTest.requiresStepUpForSession(action, expiredSession, now), true, action);
+    assert.equal(adminTest.requiresStepUpForSession(action, {}, now), true, action);
+  }
+  for (const action of alwaysStepUpActions) {
+    assert.equal(adminTest.alwaysRequiresStepUpAction(action), true, action);
+    assert.equal(adminTest.requiresStepUpForSession(action, recentSession, now), true, action);
   }
   for (const action of ["login", "login_totp", "logout", "refresh_sub2api_status", "test_api_key"]) {
     assert.equal(adminTest.requiresStepUpAction(action), false, action);
+    assert.equal(adminTest.requiresStepUpForSession(action, {}, now), false, action);
   }
 });
 
-test("admin UI renders a TOTP field for every access-changing action", () => {
+test("admin UI retains a TOTP field for every always-sensitive action", () => {
   for (const action of [
-    "create",
     "migrate_invite_credentials",
     "finalize_legacy_auth_state_cleanup",
     "rotate_access_key",
     "restore_uuid",
     "reset_sub2api_password",
-    "update_invite",
-    "delete",
     "purge_uuid",
-    "delete_ip_group",
     "restore_ip_group",
     "purge_ip_group",
-    "update_ip_group_expiration",
-    "add_ip_group",
   ]) {
     const marker = `name="action" value="${action}"`;
     const actionOffset = ADMIN_SOURCE.indexOf(marker);
@@ -1115,6 +1127,12 @@ test("legacy AuthState cleanup requires TOTP and every seven-day deadline to exp
     async getAdminSession(hash) {
       assert.equal(hash, sessionHash);
       return session;
+    },
+    async putAdminSession(hash, payload) {
+      assert.equal(hash, sessionHash);
+      assert.equal(payload.csrf, csrf);
+      assert.ok(Number.isSafeInteger(payload.totpVerifiedAt));
+      return { ok: true, expiresAt: payload.expiresAt };
     },
     async getInvites() {
       return {
@@ -2087,6 +2105,9 @@ test("admin password success waits for 2FA before issuing a dashboard session", 
   assert.match(totpOk.headers.get("set-cookie") || "", /Max-Age=604800/);
   assert.equal(fullSessions.length, 1);
   assert.equal(JSON.parse(fullSessions[0][1]).loginPhase, undefined);
+  const authenticatedSession = JSON.parse(fullSessions[0][1]);
+  assert.ok(Number.isSafeInteger(authenticatedSession.totpVerifiedAt));
+  assert.ok(Date.now() - authenticatedSession.totpVerifiedAt < 5_000);
 
   const dashboard = await worker.fetch(new Request("https://api.example.test/allow-ip/admin", {
     headers: { cookie: `sub2api_allow_admin=${fullCookie}` },
@@ -2216,13 +2237,89 @@ test("admin login rate limiting uses one Durable Object HMAC bucket per IP", asy
   assert.doesNotMatch(seenKeys[0], /private-admin|198\.51\.100\.44/);
 });
 
+test("recent login 2FA skips routine step-up and its rate-limit bucket", async () => {
+  const sessionToken = "recent-totp-routine-session-token";
+  const sessionHash = await sha256Hex(sessionToken);
+  const csrf = "recent-totp-routine-csrf";
+  const values = new Map([
+    [`session:${sessionHash}`, JSON.stringify({
+      ...await boundAdminSession(csrf, Date.now() + 60_000),
+      totpVerifiedAt: Date.now(),
+    })],
+  ]);
+  const seenKeys = [];
+  const env = {
+    ...validAdminEnv(memoryKv(values)),
+    AUTH_RATE_LIMITER: observingRateLimiter(false, seenKeys),
+  };
+
+  const response = await worker.fetch(new Request("https://api.example.test/allow-ip/admin", {
+    method: "POST",
+    headers: {
+      cookie: `sub2api_allow_admin=${sessionToken}`,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      action: "create",
+      csrf,
+      uuid: "invalid-uuid",
+      username: "routine-user",
+      key_group: "openai-default",
+    }),
+  }), env);
+
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Invalid UUID/);
+  assert.equal(seenKeys.length, 0);
+});
+
+test("successful routine step-up refreshes the current session verification time", async () => {
+  const sessionToken = "refresh-totp-session-token";
+  const sessionHash = await sha256Hex(sessionToken);
+  const csrf = "refresh-totp-session-csrf";
+  const values = new Map([
+    [`session:${sessionHash}`, JSON.stringify(
+      await boundAdminSession(csrf, Date.now() + 60_000),
+    )],
+  ]);
+  const env = validAdminEnv(memoryKv(values));
+  const startedAt = Date.now();
+
+  const response = await worker.fetch(new Request("https://api.example.test/allow-ip/admin", {
+    method: "POST",
+    headers: {
+      cookie: `sub2api_allow_admin=${sessionToken}`,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      action: "create",
+      csrf,
+      uuid: "invalid-uuid",
+      username: "step-up-user",
+      key_group: "openai-default",
+      step_up_token: await adminTest.totp(
+        env.ADMIN_TOTP_SECRET,
+        Math.floor(Date.now() / 1000 / 30),
+      ),
+    }),
+  }), env);
+
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Invalid UUID/);
+  const refreshed = JSON.parse(values.get(`session:${sessionHash}`));
+  assert.ok(refreshed.totpVerifiedAt >= startedAt);
+  assert.ok(refreshed.totpVerifiedAt <= Date.now());
+  assert.equal(refreshed.csrf, csrf);
+});
+
 test("TOTP step-up is rate-limited by an HMAC of the authenticated session", async () => {
   const sessionToken = "totp-rate-limit-session-token";
   const sessionHash = await sha256Hex(sessionToken);
   const values = new Map([
-    [`session:${sessionHash}`, JSON.stringify(
-      await boundAdminSession("totp-rate-limit-csrf", Date.now() + 60_000),
-    )],
+    [`session:${sessionHash}`, JSON.stringify({
+      ...await boundAdminSession("totp-rate-limit-csrf", Date.now() + 60_000),
+      totpVerifiedAt: Date.now(),
+    })],
   ]);
   let kvWrites = 0;
   const store = memoryKv(values);

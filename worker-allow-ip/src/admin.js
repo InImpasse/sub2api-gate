@@ -39,6 +39,7 @@ const DELETE_ADMIN_COOKIE = `${COOKIE_NAME}=; Path=${ADMIN_PATH}; Max-Age=0; Htt
 const REQUEST_AUTH_STATE_STORE = Symbol("requestAuthStateStore");
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
 const PENDING_LOGIN_TTL_SECONDS = 5 * 60;
+const RECENT_TOTP_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_PHASE_TOTP = "totp";
 const ADMIN_SESSION_TOTP_BINDING_DOMAIN =
   "sub2api-gate/admin-session-totp-binding/v4\0";
@@ -105,6 +106,16 @@ const STEP_UP_ACTIONS = new Set([
   "purge_ip_group",
   "update_ip_group_expiration",
   "add_ip_group",
+]);
+const ALWAYS_STEP_UP_ACTIONS = new Set([
+  "migrate_invite_credentials",
+  "finalize_legacy_auth_state_cleanup",
+  "rotate_access_key",
+  "restore_uuid",
+  "reset_sub2api_password",
+  "purge_uuid",
+  "restore_ip_group",
+  "purge_ip_group",
 ]);
 const SUB2API_FAVICON = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA0MSA0MSI+PHBhdGggZD0iTTM3LjUzMjQgMTYuODcwN0MzNy45ODA4IDE1LjUyNDEgMzguMTM2MyAxNC4wOTc0IDM3Ljk4ODYgMTIuNjg1OUMzNy44NDA5IDExLjI3NDQgMzcuMzkzNCA5LjkxMDc2IDM2LjY3NiA4LjY4NjIyQzM1LjYxMjYgNi44MzQwNCAzMy45ODgyIDUuMzY3NiAzMi4wMzczIDQuNDk4NUMzMC4wODY0IDMuNjI5NDEgMjcuOTA5OCAzLjQwMjU5IDI1LjgyMTUgMy44NTA3OEMyNC44Nzk2IDIuNzg5MyAyMy43MjE5IDEuOTQxMjUgMjIuNDI1NyAxLjM2MzQxQzIxLjEyOTUgMC43ODU1NzUgMTkuNzI0OSAwLjQ5MTI2OSAxOC4zMDU4IDAuNTAwMTk3QzE2LjE3MDggMC40OTUwNDQgMTQuMDg5MyAxLjE2ODAzIDEyLjM2MTQgMi40MjIxNEMxMC42MzM1IDMuNjc2MjQgOS4zNDg1MyA1LjQ0NjY2IDguNjkxNyA3LjQ3ODE1QzcuMzAwODUgNy43NjI4NiA1Ljk4Njg2IDguMzQxNCA0LjgzNzcgOS4xNzUwNUMzLjY4ODU0IDEwLjAwODcgMi43MzA3MyAxMS4wNzgyIDIuMDI4MzkgMTIuMzEyQzAuOTU2NDY0IDE0LjE1OTEgMC40OTg5MDUgMTYuMjk4OCAwLjcyMTY5OCAxOC40MjI4QzAuOTQ0NDkyIDIwLjU0NjcgMS44MzYxMiAyMi41NDQ5IDMuMjY4IDI0LjEyOTNDMi44MTk2NiAyNS40NzU5IDIuNjY0MTMgMjYuOTAyNiAyLjgxMTgyIDI4LjMxNDFDMi45NTk1MSAyOS43MjU2IDMuNDA3MDEgMzEuMDg5MiA0LjEyNDM3IDMyLjMxMzhDNS4xODc5MSAzNC4xNjU5IDYuODEyMyAzNS42MzIyIDguNzYzMjEgMzYuNTAxM0MxMC43MTQxIDM3LjM3MDQgMTIuODkwNyAzNy41OTczIDE0Ljk3ODkgMzcuMTQ5MkMxNS45MjA4IDM4LjIxMDcgMTcuMDc4NiAzOS4wNTg3IDE4LjM3NDcgMzkuNjM2NkMxOS42NzA5IDQwLjIxNDQgMjEuMDc1NSA0MC41MDg3IDIyLjQ5NDYgNDAuNDk5OEMyNC42MzA3IDQwLjUwNTQgMjYuNzEzMyAzOS44MzIxIDI4LjQ0MTggMzguNTc3MkMzMC4xNzA0IDM3LjMyMjMgMzEuNDU1NiAzNS41NTA2IDMyLjExMTkgMzMuNTE3OUMzMy41MDI3IDMzLjIzMzIgMzQuODE2NyAzMi42NTQ3IDM1Ljk2NTkgMzEuODIxQzM3LjExNSAzMC45ODc0IDM4LjA3MjggMjkuOTE3OCAzOC43NzUyIDI4LjY4NEMzOS44NDU4IDI2LjgzNzEgNDAuMzAyMyAyNC42OTc5IDQwLjA3ODkgMjIuNTc0OEMzOS44NTU2IDIwLjQ1MTcgMzguOTYzOSAxOC40NTQ0IDM3LjUzMjQgMTYuODcwN1pNMjIuNDk3OCAzNy44ODQ5QzIwLjc0NDMgMzcuODg3NCAxOS4wNDU5IDM3LjI3MzMgMTcuNjk5NCAzNi4xNTAxQzE3Ljc2MDEgMzYuMTE3IDE3Ljg2NjYgMzYuMDU4NiAxNy45MzYgMzYuMDE2MUwyNS45MDA0IDMxLjQxNTZDMjYuMTAwMyAzMS4zMDE5IDI2LjI2NjMgMzEuMTM3IDI2LjM4MTMgMzAuOTM3OEMyNi40OTY0IDMwLjczODYgMjYuNTU2MyAzMC41MTI0IDI2LjU1NDkgMzAuMjgyNVYxOS4wNTQyTDI5LjkyMTMgMjAuOTk4QzI5LjkzODkgMjEuMDA2OCAyOS45NTQxIDIxLjAxOTggMjkuOTY1NiAyMS4wMzU5QzI5Ljk3NyAyMS4wNTIgMjkuOTg0MiAyMS4wNzA3IDI5Ljk4NjcgMjEuMDkwMlYzMC4zODg5QzI5Ljk4NDIgMzIuMzc1IDI5LjE5NDYgMzQuMjc5MSAyNy43OTA5IDM1LjY4NDFDMjYuMzg3MiAzNy4wODkyIDI0LjQ4MzggMzcuODgwNiAyMi40OTc4IDM3Ljg4NDlaTTYuMzkyMjcgMzEuMDA2NEM1LjUxMzk3IDI5LjQ4ODggNS4xOTc0MiAyNy43MTA3IDUuNDk4MDQgMjUuOTgzMkM1LjU1NzE4IDI2LjAxODcgNS42NjA0OCAyNi4wODE4IDUuNzM0NjEgMjYuMTI0NEwxMy42OTkgMzAuNzI0OEMxMy44OTc1IDMwLjg0MDggMTQuMTIzMyAzMC45MDIgMTQuMzUzMiAzMC45MDJDMTQuNTgzIDMwLjkwMiAxNC44MDg4IDMwLjg0MDggMTUuMDA3MyAzMC43MjQ4TDI0LjczMSAyNS4xMTAzVjI4Ljk5NzlDMjQuNzMyMSAyOS4wMTc3IDI0LjcyODMgMjkuMDM3NiAyNC43MTk5IDI5LjA1NTZDMjQuNzExNSAyOS4wNzM2IDI0LjY5ODggMjkuMDg5MyAyNC42ODI5IDI5LjEwMTJMMTYuNjMxNyAzMy43NDk3QzE0LjkwOTYgMzQuNzQxNiAxMi44NjQzIDM1LjAwOTcgMTAuOTQ0NyAzNC40OTU0QzkuMDI1MDYgMzMuOTgxMSA3LjM4Nzg1IDMyLjcyNjMgNi4zOTIyNyAzMS4wMDY0Wk00LjI5NzA3IDEzLjYxOTRDNS4xNzE1NiAxMi4wOTk4IDYuNTUyNzkgMTAuOTM2NCA4LjE5ODg1IDEwLjMzMjdDOC4xOTg4NSAxMC40MDEzIDguMTk0OTEgMTAuNTIyOCA4LjE5NDkxIDEwLjYwNzFWMTkuODA4QzguMTkzNTEgMjAuMDM3OCA4LjI1MzM0IDIwLjI2MzggOC4zNjgyMyAyMC40NjI5QzguNDgzMTIgMjAuNjYxOSA4LjY0ODkzIDIwLjgyNjcgOC44NDg2MyAyMC45NDA0TDE4LjU3MjMgMjYuNTU0MkwxNS4yMDYgMjguNDk3OUMxNS4xODk0IDI4LjUwODkgMTUuMTcwMyAyOC41MTU1IDE1LjE1MDUgMjguNTE3M0MxNS4xMzA3IDI4LjUxOTEgMTUuMTEwNyAyOC41MTYgMTUuMDkyNCAyOC41MDgyTDcuMDQwNDYgMjMuODU1N0M1LjMyMTM1IDIyLjg2MDEgNC4wNjcxNiAyMS4yMjM1IDMuNTUyODkgMTkuMzA0NkMzLjAzODYyIDE3LjM4NTggMy4zMDYyNCAxNS4zNDEzIDQuMjk3MDcgMTMuNjE5NFpNMzEuOTU1IDIwLjA1NTZMMjIuMjMxMiAxNC40NDExTDI1LjU5NzYgMTIuNDk4MUMyNS42MTQyIDEyLjQ4NzIgMjUuNjMzMyAxMi40ODA1IDI1LjY1MzEgMTIuNDc4N0MyNS42NzI5IDEyLjQ3NjkgMjUuNjkyOCAxMi40ODAxIDI1LjcxMTEgMTIuNDg3OUwzMy43NjMxIDE3LjEzNjRDMzQuOTk2NyAxNy44NDkgMzYuMDAxNyAxOC44OTgyIDM2LjY2MDYgMjAuMTYxM0MzNy4zMTk0IDIxLjQyNDQgMzcuNjA0NyAyMi44NDkgMzcuNDgzMiAyNC4yNjg0QzM3LjM2MTcgMjUuNjg3OCAzNi44MzgyIDI3LjA0MzIgMzUuOTc0MyAyOC4xNzU5QzM1LjExMDMgMjkuMzA4NiAzMy45NDE1IDMwLjE3MTcgMzIuNjA0NyAzMC42NjQxQzMyLjYwNDcgMzAuNTk0NyAzMi42MDQ3IDMwLjQ3MzMgMzIuNjA0NyAzMC4zODg5VjIxLjE4OEMzMi42MDY2IDIwLjk1ODYgMzIuNTQ3NCAyMC43MzI4IDMyLjQzMzIgMjAuNTMzOEMzMi4zMTkgMjAuMzM0OCAzMi4xNTQgMjAuMTY5OCAzMS45NTUgMjAuMDU1NlpNMzUuMzA1NSAxNS4wMTI4QzM1LjI0NjQgMTQuOTc2NSAzNS4xNDMxIDE0LjkxNDIgMzUuMDY5IDE0Ljg3MTdMMjcuMTA0NSAxMC4yNzEyQzI2LjkwNiAxMC4xNTU0IDI2LjY4MDMgMTAuMDk0MyAyNi40NTA0IDEwLjA5NDNDMjYuMjIwNiAxMC4wOTQzIDI1Ljk5NDggMTAuMTU1NCAyNS43OTYzIDEwLjI3MTJMMTYuMDcyNiAxNS44ODU4VjExLjk5ODJDMTYuMDcxNSAxMS45NzgzIDE2LjA3NTMgMTEuOTU4NSAxNi4wODM3IDExLjk0MDVDMTYuMDkyMSAxMS45MjI1IDE2LjEwNDggMTEuOTA2OCAxNi4xMjA3IDExLjg5NDlMMjQuMTcxOSA3LjI1MDI1QzI1LjQwNTMgNi41MzkwMyAyNi44MTU4IDYuMTkzNzYgMjguMjM4MyA2LjI1NDgyQzI5LjY2MDggNi4zMTU4OSAzMS4wMzY0IDYuNzgwNzcgMzIuMjA0NCA3LjU5NTA4QzMzLjM3MjMgOC40MDkzOSAzNC4yODQyIDkuNTM5NDUgMzQuODMzNCAxMC44NTMxQzM1LjM4MjYgMTIuMTY2NyAzNS41NDY0IDEzLjYwOTUgMzUuMzA1NSAxNS4wMTI4Wk0xNC4yNDI0IDIxLjk0MTlMMTAuODc1MiAxOS45OTgxQzEwLjg1NzYgMTkuOTg5MyAxMC44NDIzIDE5Ljk3NjMgMTAuODMwOSAxOS45NjAyQzEwLjgxOTUgMTkuOTQ0MSAxMC44MTIyIDE5LjkyNTQgMTAuODA5OCAxOS45MDU4VjEwLjYwNzFDMTAuODEwNyA5LjE4Mjk1IDExLjIxNzMgNy43ODg0OCAxMS45ODE5IDYuNTg2OTZDMTIuNzQ2NiA1LjM4NTQ0IDEzLjgzNzcgNC40MjY1OSAxNS4xMjc1IDMuODIyNjRDMTYuNDE3MyAzLjIxODY5IDE3Ljg1MjQgMi45OTQ2NCAxOS4yNjQ5IDMuMTc2N0MyMC42Nzc1IDMuMzU4NzYgMjIuMDA4OSAzLjkzOTQxIDIzLjEwMzQgNC44NTA2N0MyMy4wNDI3IDQuODgzNzkgMjIuOTM3IDQuOTQyMTUgMjIuODY2OCA0Ljk4NDczTDE0LjkwMjQgOS41ODUxN0MxNC43MDI1IDkuNjk4NzggMTQuNTM2NiA5Ljg2MzU2IDE0LjQyMTUgMTAuMDYyNkMxNC4zMDY1IDEwLjI2MTYgMTQuMjQ2NiAxMC40ODc3IDE0LjI0NzkgMTAuNzE3NUwxNC4yNDI0IDIxLjk0MTlaTTE2LjA3MSAxNy45OTkxTDIwLjQwMTggMTUuNDk3OEwyNC43MzI1IDE3Ljk5NzVWMjIuOTk4NUwyMC40MDE4IDI1LjQ5ODNMMTYuMDcxIDIyLjk5ODVWMTcuOTk5MVoiIGZpbGw9IiMxMTEiLz48L3N2Zz4=";
 
@@ -200,7 +211,7 @@ async function handleAdminRequest(request, env) {
       session.csrf,
       request,
       env,
-      dashboard,
+      { ...dashboard, recentTotpVerified: hasRecentAdminTotp(session) },
     ), 200, dashboard.view === "list"
       ? ADMIN_LIST_HTML_MAX_BYTES
       : dashboard.view === "edit"
@@ -251,13 +262,14 @@ async function handleAdminRequest(request, env) {
     return redirect(ADMIN_PATH);
   }
 
-  if (requiresStepUpAction(action)) {
+  if (requiresStepUpForSession(action, session)) {
     const attemptKey = await stepUpAttemptKey(env, session.sessionHash);
     if (!(await consumeAuthAttempt(env, "totp", attemptKey))) {
       return html(renderMessage("Too many 2FA attempts", "Try again later."), 429);
     }
     await requireStepUpTotp(form, env);
     await resetAuthAttempts(env, "totp", attemptKey);
+    await markAdminTotpVerified(env, session);
   }
 
   if (action === "create") {
@@ -808,12 +820,14 @@ async function handleAdminTotpLogin(form, env, session) {
   await deleteAdminSession(env, session.sessionHash);
 
   const csrf = randomHex(24);
-  const expiresAt = Date.now() + SESSION_TTL_SECONDS * 1000;
+  const totpVerifiedAt = Date.now();
+  const expiresAt = totpVerifiedAt + SESSION_TTL_SECONDS * 1000;
   const totpBinding = await adminSessionTotpBindingForEnvironment(env);
   const { cookie } = await persistAdminSession(env, {
     csrf,
     expiresAt,
     totpBinding,
+    totpVerifiedAt,
   }, SESSION_TTL_SECONDS);
 
   return redirect(ADMIN_PATH, cookie);
@@ -868,8 +882,9 @@ function isPendingTotpLogin(session) {
 function parseKvAdminSession(parsed) {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
   if (typeof parsed.csrf !== "string" || !parsed.csrf) return null;
+  const now = Date.now();
   const expiresAt = Number(parsed.expiresAt);
-  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return null;
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= now) return null;
   const session = { csrf: parsed.csrf, expiresAt };
   if (Object.hasOwn(parsed, "totpBinding")) {
     if (!ADMIN_SESSION_TOTP_BINDING.test(String(parsed.totpBinding))) return null;
@@ -878,6 +893,19 @@ function parseKvAdminSession(parsed) {
   if (Object.hasOwn(parsed, "loginPhase")) {
     if (parsed.loginPhase !== LOGIN_PHASE_TOTP || !session.totpBinding) return null;
     session.loginPhase = LOGIN_PHASE_TOTP;
+  }
+  if (Object.hasOwn(parsed, "totpVerifiedAt")) {
+    const totpVerifiedAt = Number(parsed.totpVerifiedAt);
+    if (
+      !Number.isSafeInteger(totpVerifiedAt)
+      || totpVerifiedAt <= 0
+      || totpVerifiedAt > now
+      || totpVerifiedAt >= expiresAt
+      || session.loginPhase
+    ) {
+      return null;
+    }
+    session.totpVerifiedAt = totpVerifiedAt;
   }
   return session;
 }
@@ -906,6 +934,35 @@ async function persistAdminSession(env, payload, ttlSeconds) {
     );
   }
   return { sessionToken, sessionHash, cookie: adminSessionCookie(sessionToken, ttlSeconds) };
+}
+
+async function markAdminTotpVerified(env, session, now = Date.now()) {
+  if (
+    !session
+    || isPendingTotpLogin(session)
+    || !Number.isSafeInteger(now)
+    || !Number.isSafeInteger(session.expiresAt)
+    || session.expiresAt <= now
+  ) {
+    throw new Error("Invalid admin session");
+  }
+  const payload = {
+    csrf: session.csrf,
+    expiresAt: session.expiresAt,
+    totpBinding: session.totpBinding,
+    totpVerifiedAt: now,
+  };
+  if (isAuthStateBindingConfigured(env)) {
+    await authStateStore(env).createAdminSession(session.sessionHash, payload);
+  } else {
+    const remainingTtlSeconds = Math.max(60, Math.ceil((session.expiresAt - now) / 1000));
+    await env.INVITE_STORE.put(
+      sessionKey(session.sessionHash),
+      JSON.stringify(payload),
+      { expirationTtl: remainingTtlSeconds },
+    );
+  }
+  session.totpVerifiedAt = now;
 }
 
 async function getAdminDashboard(env, adminUrl) {
@@ -2783,6 +2840,7 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
   const selectedInvite = dashboard.selectedInvite || null;
   const view = String(dashboard.view || (selectedInvite ? "detail" : "list"));
   const keyGroups = Array.isArray(dashboard.keyGroups) ? dashboard.keyGroups : [];
+  const recentTotpVerified = dashboard.recentTotpVerified === true;
   const authStateStatus = dashboard.authStateStatus || null;
   const legacyCleanupComplete = authStateStatus?.legacyCleanupComplete === true;
   const legacyCleanupVerificationPending =
@@ -2898,10 +2956,10 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
           ${renderApiConfigEditor("api-configs", [], defaultBaseUrl)}
           <div class="form-footer">
             <span class="hint">Each link is stored separately, then saved in the existing format.</span>
-            <label class="field">
+            ${recentTotpVerified ? "" : `<label class="field">
               <span>2FA code</span>
               <input name="step_up_token" aria-label="2FA code to create UUID" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" required />
-            </label>
+            </label>`}
             <button type="submit">Save UUID</button>
           </div>
         </form>
@@ -2924,6 +2982,7 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
             env,
             { page: currentPage, trashPage: currentTrashPage },
             keyGroups,
+            recentTotpVerified,
           )}
         </section>
       ` : ""}
@@ -3434,7 +3493,15 @@ function renderIpGroupTrashRow(item, csrf, trashPage) {
   `;
 }
 
-function renderInviteRow(invite, csrf, request, env, pagination = {}, keyGroups = []) {
+function renderInviteRow(
+  invite,
+  csrf,
+  request,
+  env,
+  pagination = {},
+  keyGroups = [],
+  recentTotpVerified = false,
+) {
   const groups = invite.records || [];
   const recordCount = Number.isSafeInteger(invite.recordCount) ? invite.recordCount : groups.length;
   const ipPage = Number.isSafeInteger(invite.ipPage) ? invite.ipPage : 1;
@@ -3492,13 +3559,13 @@ function renderInviteRow(invite, csrf, request, env, pagination = {}, keyGroups 
             <input type="hidden" name="action" value="delete" />
             <input type="hidden" name="uuid" value="${escapeHtml(invite.uuid)}" />
             ${renderInvitePostContextFields(pagination, ipPage, isEditing)}
-            <input name="step_up_token" aria-label="2FA code to delete UUID" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />
+            ${recentTotpVerified ? "" : `<input name="step_up_token" aria-label="2FA code to delete UUID" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />`}
             <button class="danger compact" type="submit">Delete UUID</button>
           </form>
         </div>
       </div>
       <div class="invite-main">
-        ${isEditing ? renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env, pagination, ipPage, keyGroups) : renderInviteSummary(invite, apiConfigs, ADMIN_PATH, pagination, csrf)}
+        ${isEditing ? renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env, pagination, ipPage, keyGroups, recentTotpVerified) : renderInviteSummary(invite, apiConfigs, ADMIN_PATH, pagination, csrf)}
         <section class="ip-panel">
           <div class="subhead">
             <h3>IP groups</h3>
@@ -3506,7 +3573,7 @@ function renderInviteRow(invite, csrf, request, env, pagination = {}, keyGroups 
           </div>
           ${recordsOversized
             ? `<span class="error">IP group data is too large to display safely.</span>`
-            : `${renderManualIpGroupForm(invite.uuid, csrf, pagination, ipPage, isEditing)}${groups.length ? groups.map((group, index) => renderIpGroup(group, invite.uuid, csrf, index === 0, pagination, ipPage, isEditing)).join("") : `<span class="muted">No IP groups yet</span>`}${renderIpGroupPagination(invite.uuid, ipPage, recordCount, pagination, isEditing)}`}
+            : `${renderManualIpGroupForm(invite.uuid, csrf, pagination, ipPage, isEditing, recentTotpVerified)}${groups.length ? groups.map((group, index) => renderIpGroup(group, invite.uuid, csrf, index === 0, pagination, ipPage, isEditing, recentTotpVerified)).join("") : `<span class="muted">No IP groups yet</span>`}${renderIpGroupPagination(invite.uuid, ipPage, recordCount, pagination, isEditing)}`}
         </section>
       </div>
     </article>
@@ -3546,7 +3613,7 @@ function renderInvitePostContextFields(pagination, ipPage, isEditing) {
   return `<input type="hidden" name="admin_context" value="${escapeHtml(context.toString())}" />`;
 }
 
-function renderManualIpGroupForm(uuid, csrf, pagination, ipPage, isEditing) {
+function renderManualIpGroupForm(uuid, csrf, pagination, ipPage, isEditing, recentTotpVerified = false) {
   return `
     <form class="manual-ip-form" method="post" action="${ADMIN_PATH}">
       <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
@@ -3580,10 +3647,10 @@ function renderManualIpGroupForm(uuid, csrf, pagination, ipPage, isEditing) {
           <span>Custom expires</span>
           <input id="manual-expires-at-${escapeHtml(uuid)}" class="expires-at" name="expires_at" type="datetime-local" value="" />
         </label>
-        <label class="expiry-field">
+        ${recentTotpVerified ? "" : `<label class="expiry-field">
           <span>2FA code</span>
           <input name="step_up_token" aria-label="2FA code to add IP group" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" required />
-        </label>
+        </label>`}
         <div class="manual-ip-action">
           <button class="secondary compact" type="submit">Add IP group</button>
         </div>
@@ -3592,7 +3659,18 @@ function renderManualIpGroupForm(uuid, csrf, pagination, ipPage, isEditing) {
   `;
 }
 
-function renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env, pagination, ipPage, keyGroups = []) {
+function renderInviteEditForm(
+  invite,
+  apiConfigs,
+  editorId,
+  csrf,
+  request,
+  env,
+  pagination,
+  ipPage,
+  keyGroups = [],
+  recentTotpVerified = false,
+) {
   const selectedGroup = selectedKeyGroupName(invite, keyGroups);
   const fieldId = `key_group-${invite.uuid}`;
   return `
@@ -3625,10 +3703,10 @@ function renderInviteEditForm(invite, apiConfigs, editorId, csrf, request, env, 
       </div>
       ${renderApiConfigEditor(editorId, apiConfigs, defaultSub2ApiBaseUrl(env, request))}
       <div class="form-footer">
-        <label class="field">
+        ${recentTotpVerified ? "" : `<label class="field">
           <span>2FA code</span>
           <input name="step_up_token" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" required />
-        </label>
+        </label>`}
         <button class="secondary compact" type="submit">Save user</button>
       </div>
     </form>
@@ -3690,6 +3768,7 @@ function renderIpGroup(
   pagination = {},
   ipPage = 1,
   isEditing = false,
+  recentTotpVerified = false,
 ) {
   const place = formatGroupPlace(group) || "Unknown location";
   const meta = [group.asOrganization, group.colo, group.geoSource ? `geo: ${group.geoSource}` : ""].filter(Boolean).join(" · ");
@@ -3721,7 +3800,7 @@ function renderIpGroup(
             <input type="hidden" name="uuid" value="${escapeHtml(uuid)}" />
             <input type="hidden" name="group_id" value="${escapeHtml(group.id)}" />
             ${renderInvitePostContextFields(pagination, ipPage, isEditing)}
-            <input name="step_up_token" aria-label="2FA code to delete IP group" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />
+            ${recentTotpVerified ? "" : `<input name="step_up_token" aria-label="2FA code to delete IP group" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="2FA code" required />`}
             <button class="danger compact" type="submit">Delete group</button>
           </form>
         </div>
@@ -3746,10 +3825,10 @@ function renderIpGroup(
             <span>Days left</span>
             <input class="expires-days" id="expires-days-${escapeHtml(group.id)}" name="expires_in_days" type="number" min="0" step="1" value="${escapeHtml(expiresInDays)}" />
           </label>
-          <label class="expiry-field">
+          ${recentTotpVerified ? "" : `<label class="expiry-field">
             <span>2FA code</span>
             <input name="step_up_token" aria-label="2FA code to update IP expiration" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" required />
-          </label>
+          </label>`}
           <button class="secondary compact" type="submit">Update</button>
         </form>
         <div class="ip-list">
@@ -6001,6 +6080,24 @@ function requiresStepUpAction(action) {
   return STEP_UP_ACTIONS.has(String(action || ""));
 }
 
+function alwaysRequiresStepUpAction(action) {
+  return ALWAYS_STEP_UP_ACTIONS.has(String(action || ""));
+}
+
+function hasRecentAdminTotp(session, now = Date.now()) {
+  const verifiedAt = Number(session?.totpVerifiedAt);
+  return Number.isSafeInteger(now)
+    && Number.isSafeInteger(verifiedAt)
+    && verifiedAt > 0
+    && verifiedAt <= now
+    && now - verifiedAt <= RECENT_TOTP_WINDOW_MS;
+}
+
+function requiresStepUpForSession(action, session, now = Date.now()) {
+  return requiresStepUpAction(action)
+    && (alwaysRequiresStepUpAction(action) || !hasRecentAdminTotp(session, now));
+}
+
 function sessionKey(hash) {
   return `session:${hash}`;
 }
@@ -6213,6 +6310,11 @@ export const __test = Object.freeze({
   adminSessionTotpBinding,
   stepUpAttemptKey,
   requiresStepUpAction,
+  alwaysRequiresStepUpAction,
+  hasRecentAdminTotp,
+  requiresStepUpForSession,
+  markAdminTotpVerified,
+  RECENT_TOTP_WINDOW_MS,
   inviteCredentialStatus,
   detectIpVersion,
   resolveCurrentCloudflareDeleteIds,

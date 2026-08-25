@@ -271,6 +271,12 @@ test("one admin allowlist mutation reuses the request AuthState readiness check"
       assert.equal(hash, sessionHash);
       return session;
     },
+    async putAdminSession(hash, payload) {
+      assert.equal(hash, sessionHash);
+      assert.equal(payload.csrf, csrf);
+      assert.ok(Number.isSafeInteger(payload.totpVerifiedAt));
+      return { ok: true, expiresAt: payload.expiresAt };
+    },
     async getInvites() {
       return {
         revision: 1,

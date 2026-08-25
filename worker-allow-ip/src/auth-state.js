@@ -1074,7 +1074,7 @@ function getSession(storage, kind, hash, now) {
     sql.exec("DELETE FROM sessions WHERE kind = ? AND token_hash = ?", kind, hash);
     return null;
   }
-  return kind === "admin" ? parseStoredAdminSession(row.payload) : parseStoredPublicSession(row.payload);
+  return kind === "admin" ? parseStoredAdminSession(row.payload, now) : parseStoredPublicSession(row.payload);
 }
 
 function insertInvite(sql, invite) {
@@ -1233,6 +1233,19 @@ function normalizeAdminSession(value, now) {
       fail("auth_state_admin_session_invalid");
     }
     normalized.loginPhase = "totp";
+  }
+  if (Object.hasOwn(payload, "totpVerifiedAt")) {
+    const totpVerifiedAt = Number(payload.totpVerifiedAt);
+    if (
+      !Number.isSafeInteger(totpVerifiedAt)
+      || totpVerifiedAt <= 0
+      || totpVerifiedAt > now
+      || totpVerifiedAt >= normalized.expiresAt
+      || normalized.loginPhase
+    ) {
+      fail("auth_state_admin_session_invalid");
+    }
+    normalized.totpVerifiedAt = totpVerifiedAt;
   }
   return normalized;
 }
@@ -1449,8 +1462,8 @@ function parseStoredTrash(payload) {
   return normalizeTrashItem(parseStoredJson(payload, "auth_state_trash_corrupt"));
 }
 
-function parseStoredAdminSession(payload) {
-  return normalizeAdminSession(parseStoredJson(payload, "auth_state_session_corrupt"), 0);
+function parseStoredAdminSession(payload, now) {
+  return normalizeAdminSession(parseStoredJson(payload, "auth_state_session_corrupt"), now);
 }
 
 function parseStoredPublicSession(payload) {

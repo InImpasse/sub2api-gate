@@ -21,6 +21,7 @@ export default {
       await store.createAdminSession(body.adminSessionHash, {
         csrf: body.csrf,
         expiresAt: Date.now() + 60 * 60 * 1000,
+        totpVerifiedAt: Date.now(),
         totpBinding: await adminTest.adminSessionTotpBinding(
           env.ADMIN_TOTP_SECRET,
           env.INVITE_ACCESS_HMAC_KEY,
