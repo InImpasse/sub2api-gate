@@ -89,7 +89,6 @@ test("invite summary test forms stay CSRF-bound and never serialize API keys", (
   assert.match(html, /name="csrf" value="csrf-token"/);
   assert.match(html, /Key group: grok/);
   assert.match(html, /name="admin_context" value="p=2&amp;t=3&amp;i=2&amp;v=d"/);
-  assert.equal(adminTest.requiresStepUpAction("test_api_key"), false);
 });
 
 test("provision payload selects a real group and never sends default", async () => {

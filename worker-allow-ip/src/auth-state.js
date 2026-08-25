@@ -1234,19 +1234,6 @@ function normalizeAdminSession(value, now) {
     }
     normalized.loginPhase = "totp";
   }
-  if (Object.hasOwn(payload, "totpVerifiedAt")) {
-    const totpVerifiedAt = Number(payload.totpVerifiedAt);
-    if (
-      !Number.isSafeInteger(totpVerifiedAt)
-      || totpVerifiedAt <= 0
-      || totpVerifiedAt > now
-      || totpVerifiedAt >= normalized.expiresAt
-      || normalized.loginPhase
-    ) {
-      fail("auth_state_admin_session_invalid");
-    }
-    normalized.totpVerifiedAt = totpVerifiedAt;
-  }
   return normalized;
 }
 

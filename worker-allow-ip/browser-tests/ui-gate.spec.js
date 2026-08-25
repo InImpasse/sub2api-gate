@@ -6,7 +6,6 @@ import { fileURLToPath } from "node:url";
 
 import { expect, test } from "@playwright/test";
 import { Miniflare } from "miniflare";
-import { __test as adminTest } from "../src/admin.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_ROOT = path.resolve(HERE, "..");
@@ -814,7 +813,7 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
     await expect(page.getByRole("button", { name: "Test API key" }).first()).toBeVisible();
     await expect(page.locator('form:has(input[name="action"][value="delete"]) input[name="step_up_token"]')).toHaveCount(0);
     await expect(page.locator('form:has(input[name="action"][value="add_ip_group"]) input[name="step_up_token"]')).toHaveCount(0);
-    await expect(page.locator('form:has(input[name="action"][value="rotate_access_key"]) input[name="step_up_token"]')).toBeVisible();
+    await expect(page.locator('form:has(input[name="action"][value="rotate_access_key"]) input[name="step_up_token"]')).toHaveCount(0);
     await expect(page.locator(".invite-list, .create-panel, .trash-list")).toHaveCount(0);
     if (viewport.width === 240) {
       const detailPosition = await page.evaluate(() => {
@@ -1399,17 +1398,12 @@ test("admin copy actions report clipboard rejection without unhandled errors", a
   expect(editResponse?.status(), await page.locator("body").innerText()).toBe(200);
   await expect(page.locator('input[name="admin_context"][value$="v=e"]')).not.toHaveCount(0);
   await expect(page.locator('form:has(input[name="action"][value="update_invite"]) input[name="step_up_token"]')).toHaveCount(0);
-  await expect(page.locator('form:has(input[name="action"][value="reset_sub2api_password"]) input[name="step_up_token"]')).toBeVisible();
+  await expect(page.locator('form:has(input[name="action"][value="reset_sub2api_password"]) input[name="step_up_token"]')).toHaveCount(0);
   const copyRow = page.locator(".copy-row").first();
   await copyRow.click();
   await expect(copyRow).toHaveText("Copy failed");
 
-  const stepUpToken = await adminTest.totp(
-    TOTP_SECRET,
-    Math.floor(Date.now() / 1000 / 30),
-  );
   const rotateForm = page.locator('form:has(input[name="action"][value="rotate_access_key"])');
-  await rotateForm.locator('input[name="step_up_token"]').fill(stepUpToken);
   await Promise.all([
     page.waitForNavigation({ waitUntil: "networkidle" }),
     rotateForm.getByRole("button", { name: "Rotate key" }).click(),

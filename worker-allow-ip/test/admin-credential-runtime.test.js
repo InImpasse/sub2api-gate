@@ -3,7 +3,6 @@ import test from "node:test";
 
 import { Miniflare } from "miniflare";
 
-import { __test as adminTest } from "../src/admin.js";
 
 const UUID = "7c484f74-6d93-43d1-9441-00c7d8d4ab11";
 const OTHER_UUID = "4c484f74-6d93-43d1-9441-00c7d8d4ab12";
@@ -113,10 +112,6 @@ async function sha256Hex(value) {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function currentTotp() {
-  return await adminTest.totp(TOTP_SECRET, Math.floor(Date.now() / 1000 / 30));
-}
-
 async function postUpdate(miniflare, apiConfigs) {
   const form = new URLSearchParams({
     action: "update_invite",
@@ -128,7 +123,6 @@ async function postUpdate(miniflare, apiConfigs) {
     remark: "",
     api_configs: apiConfigs,
     key_group: "openai-default",
-    step_up_token: await currentTotp(),
   });
   return await miniflare.dispatchFetch("https://api.example.test/allow-ip/admin", {
     method: "POST",
@@ -151,7 +145,6 @@ async function postCreate(miniflare, apiConfigs) {
     remark: "",
     api_configs: apiConfigs,
     key_group: "openai-default",
-    step_up_token: await currentTotp(),
   });
   return await miniflare.dispatchFetch("https://api.example.test/allow-ip/admin", {
     method: "POST",

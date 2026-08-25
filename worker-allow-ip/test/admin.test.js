@@ -271,12 +271,6 @@ test("one admin allowlist mutation reuses the request AuthState readiness check"
       assert.equal(hash, sessionHash);
       return session;
     },
-    async putAdminSession(hash, payload) {
-      assert.equal(hash, sessionHash);
-      assert.equal(payload.csrf, csrf);
-      assert.ok(Number.isSafeInteger(payload.totpVerifiedAt));
-      return { ok: true, expiresAt: payload.expiresAt };
-    },
     async getInvites() {
       return {
         revision: 1,
@@ -340,10 +334,6 @@ test("one admin allowlist mutation reuses the request AuthState readiness check"
   };
 
   try {
-    const stepUpToken = await __test.totp(
-      env.ADMIN_TOTP_SECRET,
-      Math.floor(Date.now() / 1000 / 30),
-    );
     const response = await handleAdmin(new Request(
       "https://api.example.test/allow-ip/admin",
       {
@@ -355,7 +345,6 @@ test("one admin allowlist mutation reuses the request AuthState readiness check"
         body: new URLSearchParams({
           action: "add_ip_group",
           csrf,
-          step_up_token: stepUpToken,
           uuid,
           ip_value: "198.51.100.8",
           expires_in_days: "7",
