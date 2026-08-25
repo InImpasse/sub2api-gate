@@ -909,14 +909,19 @@ class SyncCanaryToolTests(unittest.TestCase):
                 "true",
                 "none",
                 "[]",
+                json.dumps({
+                    "3021/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3022"}]
+                }),
                 json.dumps({self.tool.TARGET_NETWORK: {}}),
                 json.dumps(labels),
             )
         ).encode()
 
         def runner(command, **_kwargs):
-            output = metadata if command[1] == "inspect" else b"127.0.0.1:3022\n"
-            return subprocess.CompletedProcess(command, 0, stdout=output, stderr=b"")
+            self.assertEqual(command[1], "inspect")
+            return subprocess.CompletedProcess(
+                command, 0, stdout=metadata, stderr=b""
+            )
 
         self.tool.inspect_sync_container(
             self.tool.CANARY_CONTAINER,
@@ -931,6 +936,70 @@ class SyncCanaryToolTests(unittest.TestCase):
                 "sha256:" + "c" * 64,
                 runner=runner,
             )
+
+    def test_live_dependencies_use_structured_runtime_ports_without_docker_port(self):
+        labels = {
+            "com.docker.compose.project": "sub2api-gate-release",
+            "com.docker.compose.service": "postgres",
+        }
+        fields = (
+            "true",
+            "healthy",
+            json.dumps({"5432/tcp": None}),
+            json.dumps({self.tool.TARGET_NETWORK: {}}),
+            json.dumps(labels),
+        )
+
+        def runner(command, **_kwargs):
+            self.assertEqual(command[1], "inspect")
+            return subprocess.CompletedProcess(
+                command, 0, stdout="|".join(fields).encode(), stderr=b""
+            )
+
+        self.tool.inspect_live_dependency(
+            self.tool.TARGET_POSTGRES, "postgres", runner=runner
+        )
+
+        fields = list(fields)
+        fields[2] = json.dumps({
+            "5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "5432"}]
+        })
+        with self.assertRaisesRegex(self.tool.CanaryError, "runtime contract"):
+            self.tool.inspect_live_dependency(
+                self.tool.TARGET_POSTGRES, "postgres", runner=runner
+            )
+
+    def test_legacy_sync_uses_structured_runtime_ports_without_docker_port(self):
+        container_id = "b" * 64
+        labels = {
+            "com.docker.compose.project": "sub2api-gate-release",
+            "com.docker.compose.service": "sub2api-sync",
+        }
+        metadata = "|".join((
+            container_id,
+            "sha256:" + "c" * 64,
+            self.tool.SYNC_IMAGE,
+            "true",
+            "healthy",
+            "65532:65532",
+            "true",
+            "none",
+            "[]",
+            json.dumps({"3021/tcp": None}),
+            json.dumps({self.tool.TARGET_NETWORK: {}}),
+            json.dumps(labels),
+        )).encode()
+
+        def runner(command, **_kwargs):
+            self.assertEqual(command[1], "inspect")
+            return subprocess.CompletedProcess(
+                command, 0, stdout=metadata, stderr=b""
+            )
+
+        self.assertEqual(
+            self.tool.inspect_legacy_sync_container(True, runner=runner),
+            container_id,
+        )
 
     def test_nonce_runtime_requires_exact_memory_and_noeviction_command(self):
         labels = {

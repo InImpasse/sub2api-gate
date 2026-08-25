@@ -902,21 +902,34 @@ def deferred_termination_signals():
 def inspect_live_dependency(name, expected_service, *, runner=run_command):
     template = (
         "{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|"
-        "{{json .NetworkSettings.Networks}}|{{json .Config.Labels}}"
+        "{{json .NetworkSettings.Ports}}|{{json .NetworkSettings.Networks}}|"
+        "{{json .Config.Labels}}"
     )
     result = runner(["docker", "inspect", "--format", template, name], timeout=10)
-    parts = decoded_stdout(result).split("|", 3)
-    if len(parts) != 4:
+    parts = decoded_stdout(result).split("|", 4)
+    if len(parts) != 5:
         raise CanaryError("live sync dependency identity is invalid")
-    running, health, networks_json, labels_json = parts
+    running, health, ports_json, networks_json, labels_json = parts
     try:
+        ports = json.loads(ports_json or "{}")
         networks = json.loads(networks_json or "{}")
         labels = json.loads(labels_json or "{}")
     except json.JSONDecodeError as error:
         raise CanaryError("live sync dependency metadata could not be verified") from error
+    container_port = "8080/tcp" if name == TARGET_APP else (
+        "5432/tcp" if name == TARGET_POSTGRES else "6379/tcp"
+    )
+    expected_ports = {
+        container_port: (
+            [{"HostIp": "127.0.0.1", "HostPort": "8080"}]
+            if name == TARGET_APP
+            else None
+        )
+    }
     if (
         running != "true"
         or health != "healthy"
+        or ports != expected_ports
         or set(networks) != (
             {TARGET_NETWORK, "sub2api-gate-release_sub2api-egress"}
             if name == TARGET_APP
@@ -926,15 +939,6 @@ def inspect_live_dependency(name, expected_service, *, runner=run_command):
         or labels.get("com.docker.compose.service") != expected_service
     ):
         raise CanaryError("live sync dependency runtime contract failed")
-    container_port = "8080/tcp" if name == TARGET_APP else (
-        "5432/tcp" if name == TARGET_POSTGRES else "6379/tcp"
-    )
-    published = decoded_stdout(
-        runner(["docker", "port", name, container_port], timeout=10)
-    )
-    expected = "127.0.0.1:8080" if name == TARGET_APP else ""
-    if published != expected:
-        raise CanaryError("live sync dependency port contract failed")
 
 
 def require_target_runtime(*, runner=run_command):
@@ -988,11 +992,12 @@ def inspect_sync_container(name, expected_port, expected_image_id, *, runner=run
         "{{.Image}}|{{.Config.Image}}|"
         "{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|"
         "{{.Config.User}}|{{.HostConfig.ReadonlyRootfs}}|{{.HostConfig.LogConfig.Type}}|"
-        "{{json .HostConfig.Binds}}|{{json .NetworkSettings.Networks}}|{{json .Config.Labels}}"
+        "{{json .HostConfig.Binds}}|{{json .NetworkSettings.Ports}}|"
+        "{{json .NetworkSettings.Networks}}|{{json .Config.Labels}}"
     )
     result = runner(["docker", "inspect", "--format", template, name], timeout=10)
-    parts = decoded_stdout(result).split("|", 9)
-    if len(parts) != 10:
+    parts = decoded_stdout(result).split("|", 10)
+    if len(parts) != 11:
         raise CanaryError("sync container identity is invalid")
     (
         image_id,
@@ -1003,11 +1008,13 @@ def inspect_sync_container(name, expected_port, expected_image_id, *, runner=run
         read_only,
         log_driver,
         binds_json,
+        ports_json,
         networks_json,
         labels_json,
     ) = parts
     try:
         binds = json.loads(binds_json or "[]")
+        ports = json.loads(ports_json or "{}")
         networks = json.loads(networks_json or "{}")
         labels = json.loads(labels_json or "{}")
     except json.JSONDecodeError as error:
@@ -1024,15 +1031,17 @@ def inspect_sync_container(name, expected_port, expected_image_id, *, runner=run
         or read_only != "true"
         or log_driver != "none"
         or any("docker.sock" in str(binding) for binding in (binds or []))
+        or ports != {
+            "3021/tcp": [
+                {"HostIp": "127.0.0.1", "HostPort": str(expected_port)}
+            ]
+        }
         or set(networks) != {TARGET_NETWORK}
         or labels.get("com.docker.compose.project") != "sub2api-gate-sync-canary"
         or labels.get("com.docker.compose.service") != expected_service
         or labels.get("sub2api-gate.request-path") != "never-v1"
     ):
         raise CanaryError("sync container runtime contract failed")
-    port = decoded_stdout(runner(["docker", "port", name, "3021/tcp"], timeout=10))
-    if port != f"127.0.0.1:{expected_port}":
-        raise CanaryError("sync container is not loopback-only")
 
 
 def inspect_nonce_redis(*, runner=run_command):
@@ -1410,22 +1419,24 @@ def inspect_legacy_sync_container(
         "{{.Id}}|{{.Image}}|{{.Config.Image}}|{{.State.Running}}|"
         "{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.Config.User}}|"
         "{{.HostConfig.ReadonlyRootfs}}|{{.HostConfig.LogConfig.Type}}|"
-        "{{json .HostConfig.Binds}}|{{json .NetworkSettings.Networks}}|"
+        "{{json .HostConfig.Binds}}|{{json .NetworkSettings.Ports}}|"
+        "{{json .NetworkSettings.Networks}}|"
         "{{json .Config.Labels}}"
     )
     result = runner(
         ["docker", "inspect", "--format", template, LEGACY_SYNC_CONTAINER],
         timeout=10,
     )
-    parts = decoded_stdout(result).split("|", 10)
-    if len(parts) != 11:
+    parts = decoded_stdout(result).split("|", 11)
+    if len(parts) != 12:
         raise CanaryError("legacy sync container identity is invalid")
     (
         container_id, image_id, configured_image, running, health, user,
-        read_only, log_driver, binds_json, networks_json, labels_json,
+        read_only, log_driver, binds_json, ports_json, networks_json, labels_json,
     ) = parts
     try:
         binds = json.loads(binds_json or "[]")
+        ports = json.loads(ports_json or "{}")
         networks = json.loads(networks_json or "{}")
         labels = json.loads(labels_json or "{}")
     except json.JSONDecodeError as error:
@@ -1441,16 +1452,12 @@ def inspect_legacy_sync_container(
         or read_only != "true"
         or log_driver != "none"
         or any("docker.sock" in str(binding) for binding in (binds or []))
+        or ports != {"3021/tcp": None}
         or set(networks) != {TARGET_NETWORK}
         or labels.get("com.docker.compose.project") != "sub2api-gate-release"
         or labels.get("com.docker.compose.service") != "sub2api-sync"
     ):
         raise CanaryError("legacy sync container runtime contract failed")
-    published = decoded_stdout(
-        runner(["docker", "port", LEGACY_SYNC_CONTAINER, "3021/tcp"], timeout=10)
-    )
-    if published:
-        raise CanaryError("legacy sync container unexpectedly publishes a host port")
     return container_id
 
 
