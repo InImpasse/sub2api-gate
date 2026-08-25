@@ -1,5 +1,5 @@
 # Temporary override for the nonce-only Redis migration. Combine this with
-# docker-compose.sync-canary.yml and remove it before a sync runtime starts.
+# docker-compose.nonce-canary.yml and remove it before a nonce runtime starts.
 services:
   sync-canary-redis-nonce:
     ports:

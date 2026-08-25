@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -126,23 +127,18 @@ class SyncCanaryComposeTests(unittest.TestCase):
             ],
         )
 
-    def test_canary_targets_migrated_services_and_uses_persistent_nonce_only(self):
-        self.assertIn("SUB2API_SYNC_DATABASE_HOST: traffic-canary-postgres", self.compose)
+    def test_canary_targets_live_services_and_reuses_the_reviewed_nonce_runtime(self):
+        self.assertIn("SUB2API_SYNC_DATABASE_HOST: postgres", self.compose)
         self.assertIn("SUB2API_SYNC_DATABASE_USER: sub2api_sync", self.compose)
         self.assertIn(
-            "SUB2API_INTERNAL_LOGIN_URL: http://sub2api-traffic-canary:8080/api/v1/auth/login",
+            "SUB2API_INTERNAL_LOGIN_URL: http://sub2api:8080/api/v1/auth/login",
             self.compose,
         )
-        self.assertIn("SUB2API_SYNC_REDIS_HOST: sync-canary-redis-nonce", self.compose)
-        self.assertIn("source: /mnt/data/sub2api-gate/redis/nonce", self.compose)
-        self.assertIn("create_host_path: false", self.compose)
-        self.assertIn("--appendonly\n      - \"yes\"", self.compose)
-        self.assertIn("--appendfsync\n      - \"always\"", self.compose)
-        self.assertIn("mem_limit: 128m", self.compose)
-        self.assertIn("--maxmemory\n      - 32mb", self.compose)
-        self.assertIn("--maxmemory-policy\n      - noeviction", self.compose)
+        self.assertIn("SUB2API_SYNC_REDIS_HOST: redis-nonce", self.compose)
+        self.assertNotIn("sync-canary-redis-nonce:", self.compose)
+        self.assertNotIn("source: /mnt/data/sub2api-gate/redis/nonce", self.compose)
         self.assertIn(
-            "name: sub2api-gate-traffic-canary_traffic-canary-data", self.compose
+            "name: sub2api-gate-release_sub2api-data", self.compose
         )
 
     def test_compose_config_parses_without_runtime_values(self):
@@ -532,9 +528,6 @@ class SyncCanaryToolTests(unittest.TestCase):
             self.tool.subprocess, "run", side_effect=run
         ), mock.patch.dict(os.environ, hostile_environment, clear=True):
             self.tool.run_command([str(self.tool.CLEAN_WORKTREE)])
-            self.tool.run_command(
-                [sys.executable, str(self.tool.TRAFFIC_CONTROLLER), "status"]
-            )
             self.tool.run_command(["git", "rev-parse", "--verify", "HEAD^{commit}"])
             self.tool.run_command(
                 ["systemctl", "is-active", "--quiet", self.tool.LEGACY_UNIT]
@@ -544,7 +537,6 @@ class SyncCanaryToolTests(unittest.TestCase):
             [command[0] for command, _kwargs in calls],
             [
                 str(self.tool.CLEAN_WORKTREE),
-                sys.executable,
                 self.tool.GIT_BINARY,
                 self.tool.SYSTEMCTL_BINARY,
             ],
@@ -898,6 +890,7 @@ class SyncCanaryToolTests(unittest.TestCase):
         self.assertIn("--no-build", command)
         self.assertNotIn("--build", command)
         self.assertEqual(command[command.index("--pull") + 1], "never")
+        self.assertNotIn("sync-canary-redis-nonce", command)
 
     def test_running_container_must_use_the_recorded_exact_image_id(self):
         image_id = "sha256:" + "a" * 64
@@ -941,7 +934,7 @@ class SyncCanaryToolTests(unittest.TestCase):
 
     def test_nonce_runtime_requires_exact_memory_and_noeviction_command(self):
         labels = {
-            "com.docker.compose.project": "sub2api-gate-sync-canary",
+            "com.docker.compose.project": "sub2api-gate-release",
             "com.docker.compose.service": self.tool.NONCE_REDIS_SERVICE,
         }
         command = [
@@ -977,7 +970,7 @@ class SyncCanaryToolTests(unittest.TestCase):
         with self.assertRaisesRegex(self.tool.CanaryError, "runtime contract"):
             self.tool.inspect_nonce_redis(runner=runner)
 
-    def test_promote_stops_legacy_before_3021_and_recovers_on_failure(self):
+    def test_promote_stops_the_live_relay_before_3021_and_recovers_on_failure(self):
         events = []
 
         def systemctl(action, **_kwargs):
@@ -990,7 +983,11 @@ class SyncCanaryToolTests(unittest.TestCase):
         with mock.patch.object(self.tool, "inspect_sync_container"), \
              mock.patch.object(self.tool, "inspect_nonce_redis"), \
              mock.patch.object(self.tool, "verify_signed_status"), \
-             mock.patch.object(self.tool, "require_legacy_service"), \
+             mock.patch.object(self.tool, "require_target_runtime"), \
+             mock.patch.object(self.tool, "require_sync_role"), \
+             mock.patch.object(self.tool, "require_legacy_relay"), \
+             mock.patch.object(self.tool, "inspect_legacy_sync_container", return_value="b" * 64), \
+             mock.patch.object(self.tool, "wait_for_legacy_sync"), \
              mock.patch.object(self.tool, "systemctl", side_effect=systemctl), \
              mock.patch.object(self.tool, "require_port_free", side_effect=lambda _port: events.append(("port", 3021))), \
              mock.patch.object(self.tool, "start_profile", side_effect=start_profile), \
@@ -1006,6 +1003,244 @@ class SyncCanaryToolTests(unittest.TestCase):
         self.assertEqual(events[0], ("systemctl", "stop"))
         self.assertIn(("systemctl", "start"), events)
         self.assertLess(events.index(("systemctl", "stop")), events.index(("port", 3021)))
+
+    def test_promote_preserves_identity_and_orders_the_successful_cutover(self):
+        events = []
+        legacy_id = "b" * 64
+
+        def inspect_legacy(running, *, expected_id=None, **_kwargs):
+            events.append(("legacy", running, expected_id))
+            return legacy_id
+
+        with mock.patch.object(self.tool, "require_target_runtime"), \
+             mock.patch.object(self.tool, "require_sync_role"), \
+             mock.patch.object(self.tool, "inspect_sync_container"), \
+             mock.patch.object(self.tool, "inspect_nonce_redis"), \
+             mock.patch.object(self.tool, "verify_signed_status", side_effect=lambda port, _secret: events.append(("verify", port))), \
+             mock.patch.object(self.tool, "require_legacy_relay"), \
+             mock.patch.object(self.tool, "inspect_legacy_sync_container", side_effect=inspect_legacy), \
+             mock.patch.object(self.tool, "systemctl", side_effect=lambda action, **_kwargs: events.append(("systemctl", action))), \
+             mock.patch.object(self.tool, "require_port_free", side_effect=lambda port: events.append(("port-free", port))), \
+             mock.patch.object(self.tool, "start_profile", side_effect=lambda _env, _profile, service, _environment, **_kwargs: events.append(("start", service))), \
+             mock.patch.object(self.tool, "wait_for_container", side_effect=lambda name, port, _image, **_kwargs: events.append(("healthy", name, port))), \
+             mock.patch.object(self.tool, "stop_service", side_effect=lambda _env, _profile, service, _environment, **_kwargs: events.append(("stop", service))), \
+             mock.patch.object(self.tool, "container_action", side_effect=lambda action, name, **_kwargs: events.append(("container", action, name))):
+            self.tool.promote(
+                pathlib.Path("/private/env"),
+                {},
+                "s" * 32,
+                "sha256:" + "a" * 64,
+                runner=lambda *_args, **_kwargs: None,
+            )
+
+        relay_stop = events.index(("systemctl", "stop"))
+        stable_start = events.index(("start", self.tool.STABLE_CONTAINER))
+        stable_verified = events.index(("verify", self.tool.SYNC_STABLE_PORT))
+        canary_stop = events.index(("stop", self.tool.CANARY_CONTAINER))
+        legacy_stop = events.index(
+            ("container", "stop", self.tool.LEGACY_SYNC_CONTAINER)
+        )
+        relay_disable = events.index(("systemctl", "disable"))
+        self.assertLess(
+            relay_stop,
+            events.index(("port-free", self.tool.SYNC_STABLE_PORT)),
+        )
+        self.assertLess(relay_stop, stable_start)
+        self.assertLess(stable_start, stable_verified)
+        self.assertLess(stable_verified, canary_stop)
+        self.assertLess(canary_stop, legacy_stop)
+        self.assertLess(legacy_stop, relay_disable)
+        self.assertIn(("legacy", False, legacy_id), events)
+
+    def test_live_runtime_requires_the_internal_release_network_and_exact_services(self):
+        containers = {
+            "postgres": {"Name": self.tool.TARGET_POSTGRES},
+            "app": {"Name": self.tool.TARGET_APP},
+            "nonce": {"Name": self.tool.NONCE_REDIS},
+            "sync": {"Name": self.tool.LEGACY_SYNC_CONTAINER},
+        }
+        network = ("true|" + json.dumps(containers)).encode()
+        inspected = []
+
+        def runner(command, **_kwargs):
+            self.assertEqual(command[1:4], ["network", "inspect", self.tool.TARGET_NETWORK])
+            return subprocess.CompletedProcess(command, 0, stdout=network, stderr=b"")
+
+        with mock.patch.object(
+            self.tool, "inspect_live_dependency", side_effect=lambda name, service, **_kwargs: inspected.append((name, service))
+        ):
+            self.tool.require_target_runtime(runner=runner)
+
+        self.assertEqual(inspected, [
+            (self.tool.TARGET_POSTGRES, "postgres"),
+            (self.tool.TARGET_APP, "sub2api"),
+            (self.tool.NONCE_REDIS, "redis-nonce"),
+        ])
+
+        with self.assertRaisesRegex(self.tool.CanaryError, "internal"):
+            self.tool.require_target_runtime(
+                runner=lambda command, **_kwargs: subprocess.CompletedProcess(
+                    command, 0, stdout=("false|" + json.dumps(containers)).encode(), stderr=b""
+                )
+            )
+
+    def test_rollback_starts_the_old_container_before_the_relay(self):
+        events = []
+
+        def container_action(action, _name, **_kwargs):
+            events.append(("container", action))
+
+        def systemctl(action, **_kwargs):
+            events.append(("systemctl", action))
+
+        with mock.patch.object(self.tool, "inspect_sync_container"), \
+             mock.patch.object(self.tool, "inspect_nonce_redis"), \
+             mock.patch.object(self.tool, "verify_signed_status"), \
+             mock.patch.object(self.tool, "require_target_runtime"), \
+             mock.patch.object(self.tool, "require_legacy_relay", return_value=False), \
+             mock.patch.object(self.tool, "inspect_legacy_sync_container"), \
+             mock.patch.object(self.tool, "stop_service"), \
+             mock.patch.object(self.tool, "container_action", side_effect=container_action), \
+             mock.patch.object(self.tool, "wait_for_legacy_sync", side_effect=lambda *_args, **_kwargs: events.append(("container", "healthy"))), \
+             mock.patch.object(self.tool, "systemctl", side_effect=systemctl):
+            self.tool.rollback(
+                pathlib.Path("/private/env"), {}, "s" * 32,
+                "sha256:" + "a" * 64, runner=lambda *_args, **_kwargs: None,
+            )
+
+        self.assertLess(events.index(("container", "start")), events.index(("container", "healthy")))
+        self.assertLess(events.index(("container", "healthy")), events.index(("systemctl", "start")))
+
+    def test_mutating_release_actions_hold_the_sync_operation_lock(self):
+        events = []
+
+        class Lock:
+            def __enter__(self):
+                events.append("lock-enter")
+
+            def __exit__(self, *_args):
+                events.append("lock-exit")
+
+        with mock.patch.object(self.tool, "require_apply_context"), \
+             mock.patch.object(self.tool, "sync_operation_lock", return_value=Lock()), \
+             mock.patch.object(self.tool, "validate_contract"), \
+             mock.patch.object(self.tool, "prepare_sync_image", side_effect=lambda **_kwargs: events.append("prepare")):
+            result = self.tool.main(
+                ["prepare-image", "--apply"],
+                runner=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
+                stdin=TtyBuffer(), stdout=TtyBuffer(), stderr=TtyBuffer(),
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(events, ["lock-enter", "prepare", "lock-exit"])
+
+    def test_sync_operation_lock_is_private_and_rejects_contention(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_directory = pathlib.Path(directory) / "state"
+            lock_path = state_directory / "sync-operation.lock"
+            with mock.patch.object(self.tool, "STATE_UID", os.getuid()), \
+                 mock.patch.object(self.tool, "STATE_GID", os.getgid()):
+                with self.tool.sync_operation_lock(lock_path):
+                    self.assertEqual(
+                        stat.S_IMODE(state_directory.stat().st_mode), 0o700
+                    )
+                    self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
+                    with self.assertRaisesRegex(
+                        self.tool.CanaryError, "in progress"
+                    ):
+                        with self.tool.sync_operation_lock(lock_path):
+                            self.fail("a second release operation acquired the lock")
+
+    def test_live_relay_files_must_match_the_reviewed_release_exactly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            reviewed = root / "deploy" / "relay"
+            live = root / "live-relay"
+            reviewed.parent.mkdir()
+            reviewed.write_bytes(b"reviewed\n")
+            live.write_bytes(b"reviewed\n")
+            live.chmod(0o755)
+            with mock.patch.object(self.tool, "ROOT", root):
+                self.tool._require_reviewed_live_file(
+                    live,
+                    pathlib.Path("deploy/relay"),
+                    0o755,
+                    expected_uid=os.getuid(),
+                    expected_gid=os.getgid(),
+                )
+                live.write_bytes(b"changed\n")
+                with self.assertRaisesRegex(
+                    self.tool.CanaryError, "does not match"
+                ):
+                    self.tool._require_reviewed_live_file(
+                        live,
+                        pathlib.Path("deploy/relay"),
+                        0o755,
+                        expected_uid=os.getuid(),
+                        expected_gid=os.getgid(),
+                    )
+
+    def test_cutover_signal_handler_restores_the_previous_handler(self):
+        previous = signal.getsignal(signal.SIGTERM)
+        with self.assertRaises(self.tool.TerminationRequested):
+            with self.tool.controlled_termination_signals():
+                os.kill(os.getpid(), signal.SIGTERM)
+        self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+
+    def test_promote_recovers_when_relay_stop_is_interrupted(self):
+        legacy_id = "b" * 64
+        recovered = []
+
+        with mock.patch.object(self.tool, "require_target_runtime"), \
+             mock.patch.object(self.tool, "require_sync_role"), \
+             mock.patch.object(self.tool, "inspect_sync_container"), \
+             mock.patch.object(self.tool, "inspect_nonce_redis"), \
+             mock.patch.object(self.tool, "verify_signed_status"), \
+             mock.patch.object(self.tool, "require_legacy_relay"), \
+             mock.patch.object(self.tool, "inspect_legacy_sync_container", return_value=legacy_id), \
+             mock.patch.object(self.tool, "systemctl", side_effect=self.tool.TerminationRequested("interrupted")), \
+             mock.patch.object(self.tool, "recover_legacy", side_effect=lambda _env, _environment, _secret, expected_id, **_kwargs: recovered.append(expected_id)):
+            with self.assertRaisesRegex(self.tool.CanaryError, "legacy recovery"):
+                self.tool.promote(
+                    pathlib.Path("/private/env"),
+                    {},
+                    "s" * 32,
+                    "sha256:" + "a" * 64,
+                    runner=lambda *_args, **_kwargs: None,
+                )
+
+        self.assertEqual(recovered, [legacy_id])
+
+    def test_rollback_restores_stable_when_its_stop_is_interrupted(self):
+        events = []
+
+        def stop_service(_env, _profile, service, _environment, **_kwargs):
+            events.append(("stop", service))
+            raise self.tool.TerminationRequested("interrupted")
+
+        with mock.patch.object(self.tool, "require_target_runtime"), \
+             mock.patch.object(self.tool, "inspect_sync_container"), \
+             mock.patch.object(self.tool, "inspect_nonce_redis"), \
+             mock.patch.object(self.tool, "verify_signed_status"), \
+             mock.patch.object(self.tool, "require_legacy_relay"), \
+             mock.patch.object(self.tool, "inspect_legacy_sync_container", return_value="b" * 64), \
+             mock.patch.object(self.tool, "stop_service", side_effect=stop_service), \
+             mock.patch.object(self.tool, "systemctl", side_effect=lambda action, **_kwargs: events.append(("systemctl", action))), \
+             mock.patch.object(self.tool, "container_action", side_effect=lambda action, name, **_kwargs: events.append(("container", action, name))), \
+             mock.patch.object(self.tool, "start_profile", side_effect=lambda _env, _profile, service, _environment, **_kwargs: events.append(("start", service))), \
+             mock.patch.object(self.tool, "wait_for_container"):
+            with self.assertRaisesRegex(
+                self.tool.CanaryError, "stable container was restored"
+            ):
+                self.tool.rollback(
+                    pathlib.Path("/private/env"),
+                    {},
+                    "s" * 32,
+                    "sha256:" + "a" * 64,
+                    runner=lambda *_args, **_kwargs: None,
+                )
+
+        self.assertIn(("start", self.tool.STABLE_CONTAINER), events)
 
     def test_controller_has_no_nginx_or_v1_mutation_path(self):
         source = TOOL_PATH.read_text(encoding="utf-8").lower()

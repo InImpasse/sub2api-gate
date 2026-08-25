@@ -42,10 +42,10 @@ COMPOSE_FILE = REPO_DIR / "docker-compose.traffic-canary.yml"
 POSTGRES_MIGRATION_COMPOSE_FILE = REPO_DIR / "docker-compose.postgres-migration.yml"
 COMPOSE_PROJECT = "sub2api-gate-traffic-canary"
 COMPOSE_PROFILE = "traffic-canary"
-SYNC_COMPOSE_FILE = REPO_DIR / "docker-compose.sync-canary.yml"
+NONCE_COMPOSE_FILE = REPO_DIR / "docker-compose.nonce-canary.yml"
 REDIS_MIGRATION_COMPOSE_FILE = REPO_DIR / "docker-compose.redis-migration.yml"
-SYNC_COMPOSE_PROJECT = "sub2api-gate-sync-canary"
-SYNC_COMPOSE_PROFILE = "sync-canary"
+NONCE_COMPOSE_PROJECT = "sub2api-gate-nonce-canary"
+NONCE_COMPOSE_PROFILE = "nonce-canary"
 TARGET_APP = "sub2api-traffic-canary"
 TARGET_POSTGRES = "sub2api-traffic-canary-postgres"
 TARGET_REDIS = "sub2api-traffic-canary-redis"
@@ -133,7 +133,7 @@ CUTOVER_TRUSTED_RELEASE_FILES = (
     pathlib.Path("deploy/retire-legacy-data.py"),
     pathlib.Path("docker-compose.traffic-canary.yml"),
     pathlib.Path("docker-compose.postgres-migration.yml"),
-    pathlib.Path("docker-compose.sync-canary.yml"),
+    pathlib.Path("docker-compose.nonce-canary.yml"),
     pathlib.Path("docker-compose.redis-migration.yml"),
     pathlib.Path("nginx/snippets/sub2api-upstream-stable.conf"),
     pathlib.Path("nginx/snippets/sub2api-upstream-canary.conf"),
@@ -977,7 +977,7 @@ def validate_contract():
         DEPLOY_DIR / "retire-legacy-data.py",
         COMPOSE_FILE,
         POSTGRES_MIGRATION_COMPOSE_FILE,
-        SYNC_COMPOSE_FILE,
+        NONCE_COMPOSE_FILE,
         REDIS_MIGRATION_COMPOSE_FILE,
     )
     for path in required:
@@ -995,6 +995,22 @@ def validate_contract():
     ):
         if marker not in compose:
             raise CutoverError("maintenance cutover Compose contract is incomplete")
+    nonce_compose = NONCE_COMPOSE_FILE.read_text(encoding="utf-8")
+    for marker in (
+        "name: sub2api-gate-nonce-canary",
+        "redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005",
+        "container_name: sub2api-sync-canary-redis-nonce",
+        "name: sub2api-gate-traffic-canary_traffic-canary-data",
+        "pull_policy: never",
+        'driver: "none"',
+    ):
+        if marker not in nonce_compose:
+            raise CutoverError("nonce Redis canary Compose contract is incomplete")
+    if any(
+        marker in nonce_compose
+        for marker in ("ports:", "network_mode: host", "privileged: true", "build:")
+    ):
+        raise CutoverError("nonce Redis canary Compose contract is unsafe")
     redis_migration_compose = REDIS_MIGRATION_COMPOSE_FILE.read_text(encoding="utf-8")
     for marker in (
         '"127.0.0.1:16379:6379"',
@@ -1089,15 +1105,15 @@ def nonce_compose_command(env_file, *, migration, arguments):
         "docker",
         "compose",
         "--project-name",
-        SYNC_COMPOSE_PROJECT,
+        NONCE_COMPOSE_PROJECT,
         "--env-file",
         str(env_file),
         "-f",
-        str(SYNC_COMPOSE_FILE),
+        str(NONCE_COMPOSE_FILE),
     ]
     if migration:
         command.extend(["-f", str(REDIS_MIGRATION_COMPOSE_FILE)])
-    return [*command, "--profile", SYNC_COMPOSE_PROFILE, *arguments]
+    return [*command, "--profile", NONCE_COMPOSE_PROFILE, *arguments]
 
 
 def minimal_environment():

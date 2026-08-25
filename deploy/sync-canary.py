@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import getpass
 import hashlib
 import hmac
@@ -13,6 +14,7 @@ import json
 import os
 import pathlib
 import re
+import signal
 import socket
 import stat
 import subprocess
@@ -20,6 +22,7 @@ import sys
 import time
 import urllib.parse
 import uuid
+from contextlib import contextmanager
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -41,6 +44,10 @@ TRAFFIC_COMPOSE_RELATIVE_PATH = pathlib.Path("docker-compose.traffic-canary.yml"
 POSTGRES_LOG_GATE_RELATIVE_PATH = pathlib.Path(
     "deploy/verify-postgres-runtime-logging.sql"
 )
+RELAY_UNIT_RELATIVE_PATH = pathlib.Path(
+    "deploy/systemd/sub2api-sync-loopback-relay.service"
+)
+RELAY_SCRIPT_RELATIVE_PATH = pathlib.Path("deploy/sub2api-sync-loopback-relay")
 TRUSTED_RELEASE_DIRECTORIES = (
     pathlib.Path("deploy"),
     pathlib.Path("migrations"),
@@ -60,6 +67,8 @@ TRUSTED_RELEASE_FILES = (
     (SYNC_USAGE_METADATA_RELATIVE_PATH, False),
     (TRAFFIC_COMPOSE_RELATIVE_PATH, False),
     (POSTGRES_LOG_GATE_RELATIVE_PATH, False),
+    (RELAY_UNIT_RELATIVE_PATH, False),
+    (RELAY_SCRIPT_RELATIVE_PATH, True),
 )
 COMPOSE = ROOT / "docker-compose.sync-canary.yml"
 SYNC_DOCKERFILE = ROOT / "sub2api-sync" / "Dockerfile"
@@ -71,6 +80,7 @@ TRAFFIC_CONTROLLER = ROOT / "deploy" / "traffic-canary.py"
 DATA_ROOT = pathlib.Path("/mnt/data/sub2api-gate")
 STATE_DIRECTORY = pathlib.Path("/run/sub2api-gate")
 SYNC_IMAGE_STATE = STATE_DIRECTORY / "sync-image.json"
+SYNC_OPERATION_LOCK = STATE_DIRECTORY / "sync-operation.lock"
 DOCKER_SOCKET = pathlib.Path("/var/run/docker.sock")
 DOCKER_BINARY = "/usr/bin/docker"
 GIT_BINARY = "/usr/bin/git"
@@ -78,14 +88,17 @@ SYSTEMCTL_BINARY = "/usr/bin/systemctl"
 SAFE_SYSTEM_COMMAND_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 LOCAL_DOCKER_HOST = "unix:///var/run/docker.sock"
 DOCKER_SELECTOR_ENV_PREFIXES = ("DOCKER_", "BUILDKIT_", "BUILDX_")
-TARGET_NETWORK = "sub2api-gate-traffic-canary_traffic-canary-data"
-TARGET_POSTGRES = "sub2api-traffic-canary-postgres"
-TARGET_APP = "sub2api-traffic-canary"
-NONCE_REDIS = "sub2api-sync-canary-redis-nonce"
-NONCE_REDIS_SERVICE = "sync-canary-redis-nonce"
+TARGET_NETWORK = "sub2api-gate-release_sub2api-data"
+TARGET_POSTGRES = "sub2api-postgres"
+TARGET_APP = "sub2api"
+NONCE_REDIS = "sub2api-redis-nonce"
+NONCE_REDIS_SERVICE = "redis-nonce"
 CANARY_CONTAINER = "sub2api-sync-canary"
 STABLE_CONTAINER = "sub2api-sync-stable"
-LEGACY_UNIT = "sub2api-sync.service"
+LEGACY_SYNC_CONTAINER = "sub2api-sync"
+LEGACY_UNIT = "sub2api-sync-loopback-relay.service"
+LIVE_RELAY_UNIT = pathlib.Path("/etc/systemd/system") / LEGACY_UNIT
+LIVE_RELAY_SCRIPT = pathlib.Path("/usr/local/libexec/sub2api-sync-loopback-relay")
 SYNC_CANARY_PORT = 3022
 SYNC_STABLE_PORT = 3021
 MAX_COMMAND_OUTPUT = 128 * 1024
@@ -117,6 +130,11 @@ SQLSTATE_PATTERN = re.compile(r"[0-9A-DF-HJ-Z][0-9A-Z]{4}\Z")
 
 class CanaryError(RuntimeError):
     pass
+
+
+class TerminationRequested(CanaryError):
+    pass
+
 
 def _require_trusted_release_path(
     path, *, expects_directory, expects_executable, expected_uid
@@ -667,13 +685,11 @@ def validate_contract():
         'driver: "none"',
         '"127.0.0.1:3022:3021"',
         '"127.0.0.1:3021:3021"',
-        "SUB2API_SYNC_DATABASE_HOST: traffic-canary-postgres",
+        "SUB2API_SYNC_DATABASE_HOST: postgres",
         "SUB2API_SYNC_DATABASE_USER: sub2api_sync",
-        "SUB2API_INTERNAL_LOGIN_URL: http://sub2api-traffic-canary:8080/api/v1/auth/login",
-        "SUB2API_SYNC_REDIS_HOST: sync-canary-redis-nonce",
-        "source: /mnt/data/sub2api-gate/redis/nonce",
-        "create_host_path: false",
-        "name: sub2api-gate-traffic-canary_traffic-canary-data",
+        "SUB2API_INTERNAL_LOGIN_URL: http://sub2api:8080/api/v1/auth/login",
+        "SUB2API_SYNC_REDIS_HOST: redis-nonce",
+        "name: sub2api-gate-release_sub2api-data",
         "sub2api-gate.request-path: never-v1",
         f"image: {SYNC_IMAGE}",
         "pull_policy: never",
@@ -686,6 +702,7 @@ def validate_contract():
         "network_mode: host",
         "privileged: true",
         "build:",
+        "sync-canary-redis-nonce:",
     )
     if any(marker in source for marker in forbidden):
         raise CanaryError("sync canary Compose contract is unsafe")
@@ -796,19 +813,155 @@ def require_storage_layout():
             raise CanaryError("sync nonce storage has unsafe permissions")
 
 
+@contextmanager
+def sync_operation_lock(path=None):
+    path = SYNC_OPERATION_LOCK if path is None else pathlib.Path(path)
+    state_directory = path.parent
+    try:
+        state_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory = state_directory.lstat()
+    except OSError as error:
+        raise CanaryError("sync operation lock directory is unavailable") from error
+    if (
+        stat.S_ISLNK(directory.st_mode)
+        or not stat.S_ISDIR(directory.st_mode)
+        or directory.st_uid != STATE_UID
+        or directory.st_gid != STATE_GID
+        or stat.S_IMODE(directory.st_mode) != 0o700
+    ):
+        raise CanaryError("sync operation lock directory has unsafe permissions")
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise CanaryError("sync operation lock is unavailable") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != STATE_UID
+            or metadata.st_gid != STATE_GID
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise CanaryError("sync operation lock has unsafe permissions")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise CanaryError("another sync release operation is in progress") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def controlled_termination_signals():
+    previous = {}
+
+    def abort(_signum, _frame):
+        raise TerminationRequested("sync release operation was interrupted")
+
+    for signal_name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        signum = getattr(signal, signal_name, None)
+        if signum is None:
+            continue
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, abort)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+@contextmanager
+def deferred_termination_signals():
+    previous = {}
+
+    def defer(_signum, _frame):
+        return None
+
+    for signal_name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        signum = getattr(signal, signal_name, None)
+        if signum is None:
+            continue
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, defer)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def inspect_live_dependency(name, expected_service, *, runner=run_command):
+    template = (
+        "{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|"
+        "{{json .NetworkSettings.Networks}}|{{json .Config.Labels}}"
+    )
+    result = runner(["docker", "inspect", "--format", template, name], timeout=10)
+    parts = decoded_stdout(result).split("|", 3)
+    if len(parts) != 4:
+        raise CanaryError("live sync dependency identity is invalid")
+    running, health, networks_json, labels_json = parts
+    try:
+        networks = json.loads(networks_json or "{}")
+        labels = json.loads(labels_json or "{}")
+    except json.JSONDecodeError as error:
+        raise CanaryError("live sync dependency metadata could not be verified") from error
+    if (
+        running != "true"
+        or health != "healthy"
+        or set(networks) != (
+            {TARGET_NETWORK, "sub2api-gate-release_sub2api-egress"}
+            if name == TARGET_APP
+            else {TARGET_NETWORK}
+        )
+        or labels.get("com.docker.compose.project") != "sub2api-gate-release"
+        or labels.get("com.docker.compose.service") != expected_service
+    ):
+        raise CanaryError("live sync dependency runtime contract failed")
+    container_port = "8080/tcp" if name == TARGET_APP else (
+        "5432/tcp" if name == TARGET_POSTGRES else "6379/tcp"
+    )
+    published = decoded_stdout(
+        runner(["docker", "port", name, container_port], timeout=10)
+    )
+    expected = "127.0.0.1:8080" if name == TARGET_APP else ""
+    if published != expected:
+        raise CanaryError("live sync dependency port contract failed")
+
+
 def require_target_runtime(*, runner=run_command):
-    runner([sys.executable, str(TRAFFIC_CONTROLLER), "status"], timeout=30)
     result = runner(
-        ["docker", "network", "inspect", TARGET_NETWORK, "--format", "{{json .Containers}}"],
+        [
+            "docker", "network", "inspect", TARGET_NETWORK,
+            "--format", "{{.Internal}}|{{json .Containers}}",
+        ],
         timeout=10,
     )
     try:
-        containers = json.loads(decoded_stdout(result))
+        internal, containers_json = decoded_stdout(result).split("|", 1)
+        containers = json.loads(containers_json)
     except (TypeError, ValueError, json.JSONDecodeError) as error:
-        raise CanaryError("migrated target network could not be verified") from error
+        raise CanaryError("live sync network could not be verified") from error
     names = {str(item.get("Name") or "") for item in containers.values() if isinstance(item, dict)}
-    if not {TARGET_POSTGRES, TARGET_APP}.issubset(names):
-        raise CanaryError("migrated target network is missing required services")
+    required = {TARGET_POSTGRES, TARGET_APP, NONCE_REDIS, LEGACY_SYNC_CONTAINER}
+    if internal != "true":
+        raise CanaryError("live sync network is not internal")
+    if not required.issubset(names):
+        raise CanaryError("live sync network is missing required services")
+    for name, service in (
+        (TARGET_POSTGRES, "postgres"),
+        (TARGET_APP, "sub2api"),
+        (NONCE_REDIS, "redis-nonce"),
+    ):
+        inspect_live_dependency(name, service, runner=runner)
 
 
 def require_sync_role(*, runner=run_command):
@@ -871,7 +1024,7 @@ def inspect_sync_container(name, expected_port, expected_image_id, *, runner=run
         or read_only != "true"
         or log_driver != "none"
         or any("docker.sock" in str(binding) for binding in (binds or []))
-        or TARGET_NETWORK not in networks
+        or set(networks) != {TARGET_NETWORK}
         or labels.get("com.docker.compose.project") != "sub2api-gate-sync-canary"
         or labels.get("com.docker.compose.service") != expected_service
         or labels.get("sub2api-gate.request-path") != "never-v1"
@@ -938,7 +1091,7 @@ def inspect_nonce_redis(*, runner=run_command):
         or str(DATA_ROOT / "redis" / "nonce") not in sources
         or str(DATA_ROOT / "redis" / "nonce-users.acl") not in sources
         or TARGET_NETWORK not in networks
-        or labels.get("com.docker.compose.project") != "sub2api-gate-sync-canary"
+        or labels.get("com.docker.compose.project") != "sub2api-gate-release"
         or labels.get("com.docker.compose.service") != NONCE_REDIS_SERVICE
     ):
         raise CanaryError("sync nonce Redis runtime contract failed")
@@ -1155,7 +1308,6 @@ def start_profile(env_file, profile, service, environment, *, runner=run_command
             "--no-build",
             "--pull",
             "never",
-            NONCE_REDIS_SERVICE,
             service,
         ),
         timeout=180,
@@ -1172,12 +1324,185 @@ def stop_service(env_file, profile, service, environment, *, runner=run_command)
 
 
 def systemctl(action, *, runner=run_command):
+    if action not in {"start", "stop", "enable", "disable"}:
+        raise CanaryError("unsupported sync relay service action")
     return runner(["systemctl", action, LEGACY_UNIT], timeout=30)
+
+
+def container_action(action, name, *, runner=run_command):
+    if name != LEGACY_SYNC_CONTAINER or action not in {"start", "stop"}:
+        raise CanaryError("unsupported legacy sync container action")
+    command = ["docker", action]
+    if action == "stop":
+        command.extend(("--time", "15"))
+    command.append(name)
+    runner(command, timeout=30)
+
+
+def _require_reviewed_live_file(
+    live_path,
+    reviewed_relative_path,
+    expected_mode,
+    *,
+    expected_uid=0,
+    expected_gid=0,
+):
+    reviewed_path = ROOT / reviewed_relative_path
+    try:
+        metadata = live_path.lstat()
+        live_content = live_path.read_bytes()
+        reviewed_content = reviewed_path.read_bytes()
+    except OSError as error:
+        raise CanaryError("legacy sync relay file is unavailable") from error
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or metadata.st_gid != expected_gid
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != expected_mode
+        or not hmac.compare_digest(live_content, reviewed_content)
+    ):
+        raise CanaryError("legacy sync relay file does not match the reviewed release")
+
+
+def require_legacy_relay(
+    *, expected_active=True, expected_enabled=True, runner=run_command
+):
+    _require_reviewed_live_file(LIVE_RELAY_UNIT, RELAY_UNIT_RELATIVE_PATH, 0o644)
+    _require_reviewed_live_file(LIVE_RELAY_SCRIPT, RELAY_SCRIPT_RELATIVE_PATH, 0o755)
+    result = runner(
+        [
+            "systemctl", "show", LEGACY_UNIT,
+            "--property=ActiveState", "--property=SubState",
+            "--property=UnitFileState", "--property=FragmentPath",
+            "--property=User", "--property=NeedDaemonReload",
+        ],
+        timeout=10,
+    )
+    fields = {}
+    for line in decoded_stdout(result).splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in fields:
+            raise CanaryError("legacy sync relay service metadata is invalid")
+        fields[key] = value
+    active = fields.get("ActiveState") == "active" and fields.get("SubState") == "running"
+    enabled = fields.get("UnitFileState") == "enabled"
+    if (
+        set(fields) != {
+            "ActiveState", "SubState", "UnitFileState", "FragmentPath", "User",
+            "NeedDaemonReload",
+        }
+        or fields.get("FragmentPath") != str(LIVE_RELAY_UNIT)
+        or fields.get("User") != ""
+        or fields.get("NeedDaemonReload") != "no"
+        or active != expected_active
+        or enabled != expected_enabled
+    ):
+        raise CanaryError("legacy sync relay service runtime contract failed")
+    return active
+
+
+def inspect_legacy_sync_container(
+    expected_running, *, expected_id=None, runner=run_command
+):
+    template = (
+        "{{.Id}}|{{.Image}}|{{.Config.Image}}|{{.State.Running}}|"
+        "{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.Config.User}}|"
+        "{{.HostConfig.ReadonlyRootfs}}|{{.HostConfig.LogConfig.Type}}|"
+        "{{json .HostConfig.Binds}}|{{json .NetworkSettings.Networks}}|"
+        "{{json .Config.Labels}}"
+    )
+    result = runner(
+        ["docker", "inspect", "--format", template, LEGACY_SYNC_CONTAINER],
+        timeout=10,
+    )
+    parts = decoded_stdout(result).split("|", 10)
+    if len(parts) != 11:
+        raise CanaryError("legacy sync container identity is invalid")
+    (
+        container_id, image_id, configured_image, running, health, user,
+        read_only, log_driver, binds_json, networks_json, labels_json,
+    ) = parts
+    try:
+        binds = json.loads(binds_json or "[]")
+        networks = json.loads(networks_json or "{}")
+        labels = json.loads(labels_json or "{}")
+    except json.JSONDecodeError as error:
+        raise CanaryError("legacy sync container metadata could not be verified") from error
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", container_id)
+        or (expected_id is not None and container_id != expected_id)
+        or not IMAGE_ID_PATTERN.fullmatch(image_id)
+        or configured_image != SYNC_IMAGE
+        or (running == "true") != expected_running
+        or (expected_running and health != "healthy")
+        or user != "65532:65532"
+        or read_only != "true"
+        or log_driver != "none"
+        or any("docker.sock" in str(binding) for binding in (binds or []))
+        or set(networks) != {TARGET_NETWORK}
+        or labels.get("com.docker.compose.project") != "sub2api-gate-release"
+        or labels.get("com.docker.compose.service") != "sub2api-sync"
+    ):
+        raise CanaryError("legacy sync container runtime contract failed")
+    published = decoded_stdout(
+        runner(["docker", "port", LEGACY_SYNC_CONTAINER, "3021/tcp"], timeout=10)
+    )
+    if published:
+        raise CanaryError("legacy sync container unexpectedly publishes a host port")
+    return container_id
+
+
+def wait_for_legacy_sync(
+    expected_id, *, runner=run_command, clock=time.monotonic, sleeper=time.sleep
+):
+    deadline = clock() + 75
+    while True:
+        try:
+            inspect_legacy_sync_container(
+                True, expected_id=expected_id, runner=runner
+            )
+            return
+        except CanaryError:
+            if clock() >= deadline:
+                raise CanaryError("legacy sync container did not become healthy")
+            sleeper(1)
+
+
+def recover_legacy(
+    env_file, environment, secret, legacy_id, *, runner=run_command
+):
+    stop_service(
+        env_file, "sync-stable", STABLE_CONTAINER, environment, runner=runner
+    )
+    try:
+        inspect_legacy_sync_container(
+            True, expected_id=legacy_id, runner=runner
+        )
+    except CanaryError:
+        inspect_legacy_sync_container(
+            False, expected_id=legacy_id, runner=runner
+        )
+        container_action("start", LEGACY_SYNC_CONTAINER, runner=runner)
+        wait_for_legacy_sync(legacy_id, runner=runner)
+    systemctl("enable", runner=runner)
+    systemctl("start", runner=runner)
+    require_legacy_relay(
+        expected_active=True, expected_enabled=True, runner=runner
+    )
+    verify_signed_status(SYNC_STABLE_PORT, secret)
 
 
 def start_canary(env_file, environment, secret, expected_image_id, *, runner=run_command):
     require_target_runtime(runner=runner)
     require_sync_role(runner=runner)
+    inspect_nonce_redis(runner=runner)
+    require_legacy_relay(
+        expected_active=True, expected_enabled=True, runner=runner
+    )
+    inspect_legacy_sync_container(True, runner=runner)
+    verify_signed_status(SYNC_STABLE_PORT, secret)
     try:
         start_profile(env_file, "sync-canary", CANARY_CONTAINER, environment, runner=runner)
         wait_for_container(
@@ -1188,25 +1513,20 @@ def start_canary(env_file, environment, secret, expected_image_id, *, runner=run
         )
         inspect_nonce_redis(runner=runner)
         verify_signed_status(SYNC_CANARY_PORT, secret)
-    except Exception:
-        for service in (CANARY_CONTAINER, NONCE_REDIS_SERVICE):
+    except (Exception, KeyboardInterrupt):
+        with deferred_termination_signals():
             try:
-                stop_service(env_file, "sync-canary", service, environment, runner=runner)
+                stop_service(
+                    env_file, "sync-canary", CANARY_CONTAINER, environment, runner=runner
+                )
             except CanaryError:
                 pass
         raise CanaryError("sync canary start failed and temporary services were stopped")
 
 
-def require_legacy_service(*, runner=run_command):
-    runner(["systemctl", "is-active", "--quiet", LEGACY_UNIT], timeout=10)
-    result = runner(
-        ["systemctl", "show", "--property=User", "--value", LEGACY_UNIT], timeout=10
-    )
-    if decoded_stdout(result) not in {"", "root"}:
-        raise CanaryError("legacy sync service is not the reviewed root service")
-
-
 def promote(env_file, environment, secret, expected_image_id, *, runner=run_command):
+    require_target_runtime(runner=runner)
+    require_sync_role(runner=runner)
     inspect_sync_container(
         CANARY_CONTAINER,
         SYNC_CANARY_PORT,
@@ -1215,10 +1535,15 @@ def promote(env_file, environment, secret, expected_image_id, *, runner=run_comm
     )
     inspect_nonce_redis(runner=runner)
     verify_signed_status(SYNC_CANARY_PORT, secret)
-    require_legacy_service(runner=runner)
-    systemctl("stop", runner=runner)
-    legacy_stopped = True
+    require_legacy_relay(
+        expected_active=True, expected_enabled=True, runner=runner
+    )
+    legacy_id = inspect_legacy_sync_container(True, runner=runner)
     try:
+        systemctl("stop", runner=runner)
+        require_legacy_relay(
+            expected_active=False, expected_enabled=True, runner=runner
+        )
         require_port_free(SYNC_STABLE_PORT)
         start_profile(env_file, "sync-stable", STABLE_CONTAINER, environment, runner=runner)
         wait_for_container(
@@ -1228,30 +1553,34 @@ def promote(env_file, environment, secret, expected_image_id, *, runner=run_comm
             runner=runner,
         )
         verify_signed_status(SYNC_STABLE_PORT, secret)
-    except Exception:
-        try:
-            stop_service(env_file, "sync-stable", STABLE_CONTAINER, environment, runner=runner)
-        except CanaryError:
-            pass
-        if legacy_stopped:
-            try:
-                systemctl("start", runner=runner)
-            except CanaryError:
-                pass
-        raise CanaryError("stable sync cutover failed and legacy recovery was attempted")
-    try:
+        stop_service(
+            env_file, "sync-canary", CANARY_CONTAINER, environment, runner=runner
+        )
+        container_action("stop", LEGACY_SYNC_CONTAINER, runner=runner)
+        inspect_legacy_sync_container(
+            False, expected_id=legacy_id, runner=runner
+        )
         systemctl("disable", runner=runner)
-    except CanaryError:
+        require_legacy_relay(
+            expected_active=False, expected_enabled=False, runner=runner
+        )
+    except (Exception, KeyboardInterrupt) as cutover_error:
         try:
-            stop_service(env_file, "sync-stable", STABLE_CONTAINER, environment, runner=runner)
-            systemctl("start", runner=runner)
-        except CanaryError:
-            pass
-        raise CanaryError("legacy sync disable failed and legacy recovery was attempted")
-    stop_service(env_file, "sync-canary", CANARY_CONTAINER, environment, runner=runner)
+            with deferred_termination_signals():
+                recover_legacy(
+                    env_file, environment, secret, legacy_id, runner=runner
+                )
+        except (Exception, KeyboardInterrupt) as recovery_error:
+            raise CanaryError(
+                "stable sync cutover failed and legacy recovery failed"
+            ) from recovery_error
+        raise CanaryError(
+            "stable sync cutover failed; verified legacy recovery restored 3021"
+        ) from cutover_error
 
 
 def rollback(env_file, environment, secret, expected_image_id, *, runner=run_command):
+    require_target_runtime(runner=runner)
     inspect_sync_container(
         STABLE_CONTAINER,
         SYNC_STABLE_PORT,
@@ -1260,24 +1589,41 @@ def rollback(env_file, environment, secret, expected_image_id, *, runner=run_com
     )
     inspect_nonce_redis(runner=runner)
     verify_signed_status(SYNC_STABLE_PORT, secret)
-    stop_service(env_file, "sync-stable", STABLE_CONTAINER, environment, runner=runner)
+    require_legacy_relay(
+        expected_active=False, expected_enabled=False, runner=runner
+    )
+    legacy_id = inspect_legacy_sync_container(False, runner=runner)
     try:
+        stop_service(env_file, "sync-stable", STABLE_CONTAINER, environment, runner=runner)
+        container_action("start", LEGACY_SYNC_CONTAINER, runner=runner)
+        wait_for_legacy_sync(legacy_id, runner=runner)
         systemctl("enable", runner=runner)
         systemctl("start", runner=runner)
-        verify_signed_status(SYNC_STABLE_PORT, secret)
-    except Exception:
-        try:
-            systemctl("stop", runner=runner)
-        except CanaryError:
-            pass
-        start_profile(env_file, "sync-stable", STABLE_CONTAINER, environment, runner=runner)
-        wait_for_container(
-            STABLE_CONTAINER,
-            SYNC_STABLE_PORT,
-            expected_image_id,
-            runner=runner,
+        require_legacy_relay(
+            expected_active=True, expected_enabled=True, runner=runner
         )
-        raise CanaryError("legacy sync recovery failed; stable container was restored")
+        verify_signed_status(SYNC_STABLE_PORT, secret)
+    except (Exception, KeyboardInterrupt) as recovery_error:
+        with deferred_termination_signals():
+            try:
+                systemctl("stop", runner=runner)
+            except CanaryError:
+                pass
+            try:
+                container_action("stop", LEGACY_SYNC_CONTAINER, runner=runner)
+            except CanaryError:
+                pass
+            start_profile(env_file, "sync-stable", STABLE_CONTAINER, environment, runner=runner)
+            wait_for_container(
+                STABLE_CONTAINER,
+                SYNC_STABLE_PORT,
+                expected_image_id,
+                runner=runner,
+            )
+            verify_signed_status(SYNC_STABLE_PORT, secret)
+        raise CanaryError(
+            "legacy sync recovery failed; stable container was restored"
+        ) from recovery_error
 
 
 def parser():
@@ -1340,9 +1686,10 @@ def main(argv=None, *, runner=run_command, stdin=sys.stdin, stdout=sys.stdout, s
             print_diagnostic(SYNC_STABLE_PORT, secret, options.request_id, stdout=stdout)
             return 0
 
-        runner([str(CLEAN_WORKTREE)], timeout=15)
         if options.action == "prepare-image":
-            prepare_sync_image(runner=runner)
+            with sync_operation_lock():
+                runner([str(CLEAN_WORKTREE)], timeout=15)
+                prepare_sync_image(runner=runner)
             print(
                 "sync canary prepare-image completed; exact image identity was recorded",
                 file=stdout,
@@ -1350,54 +1697,70 @@ def main(argv=None, *, runner=run_command, stdin=sys.stdin, stdout=sys.stdout, s
             return 0
         if options.env_file is None or not options.env_file.is_absolute():
             raise CanaryError("an absolute private --env-file is required")
-        private_values = parse_private_env(options.env_file)
-        environment = compose_environment(private_values)
-        require_storage_layout()
-        runner(compose_command(options.env_file, "sync-canary", "config", "--quiet"), timeout=30, environment=environment)
-        expected_image_id = require_prebuilt_sync_image(runner=runner)
+        with sync_operation_lock():
+            runner([str(CLEAN_WORKTREE)], timeout=15)
+            private_values = parse_private_env(options.env_file)
+            environment = compose_environment(private_values)
+            require_storage_layout()
+            runner(
+                compose_command(
+                    options.env_file, "sync-canary", "config", "--quiet"
+                ),
+                timeout=30,
+                environment=environment,
+            )
+            expected_image_id = require_prebuilt_sync_image(runner=runner)
 
-        if options.action == "status":
-            require_target_runtime(runner=runner)
-            print("sync target runtime is available; no service was changed", file=stdout)
-            return 0
+            if options.action == "status":
+                require_target_runtime(runner=runner)
+                inspect_nonce_redis(runner=runner)
+                print(
+                    "sync live runtime is available; no service was changed",
+                    file=stdout,
+                )
+                return 0
 
-        secret = prompt_secret(secret_reader)
-        if not hmac.compare_digest(secret, private_values["SUB2API_SYNC_SECRET"]):
-            raise CanaryError("provided sync HMAC secret does not match the private environment")
-        if options.action == "start":
-            start_canary(
-                options.env_file,
-                environment,
-                secret,
-                expected_image_id,
-                runner=runner,
-            )
-        elif options.action == "verify":
-            require_sync_role(runner=runner)
-            inspect_sync_container(
-                CANARY_CONTAINER,
-                SYNC_CANARY_PORT,
-                expected_image_id,
-                runner=runner,
-            )
-            inspect_nonce_redis(runner=runner)
-            verify_signed_status(SYNC_CANARY_PORT, secret)
-        elif options.action == "promote":
-            promote(
-                options.env_file,
-                environment,
-                secret,
-                expected_image_id,
-                runner=runner,
-            )
-        elif options.action == "rollback":
-            rollback(
-                options.env_file,
-                environment,
-                secret,
-                expected_image_id,
-                runner=runner,
-            )
+            secret = prompt_secret(secret_reader)
+            if not hmac.compare_digest(secret, private_values["SUB2API_SYNC_SECRET"]):
+                raise CanaryError("provided sync HMAC secret does not match the private environment")
+            if options.action == "start":
+                with controlled_termination_signals():
+                    start_canary(
+                        options.env_file,
+                        environment,
+                        secret,
+                        expected_image_id,
+                        runner=runner,
+                    )
+            elif options.action == "verify":
+                require_target_runtime(runner=runner)
+                require_sync_role(runner=runner)
+                inspect_sync_container(
+                    CANARY_CONTAINER,
+                    SYNC_CANARY_PORT,
+                    expected_image_id,
+                    runner=runner,
+                )
+                inspect_nonce_redis(runner=runner)
+                verify_signed_status(SYNC_CANARY_PORT, secret)
+            elif options.action == "promote":
+                with controlled_termination_signals():
+                    promote(
+                        options.env_file,
+                        environment,
+                        secret,
+                        expected_image_id,
+                        runner=runner,
+                    )
+            elif options.action == "rollback":
+                with controlled_termination_signals():
+                    rollback(
+                        options.env_file,
+                        environment,
+                        secret,
+                        expected_image_id,
+                        runner=runner,
+                    )
         print(f"sync canary {options.action} completed", file=stdout)
         return 0
     except CanaryError as error:

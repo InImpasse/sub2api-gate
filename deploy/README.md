@@ -101,9 +101,9 @@ docker compose --env-file .env.example \
   -f docker-compose.postgres-migration.yml \
   --profile traffic-canary config --quiet
 docker compose --env-file .env.example \
-  -f docker-compose.sync-canary.yml \
+  -f docker-compose.nonce-canary.yml \
   -f docker-compose.redis-migration.yml \
-  --profile sync-canary config --quiet
+  --profile nonce-canary config --quiet
 git diff --check
 bash ./deploy/check-release-candidate.sh
 ```
@@ -956,12 +956,21 @@ destruction lifecycle.
 
 The provisioning service has its own Compose project in
 `docker-compose.sync-canary.yml`; it is never part of the traffic-canary
-Compose file and never participates in `/v1/*`. It joins only the migrated
-target's internal data network, uses the fixed `sub2api_sync` PostgreSQL role,
-and publishes the canary on `127.0.0.1:3022`. Its Redis accepts only persisted
-HMAC nonce markers from the target `/mnt/data/sub2api-gate/redis/nonce`
-directory. Both sync containers run as UID/GID 65532 with a read-only root,
-discarded Docker logs, no capabilities, no Docker socket, and zero core dumps.
+Compose file and never participates in `/v1/*`. It joins only the active
+`sub2api-gate-release_sub2api-data` internal network, uses the existing
+`sub2api-postgres`, `sub2api`, and nonce-only `sub2api-redis-nonce` containers,
+and publishes the canary on `127.0.0.1:3022`. It never creates a second Redis
+or attaches to the Sub2API egress network. Both sync containers run as UID/GID
+65532 with a read-only root, discarded Docker logs, no capabilities, no Docker
+socket, and zero core dumps.
+
+The pre-release topology is one un-published `sub2api-sync` container on that
+internal network plus the root-owned
+`sub2api-sync-loopback-relay.service`, which binds host loopback `3021` through
+the reviewed `socat` relay. The controller requires the installed unit and
+relay script to match `deploy/systemd/sub2api-sync-loopback-relay.service` and
+`deploy/sub2api-sync-loopback-relay` byte-for-byte, with modes `0644` and
+`0755`. It also verifies the exact legacy container ID and runtime contract.
 
 The default controller mode is offline and reads no private file:
 
@@ -990,15 +999,16 @@ The command in the local release-gate list intentionally exercises the
 non-mutating dry-run. The root `--apply` command above is the only supported
 release build path; the runtime Compose files contain no sync build definition.
 
-Only after that preparation and after the migrated-target traffic canary is
+Only after that preparation and after the active production dependencies are
 healthy, run the canary from a private root TTY. The controller rejects a
 missing, replaced, or differently built image and a Git revision mismatch
 before starting or stopping a service. It always passes `--no-build --pull
-never` to Compose. It also requires the exact root-owned `/mnt/data` nonce
-layout, validates the target Compose network and least-privilege role, then
-prompts for the HMAC secret without placing it in an argument or file of its
-own. Its random read-only `status` probe must succeed, and replaying the same
-signed request must return 401 before the canary passes.
+never` to Compose. It holds a nonblocking root-owned mode-0600 operation lock,
+requires the exact root-owned `/mnt/data` nonce layout, validates the live
+Compose network and least-privilege role, then prompts for the HMAC secret
+without placing it in an argument or file of its own. Its random read-only
+`status` probe must succeed, and replaying the same signed request must return
+401 before the canary passes.
 
 ```bash
 sudo python3 deploy/sync-canary.py start --apply \
@@ -1024,22 +1034,26 @@ prints database stderr, SQL, request data, credentials, or response content.
 `diagnostics` queries the active loopback `3021` service directly and is not a
 traffic-canary status command.
 
-Promotion stops only the fixed legacy `sub2api-sync.service`, confirms loopback
-3021 is free, starts the reviewed container on `127.0.0.1:3021`, repeats the
-signed status and Redis replay probes, disables the legacy unit, and finally
-stops the 3022 canary. Any failure before the new service is verified stops the
-new container and attempts to restart the legacy service. It does not invoke
-Nginx, edit an upstream, or stop the Sub2API traffic containers.
+Promotion first proves the `3022` candidate, the live dependencies, the relay,
+and the exact legacy container. It then stops only the relay, confirms loopback
+`3021` is free, starts and proves the reviewed stable container on `3021`,
+stops the `3022` canary, stops the old `sub2api-sync` container, and disables
+the relay. A failure or SIGINT/SIGTERM/SIGHUP anywhere in that mutation window
+stops the candidate stable container, restores the same recorded legacy
+container ID, enables and starts the relay, and verifies signed `3021` status;
+additional termination signals are deferred until recovery finishes. It does
+not invoke Nginx, edit an upstream, or stop PostgreSQL, Redis, or Sub2API.
 
 ```bash
 sudo python3 deploy/sync-canary.py promote --apply \
   --env-file /path/to/private.env
 ```
 
-Before forward-only legacy data destruction, an explicitly approved rollback
-stops the stable sync container, enables and starts the legacy unit, and
-requires a signed status probe. If that probe fails, the controller restores
-the stable container on 3021. Rollback never changes `/v1/*`.
+Before removing the stopped legacy container, an explicitly approved rollback
+stops the stable sync container, starts and verifies the exact old container,
+then enables and starts the relay and requires a signed status probe. If any
+part fails, the controller stops the legacy path and restores the stable
+container on `3021`. Rollback never changes `/v1/*`.
 
 ```bash
 sudo python3 deploy/sync-canary.py rollback --apply \

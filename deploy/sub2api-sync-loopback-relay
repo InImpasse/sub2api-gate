@@ -1,0 +1,44 @@
+#!/bin/bash
+set -euo pipefail
+
+docker=/usr/bin/docker
+socat=/usr/bin/socat
+container=sub2api-sync
+
+resolve_ip() {
+  local ip
+  ip="$($docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$container" 2>/dev/null || true)"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  printf '%s\n' "$ip"
+}
+
+relay_pid=''
+stop_relay() {
+  if [[ -n "$relay_pid" ]]; then
+    kill -TERM "$relay_pid" 2>/dev/null || true
+    wait "$relay_pid" 2>/dev/null || true
+    relay_pid=''
+  fi
+}
+trap 'stop_relay; exit 0' TERM INT
+
+while true; do
+  ip="$(resolve_ip || true)"
+  if [[ -z "$ip" ]]; then
+    sleep 3
+    continue
+  fi
+
+  "$socat" TCP-LISTEN:3021,bind=127.0.0.1,reuseaddr,fork "TCP:${ip}:3021" &
+  relay_pid=$!
+  while kill -0 "$relay_pid" 2>/dev/null; do
+    sleep 3
+    current_ip="$(resolve_ip || true)"
+    if [[ "$current_ip" != "$ip" ]] || ! "$docker" exec "$container" python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3021/healthz', timeout=2)" >/dev/null 2>&1; then
+      stop_relay
+      break
+    fi
+  done
+  stop_relay
+  sleep 1
+done

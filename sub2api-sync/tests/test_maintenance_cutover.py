@@ -145,7 +145,7 @@ class RollbackRunner:
             self.events.append("down:traffic")
             self.traffic_targets.clear()
             return self.tool.CommandResult(0)
-        if "down" in argv and str(self.tool.SYNC_COMPOSE_FILE) in argv:
+        if "down" in argv and str(self.tool.NONCE_COMPOSE_FILE) in argv:
             self.events.append("down:nonce")
             self.nonce_targets.clear()
             return self.tool.CommandResult(0)
@@ -2019,14 +2019,26 @@ class MaintenanceCutoverTests(unittest.TestCase):
         self.assertIn("create_host_path: false", source)
         self.assertNotIn("0.0.0.0", source)
 
+    def test_nonce_canary_is_isolated_from_the_live_sync_release(self):
+        source = (ROOT / "docker-compose.nonce-canary.yml").read_text()
+        self.assertIn("name: sub2api-gate-nonce-canary", source)
+        self.assertIn(
+            "name: sub2api-gate-traffic-canary_traffic-canary-data", source
+        )
+        self.assertIn("pull_policy: never", source)
+        self.assertNotIn("ports:", source)
+        self.assertNotIn("sub2api-gate-release_sub2api-data", source)
+        self.assertNotIn("network_mode: host", source)
+        self.assertNotIn("privileged: true", source)
+
     def test_merged_nonce_migration_compose_has_one_loopback_port_and_one_acl_mount(self):
         result = __import__("subprocess").run(
             [
                 "docker", "compose",
                 "--env-file", str(ROOT / ".env.example"),
-                "-f", str(ROOT / "docker-compose.sync-canary.yml"),
+                "-f", str(ROOT / "docker-compose.nonce-canary.yml"),
                 "-f", str(REDIS_MIGRATION_COMPOSE),
-                "--profile", "sync-canary",
+                "--profile", "nonce-canary",
                 "config", "--format", "json",
             ],
             cwd=ROOT,
