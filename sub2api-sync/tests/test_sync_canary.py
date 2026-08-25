@@ -209,6 +209,7 @@ class SyncCanaryToolTests(unittest.TestCase):
         for argv in (
             ["check"],
             ["prepare-image"],
+            ["reattest-image"],
             ["start"],
             ["promote"],
             ["rollback"],
@@ -879,6 +880,117 @@ class SyncCanaryToolTests(unittest.TestCase):
         self.assertEqual(inspect_image.call_count, 2)
         write_state.assert_called_once_with(image_id, git_head)
 
+    def test_reattest_reuses_exact_running_image_when_inputs_are_unchanged(self):
+        image_id = "sha256:" + "a" * 64
+        old_head = "b" * 40
+        new_head = "c" * 40
+        commands = []
+
+        def runner(command, **_kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+        with mock.patch.object(
+            self.tool,
+            "read_image_state",
+            return_value={
+                "version": 1,
+                "image": self.tool.SYNC_IMAGE,
+                "image_id": image_id,
+                "git_head": old_head,
+            },
+        ), mock.patch.object(
+            self.tool, "current_git_head", return_value=new_head
+        ), mock.patch.object(
+            self.tool, "inspect_local_sync_image", return_value=image_id
+        ) as inspect_image, mock.patch.object(
+            self.tool, "inspect_sync_container"
+        ) as inspect_stable, mock.patch.object(
+            self.tool, "require_relay"
+        ) as require_relay, mock.patch.object(
+            self.tool, "require_legacy_relay"
+        ) as require_legacy, mock.patch.object(
+            self.tool, "inspect_legacy_sync_container"
+        ) as inspect_legacy, mock.patch.object(
+            self.tool, "write_image_state"
+        ) as write_state:
+            self.assertEqual(
+                self.tool.reattest_sync_image(runner=runner), image_id
+            )
+
+        self.assertEqual(commands[0], [
+            "git", "merge-base", "--is-ancestor", old_head, new_head,
+        ])
+        self.assertEqual(commands[1][:7], [
+            "git", "diff", "--quiet", "--no-ext-diff", "--no-textconv",
+            old_head, new_head,
+        ])
+        self.assertEqual(
+            commands[1][8:],
+            [str(path) for path in self.tool.SYNC_IMAGE_INPUT_RELATIVE_PATHS],
+        )
+        inspect_image.assert_called_once_with(
+            self.tool.SYNC_IMAGE,
+            expected_id=image_id,
+            runner=runner,
+        )
+        inspect_stable.assert_called_once_with(
+            self.tool.STABLE_CONTAINER,
+            self.tool.SYNC_STABLE_PORT,
+            image_id,
+            runner=runner,
+        )
+        require_relay.assert_has_calls([
+            mock.call(
+                self.tool.STABLE_RELAY_UNIT,
+                expected_active=True,
+                expected_enabled=True,
+                runner=runner,
+            ),
+            mock.call(
+                self.tool.CANARY_RELAY_UNIT,
+                expected_active=False,
+                expected_enabled=False,
+                runner=runner,
+            ),
+        ])
+        require_legacy.assert_called_once_with(
+            expected_active=False,
+            expected_enabled=False,
+            runner=runner,
+        )
+        inspect_legacy.assert_called_once_with(False, runner=runner)
+        write_state.assert_called_once_with(image_id, new_head)
+
+    def test_reattest_rejects_changed_image_inputs_without_updating_state(self):
+        state = {
+            "version": 1,
+            "image": self.tool.SYNC_IMAGE,
+            "image_id": "sha256:" + "a" * 64,
+            "git_head": "b" * 40,
+        }
+        runner = mock.Mock(side_effect=[
+            subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
+            self.tool.CanaryError("image inputs changed"),
+        ])
+
+        with mock.patch.object(
+            self.tool, "read_image_state", return_value=state
+        ), mock.patch.object(
+            self.tool, "current_git_head", return_value="c" * 40
+        ), mock.patch.object(
+            self.tool, "inspect_local_sync_image"
+        ) as inspect_image, mock.patch.object(
+            self.tool, "write_image_state"
+        ) as write_state:
+            with self.assertRaisesRegex(
+                self.tool.CanaryError, "image inputs changed"
+            ):
+                self.tool.reattest_sync_image(runner=runner)
+
+        inspect_image.assert_not_called()
+        write_state.assert_not_called()
+
     def test_prebuilt_image_rejects_a_different_git_revision(self):
         with mock.patch.object(
             self.tool,
@@ -935,6 +1047,37 @@ class SyncCanaryToolTests(unittest.TestCase):
                 clock=mock.Mock(side_effect=[0, 15]),
                 sleeper=lambda _seconds: None,
                 connector=mock.Mock(side_effect=OSError("unavailable")),
+            )
+
+    def test_port_release_wait_retries_before_cutover(self):
+        checker = mock.Mock(side_effect=[
+            self.tool.CanaryError("occupied"),
+            None,
+        ])
+        sleeper = mock.Mock()
+
+        self.tool.wait_for_port_free(
+            self.tool.SYNC_STABLE_PORT,
+            clock=mock.Mock(side_effect=[0, 0]),
+            sleeper=sleeper,
+            checker=checker,
+        )
+
+        self.assertEqual(checker.call_count, 2)
+        sleeper.assert_called_once_with(0.25)
+
+    def test_port_release_wait_is_bounded_and_rejects_unknown_ports(self):
+        with self.assertRaisesRegex(self.tool.CanaryError, "port is invalid"):
+            self.tool.wait_for_port_free(8080, checker=mock.Mock())
+
+        with self.assertRaisesRegex(self.tool.CanaryError, "did not become free"):
+            self.tool.wait_for_port_free(
+                self.tool.SYNC_STABLE_PORT,
+                clock=mock.Mock(side_effect=[0, 15]),
+                sleeper=lambda _seconds: None,
+                checker=mock.Mock(
+                    side_effect=self.tool.CanaryError("occupied")
+                ),
             )
 
     def test_start_canary_starts_loopback_relay_before_signed_probe(self):
@@ -1116,6 +1259,24 @@ class SyncCanaryToolTests(unittest.TestCase):
             container_id,
         )
 
+        fields = metadata.decode().split("|")
+        fields[3] = "false"
+        fields[4] = ""
+        fields[9] = json.dumps({})
+        metadata = "|".join(fields).encode()
+        self.assertEqual(
+            self.tool.inspect_legacy_sync_container(False, runner=runner),
+            container_id,
+        )
+
+        fields = metadata.decode().split("|")
+        fields[9] = json.dumps({
+            "3021/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3021"}]
+        })
+        metadata = "|".join(fields).encode()
+        with self.assertRaisesRegex(self.tool.CanaryError, "runtime contract"):
+            self.tool.inspect_legacy_sync_container(False, runner=runner)
+
     def test_nonce_runtime_requires_exact_memory_and_noeviction_command(self):
         labels = {
             "com.docker.compose.project": "sub2api-gate-release",
@@ -1175,7 +1336,7 @@ class SyncCanaryToolTests(unittest.TestCase):
              mock.patch.object(self.tool, "wait_for_legacy_sync"), \
              mock.patch.object(self.tool, "wait_for_loopback"), \
              mock.patch.object(self.tool, "systemctl", side_effect=systemctl), \
-             mock.patch.object(self.tool, "require_port_free", side_effect=lambda _port: events.append(("port", 3021))), \
+             mock.patch.object(self.tool, "wait_for_port_free", side_effect=lambda _port: events.append(("port", 3021))), \
              mock.patch.object(self.tool, "start_profile", side_effect=start_profile), \
              mock.patch.object(self.tool, "stop_service"):
             with self.assertRaisesRegex(self.tool.CanaryError, "recovery"):
@@ -1190,6 +1351,43 @@ class SyncCanaryToolTests(unittest.TestCase):
         self.assertEqual(events[0], legacy_stop)
         self.assertIn(("systemctl", "start", self.tool.LEGACY_UNIT), events)
         self.assertLess(events.index(legacy_stop), events.index(("port", 3021)))
+
+    def test_legacy_recovery_waits_for_stable_port_release(self):
+        events = []
+
+        def systemctl(action, unit=self.tool.LEGACY_UNIT, **_kwargs):
+            events.append(("systemctl", action, unit))
+
+        with mock.patch.object(self.tool, "systemctl", side_effect=systemctl), \
+             mock.patch.object(self.tool, "require_relay"), \
+             mock.patch.object(
+                 self.tool,
+                 "wait_for_port_free",
+                 side_effect=lambda port: events.append(("port-free", port)),
+             ), mock.patch.object(
+                 self.tool,
+                 "stop_service",
+                 side_effect=lambda _env, _profile, service, _environment, **_kwargs: events.append(("stop", service)),
+             ), mock.patch.object(
+                 self.tool,
+                 "inspect_legacy_sync_container",
+                 return_value="b" * 64,
+             ), mock.patch.object(self.tool, "require_legacy_relay"), \
+             mock.patch.object(self.tool, "wait_for_loopback"), \
+             mock.patch.object(self.tool, "verify_signed_status"):
+            self.tool.recover_legacy(
+                pathlib.Path("/private/env"),
+                {},
+                "s" * 32,
+                "b" * 64,
+                runner=lambda *_args, **_kwargs: None,
+            )
+
+        relay_stop = ("systemctl", "stop", self.tool.STABLE_RELAY_UNIT)
+        port_free = ("port-free", self.tool.SYNC_STABLE_PORT)
+        stable_stop = ("stop", self.tool.STABLE_CONTAINER)
+        self.assertLess(events.index(relay_stop), events.index(port_free))
+        self.assertLess(events.index(port_free), events.index(stable_stop))
 
     def test_promote_preserves_identity_and_orders_the_successful_cutover(self):
         events = []
@@ -1208,7 +1406,7 @@ class SyncCanaryToolTests(unittest.TestCase):
              mock.patch.object(self.tool, "require_relay"), \
              mock.patch.object(self.tool, "inspect_legacy_sync_container", side_effect=inspect_legacy), \
              mock.patch.object(self.tool, "systemctl", side_effect=lambda action, unit=self.tool.LEGACY_UNIT, **_kwargs: events.append(("systemctl", action, unit))), \
-             mock.patch.object(self.tool, "require_port_free", side_effect=lambda port: events.append(("port-free", port))), \
+             mock.patch.object(self.tool, "wait_for_port_free", side_effect=lambda port: events.append(("port-free", port))), \
              mock.patch.object(self.tool, "wait_for_loopback", side_effect=lambda port: events.append(("loopback", port))), \
              mock.patch.object(self.tool, "start_profile", side_effect=lambda _env, _profile, service, _environment, **_kwargs: events.append(("start", service))), \
              mock.patch.object(self.tool, "wait_for_container", side_effect=lambda name, port, _image, **_kwargs: events.append(("healthy", name, port))), \
@@ -1310,7 +1508,15 @@ class SyncCanaryToolTests(unittest.TestCase):
              mock.patch.object(self.tool, "require_legacy_relay", return_value=False), \
              mock.patch.object(self.tool, "require_relay"), \
              mock.patch.object(self.tool, "inspect_legacy_sync_container"), \
-             mock.patch.object(self.tool, "stop_service"), \
+             mock.patch.object(
+                 self.tool,
+                 "wait_for_port_free",
+                 side_effect=lambda port: events.append(("port-free", port)),
+             ), mock.patch.object(
+                 self.tool,
+                 "stop_service",
+                 side_effect=lambda _env, _profile, service, _environment, **_kwargs: events.append(("stop", service)),
+             ), \
              mock.patch.object(self.tool, "container_action", side_effect=container_action), \
              mock.patch.object(self.tool, "wait_for_legacy_sync", side_effect=lambda *_args, **_kwargs: events.append(("container", "healthy"))), \
              mock.patch.object(self.tool, "wait_for_loopback"), \
@@ -1326,6 +1532,11 @@ class SyncCanaryToolTests(unittest.TestCase):
         legacy_relay_start = (
             "systemctl", "start", self.tool.LEGACY_UNIT
         )
+        port_free = ("port-free", self.tool.SYNC_STABLE_PORT)
+        stable_stop = ("stop", self.tool.STABLE_CONTAINER)
+        self.assertLess(events.index(stable_relay_stop), events.index(port_free))
+        self.assertLess(events.index(port_free), events.index(stable_stop))
+        self.assertLess(events.index(stable_stop), events.index(("container", "start")))
         self.assertLess(events.index(stable_relay_stop), events.index(("container", "start")))
         self.assertLess(events.index(("container", "start")), events.index(("container", "healthy")))
         self.assertLess(events.index(("container", "healthy")), events.index(legacy_relay_start))
@@ -1352,6 +1563,49 @@ class SyncCanaryToolTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(events, ["lock-enter", "prepare", "lock-exit"])
+
+    def test_reattest_action_holds_lock_without_private_env_or_secret(self):
+        events = []
+
+        class Lock:
+            def __enter__(self):
+                events.append("lock-enter")
+
+            def __exit__(self, *_args):
+                events.append("lock-exit")
+
+        def runner(command, **_kwargs):
+            self.assertEqual(command, [str(self.tool.CLEAN_WORKTREE)])
+            events.append("clean")
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+        with mock.patch.object(self.tool, "require_apply_context"), \
+             mock.patch.object(self.tool, "sync_operation_lock", return_value=Lock()), \
+             mock.patch.object(self.tool, "validate_contract"), \
+             mock.patch.object(
+                 self.tool,
+                 "reattest_sync_image",
+                 side_effect=lambda **_kwargs: events.append("reattest"),
+             ), mock.patch.object(
+                 self.tool, "parse_private_env"
+             ) as parse_private, mock.patch.object(
+                 self.tool, "prompt_secret"
+             ) as prompt_secret:
+            result = self.tool.main(
+                ["reattest-image", "--apply"],
+                runner=runner,
+                stdin=TtyBuffer(),
+                stdout=TtyBuffer(),
+                stderr=TtyBuffer(),
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            events,
+            ["lock-enter", "clean", "reattest", "lock-exit"],
+        )
+        parse_private.assert_not_called()
+        prompt_secret.assert_not_called()
 
     def test_sync_operation_lock_is_private_and_rejects_contention(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -40,6 +40,13 @@ SYNC_DOCKERIGNORE_RELATIVE_PATH = pathlib.Path("sub2api-sync/.dockerignore")
 SYNC_PSQL_WRAPPER_RELATIVE_PATH = pathlib.Path("sub2api-sync/psql-wrapper.sh")
 SYNC_APPLICATION_RELATIVE_PATH = pathlib.Path("sub2api-sync/sub2api_sync.py")
 SYNC_USAGE_METADATA_RELATIVE_PATH = pathlib.Path("sub2api-sync/usage_metadata.py")
+SYNC_IMAGE_INPUT_RELATIVE_PATHS = (
+    SYNC_DOCKERFILE_RELATIVE_PATH,
+    SYNC_DOCKERIGNORE_RELATIVE_PATH,
+    SYNC_PSQL_WRAPPER_RELATIVE_PATH,
+    SYNC_APPLICATION_RELATIVE_PATH,
+    SYNC_USAGE_METADATA_RELATIVE_PATH,
+)
 TRAFFIC_COMPOSE_RELATIVE_PATH = pathlib.Path("docker-compose.traffic-canary.yml")
 POSTGRES_LOG_GATE_RELATIVE_PATH = pathlib.Path(
     "deploy/verify-postgres-runtime-logging.sql"
@@ -666,6 +673,55 @@ def prepare_sync_image(*, runner=run_command):
     if inspect_local_sync_image(SYNC_IMAGE, expected_id=image_id, runner=runner) != image_id:
         raise CanaryError("prebuilt sync image tag could not be attested")
     write_image_state(image_id, git_head)
+    return image_id
+
+
+def reattest_sync_image(*, runner=run_command):
+    state = read_image_state()
+    old_head = state["git_head"]
+    new_head = current_git_head(runner=runner)
+    runner(
+        ["git", "merge-base", "--is-ancestor", old_head, new_head],
+        timeout=15,
+    )
+    runner(
+        [
+            "git", "diff", "--quiet", "--no-ext-diff", "--no-textconv",
+            old_head, new_head, "--",
+            *(str(path) for path in SYNC_IMAGE_INPUT_RELATIVE_PATHS),
+        ],
+        timeout=30,
+    )
+    image_id = inspect_local_sync_image(
+        SYNC_IMAGE,
+        expected_id=state["image_id"],
+        runner=runner,
+    )
+    inspect_sync_container(
+        STABLE_CONTAINER,
+        SYNC_STABLE_PORT,
+        image_id,
+        runner=runner,
+    )
+    require_relay(
+        STABLE_RELAY_UNIT,
+        expected_active=True,
+        expected_enabled=True,
+        runner=runner,
+    )
+    require_relay(
+        CANARY_RELAY_UNIT,
+        expected_active=False,
+        expected_enabled=False,
+        runner=runner,
+    )
+    require_legacy_relay(
+        expected_active=False,
+        expected_enabled=False,
+        runner=runner,
+    )
+    inspect_legacy_sync_container(False, runner=runner)
+    write_image_state(image_id, new_head)
     return image_id
 
 
@@ -1340,6 +1396,25 @@ def require_port_free(port):
         probe.close()
 
 
+def wait_for_port_free(
+    port, *, clock=time.monotonic, sleeper=time.sleep, checker=require_port_free
+):
+    if port not in {SYNC_STABLE_PORT, SYNC_CANARY_PORT}:
+        raise CanaryError("sync loopback port is invalid")
+    deadline = clock() + 15
+    while True:
+        try:
+            checker(port)
+        except CanaryError as error:
+            if clock() >= deadline:
+                raise CanaryError(
+                    "stable sync loopback port did not become free"
+                ) from error
+            sleeper(0.25)
+            continue
+        return
+
+
 def wait_for_loopback(
     port, *, clock=time.monotonic, sleeper=time.sleep, connector=socket.create_connection
 ):
@@ -1520,6 +1595,11 @@ def inspect_legacy_sync_container(
         labels = json.loads(labels_json or "{}")
     except json.JSONDecodeError as error:
         raise CanaryError("legacy sync container metadata could not be verified") from error
+    allowed_ports = (
+        ({"3021/tcp": None},)
+        if expected_running
+        else ({}, {"3021/tcp": None})
+    )
     if (
         not re.fullmatch(r"[0-9a-f]{64}", container_id)
         or (expected_id is not None and container_id != expected_id)
@@ -1531,7 +1611,7 @@ def inspect_legacy_sync_container(
         or read_only != "true"
         or log_driver != "none"
         or any("docker.sock" in str(binding) for binding in (binds or []))
-        or ports != {"3021/tcp": None}
+        or ports not in allowed_ports
         or set(networks) != {TARGET_NETWORK}
         or labels.get("com.docker.compose.project") != "sub2api-gate-release"
         or labels.get("com.docker.compose.service") != "sub2api-sync"
@@ -1567,7 +1647,7 @@ def recover_legacy(
         expected_enabled=False,
         runner=runner,
     )
-    require_port_free(SYNC_STABLE_PORT)
+    wait_for_port_free(SYNC_STABLE_PORT)
     stop_service(
         env_file, "sync-stable", STABLE_CONTAINER, environment, runner=runner
     )
@@ -1676,7 +1756,7 @@ def promote(env_file, environment, secret, expected_image_id, *, runner=run_comm
         require_legacy_relay(
             expected_active=False, expected_enabled=True, runner=runner
         )
-        require_port_free(SYNC_STABLE_PORT)
+        wait_for_port_free(SYNC_STABLE_PORT)
         start_profile(env_file, "sync-stable", STABLE_CONTAINER, environment, runner=runner)
         wait_for_container(
             STABLE_CONTAINER,
@@ -1768,7 +1848,7 @@ def rollback(env_file, environment, secret, expected_image_id, *, runner=run_com
             expected_enabled=False,
             runner=runner,
         )
-        require_port_free(SYNC_STABLE_PORT)
+        wait_for_port_free(SYNC_STABLE_PORT)
         stop_service(env_file, "sync-stable", STABLE_CONTAINER, environment, runner=runner)
         container_action("start", LEGACY_SYNC_CONTAINER, runner=runner)
         wait_for_legacy_sync(legacy_id, runner=runner)
@@ -1822,6 +1902,7 @@ def parser():
         choices=(
             "check",
             "prepare-image",
+            "reattest-image",
             "start",
             "verify",
             "promote",
@@ -1857,7 +1938,9 @@ def main(argv=None, *, runner=run_command, stdin=sys.stdin, stdout=sys.stdout, s
             print("sync canary contract check passed; no private file was read and no service was changed", file=stdout)
             return 0
 
-        if options.action in {"prepare-image", "start", "promote", "rollback"} and not options.apply:
+        if options.action in {
+            "prepare-image", "reattest-image", "start", "promote", "rollback",
+        } and not options.apply:
             print(f"sync canary {options.action} dry-run passed; add --apply from a private root TTY to change services", file=stdout)
             return 0
 
@@ -1881,6 +1964,15 @@ def main(argv=None, *, runner=run_command, stdin=sys.stdin, stdout=sys.stdout, s
                 prepare_sync_image(runner=runner)
             print(
                 "sync canary prepare-image completed; exact image identity was recorded",
+                file=stdout,
+            )
+            return 0
+        if options.action == "reattest-image":
+            with sync_operation_lock():
+                runner([str(CLEAN_WORKTREE)], timeout=15)
+                reattest_sync_image(runner=runner)
+            print(
+                "sync image reattestation completed; the exact running image was preserved",
                 file=stdout,
             )
             return 0
