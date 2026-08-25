@@ -3,11 +3,28 @@ set -euo pipefail
 
 docker=/usr/bin/docker
 socat=/usr/bin/socat
-container=sub2api-sync
+network=sub2api-gate-release_sub2api-data
+
+[[ "$#" -le 1 ]] || exit 64
+case "${1:-legacy}" in
+  legacy)
+    target=sub2api-sync:3021
+    ;;
+  canary)
+    target=sub2api-sync-canary:3022
+    ;;
+  stable)
+    target=sub2api-sync-stable:3021
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+IFS=: read -r container listen_port <<<"$target"
 
 resolve_ip() {
   local ip
-  ip="$($docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$container" 2>/dev/null || true)"
+  ip="$($docker inspect --format "{{with index .NetworkSettings.Networks \"$network\"}}{{.IPAddress}}{{end}}" "$container" 2>/dev/null || true)"
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
   printf '%s\n' "$ip"
 }
@@ -29,7 +46,7 @@ while true; do
     continue
   fi
 
-  "$socat" TCP-LISTEN:3021,bind=127.0.0.1,reuseaddr,fork "TCP:${ip}:3021" &
+  "$socat" "TCP-LISTEN:${listen_port},bind=127.0.0.1,reuseaddr,fork" "TCP:${ip}:3021" &
   relay_pid=$!
   while kill -0 "$relay_pid" 2>/dev/null; do
     sleep 3

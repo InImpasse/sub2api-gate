@@ -71,8 +71,6 @@ services:
     labels:
       sub2api-gate.canary-purpose: provisioning-sync-only
       sub2api-gate.request-path: never-v1
-    ports:
-      - "127.0.0.1:3022:3021"
 
   sub2api-sync-stable:
     <<: *sync-service
@@ -81,8 +79,6 @@ services:
     labels:
       sub2api-gate.canary-purpose: provisioning-sync-stable
       sub2api-gate.request-path: never-v1
-    ports:
-      - "127.0.0.1:3021:3021"
 
 networks:
   live-data:

@@ -959,10 +959,12 @@ The provisioning service has its own Compose project in
 Compose file and never participates in `/v1/*`. It joins only the active
 `sub2api-gate-release_sub2api-data` internal network, uses the existing
 `sub2api-postgres`, `sub2api`, and nonce-only `sub2api-redis-nonce` containers,
-and publishes the canary on `127.0.0.1:3022`. It never creates a second Redis
-or attaches to the Sub2API egress network. Both sync containers run as UID/GID
-65532 with a read-only root, discarded Docker logs, no capabilities, no Docker
-socket, and zero core dumps.
+and exposes the canary only through a root-owned relay on `127.0.0.1:3022`. It
+never creates a second Redis or attaches to the Sub2API egress network. Docker
+does not publish host ports for containers attached only to an `internal`
+network, so the Compose services intentionally have no `ports` entries. Both
+sync containers run as UID/GID 65532 with a read-only root, discarded Docker
+logs, no capabilities, no Docker socket, and zero core dumps.
 
 The pre-release topology is one un-published `sub2api-sync` container on that
 internal network plus the root-owned
@@ -970,7 +972,29 @@ internal network plus the root-owned
 the reviewed `socat` relay. The controller requires the installed unit and
 relay script to match `deploy/systemd/sub2api-sync-loopback-relay.service` and
 `deploy/sub2api-sync-loopback-relay` byte-for-byte, with modes `0644` and
-`0755`. It also verifies the exact legacy container ID and runtime contract.
+`0755`. Candidate and stable paths use fixed instances from the reviewed
+`sub2api-sync-loopback-relay@.service` template. The script accepts only the
+three fixed `legacy`, `canary`, and `stable` modes, resolves the target only on
+the internal data network, and binds only host loopback `3021` or `3022`. The
+controller also verifies each unit's exact active/enabled state and the exact
+legacy container ID and runtime contract.
+
+Install the reviewed relay files before preparing the image. Replacing the
+script does not restart the active legacy relay; `daemon-reload` only loads the
+new instance template. The controller rejects any installed-file mismatch:
+
+```bash
+sudo install -o root -g root -m 0755 \
+  deploy/sub2api-sync-loopback-relay \
+  /usr/local/libexec/sub2api-sync-loopback-relay
+sudo install -o root -g root -m 0644 \
+  deploy/systemd/sub2api-sync-loopback-relay.service \
+  /etc/systemd/system/sub2api-sync-loopback-relay.service
+sudo install -o root -g root -m 0644 \
+  deploy/systemd/sub2api-sync-loopback-relay@.service \
+  /etc/systemd/system/sub2api-sync-loopback-relay@.service
+sudo systemctl daemon-reload
+```
 
 The default controller mode is offline and reads no private file:
 
@@ -1034,15 +1058,18 @@ prints database stderr, SQL, request data, credentials, or response content.
 `diagnostics` queries the active loopback `3021` service directly and is not a
 traffic-canary status command.
 
-Promotion first proves the `3022` candidate, the live dependencies, the relay,
-and the exact legacy container. It then stops only the relay, confirms loopback
-`3021` is free, starts and proves the reviewed stable container on `3021`,
-stops the `3022` canary, stops the old `sub2api-sync` container, and disables
-the relay. A failure or SIGINT/SIGTERM/SIGHUP anywhere in that mutation window
-stops the candidate stable container, restores the same recorded legacy
-container ID, enables and starts the relay, and verifies signed `3021` status;
-additional termination signals are deferred until recovery finishes. It does
-not invoke Nginx, edit an upstream, or stop PostgreSQL, Redis, or Sub2API.
+Promotion first proves the candidate container and its `3022` relay, the live
+dependencies, the legacy relay, and the exact legacy container. It then stops
+only the legacy relay, confirms loopback `3021` is free, starts the reviewed
+stable container and its `3021` relay, and proves signed status before enabling
+that relay for reboot. Only then does it stop the `3022` relay and canary, stop
+the old `sub2api-sync` container, and disable the legacy relay. A failure or
+SIGINT/SIGTERM/SIGHUP anywhere in that mutation window stops and disables the
+stable relay, stops the candidate stable container, restores the same recorded
+legacy container ID, enables and starts the legacy relay, and verifies signed
+`3021` status; additional termination signals are deferred until recovery
+finishes. It does not invoke Nginx, edit an upstream, or stop PostgreSQL, Redis,
+or Sub2API.
 
 ```bash
 sudo python3 deploy/sync-canary.py promote --apply \
@@ -1050,10 +1077,11 @@ sudo python3 deploy/sync-canary.py promote --apply \
 ```
 
 Before removing the stopped legacy container, an explicitly approved rollback
-stops the stable sync container, starts and verifies the exact old container,
-then enables and starts the relay and requires a signed status probe. If any
-part fails, the controller stops the legacy path and restores the stable
-container on `3021`. Rollback never changes `/v1/*`.
+stops and disables the stable relay, stops the stable sync container, starts
+and verifies the exact old container, then enables and starts the legacy relay
+and requires a signed status probe. If any part fails, the controller disables
+the legacy relay and restores the stable container plus its enabled `3021`
+relay. Rollback never changes `/v1/*`.
 
 ```bash
 sudo python3 deploy/sync-canary.py rollback --apply \

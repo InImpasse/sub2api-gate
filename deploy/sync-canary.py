@@ -47,6 +47,9 @@ POSTGRES_LOG_GATE_RELATIVE_PATH = pathlib.Path(
 RELAY_UNIT_RELATIVE_PATH = pathlib.Path(
     "deploy/systemd/sub2api-sync-loopback-relay.service"
 )
+RELAY_TEMPLATE_RELATIVE_PATH = pathlib.Path(
+    "deploy/systemd/sub2api-sync-loopback-relay@.service"
+)
 RELAY_SCRIPT_RELATIVE_PATH = pathlib.Path("deploy/sub2api-sync-loopback-relay")
 TRUSTED_RELEASE_DIRECTORIES = (
     pathlib.Path("deploy"),
@@ -68,6 +71,7 @@ TRUSTED_RELEASE_FILES = (
     (TRAFFIC_COMPOSE_RELATIVE_PATH, False),
     (POSTGRES_LOG_GATE_RELATIVE_PATH, False),
     (RELAY_UNIT_RELATIVE_PATH, False),
+    (RELAY_TEMPLATE_RELATIVE_PATH, False),
     (RELAY_SCRIPT_RELATIVE_PATH, True),
 )
 COMPOSE = ROOT / "docker-compose.sync-canary.yml"
@@ -97,7 +101,13 @@ CANARY_CONTAINER = "sub2api-sync-canary"
 STABLE_CONTAINER = "sub2api-sync-stable"
 LEGACY_SYNC_CONTAINER = "sub2api-sync"
 LEGACY_UNIT = "sub2api-sync-loopback-relay.service"
+CANARY_RELAY_UNIT = "sub2api-sync-loopback-relay@canary.service"
+STABLE_RELAY_UNIT = "sub2api-sync-loopback-relay@stable.service"
+RELAY_UNITS = frozenset((LEGACY_UNIT, CANARY_RELAY_UNIT, STABLE_RELAY_UNIT))
 LIVE_RELAY_UNIT = pathlib.Path("/etc/systemd/system") / LEGACY_UNIT
+LIVE_RELAY_TEMPLATE = pathlib.Path(
+    "/etc/systemd/system/sub2api-sync-loopback-relay@.service"
+)
 LIVE_RELAY_SCRIPT = pathlib.Path("/usr/local/libexec/sub2api-sync-loopback-relay")
 SYNC_CANARY_PORT = 3022
 SYNC_STABLE_PORT = 3021
@@ -675,6 +685,11 @@ def validate_contract():
         source = COMPOSE.read_text(encoding="utf-8")
         dockerfile = SYNC_DOCKERFILE.read_text(encoding="utf-8")
         role_gate = ROLE_GATE.read_text(encoding="utf-8")
+        relay = (ROOT / RELAY_SCRIPT_RELATIVE_PATH).read_text(encoding="utf-8")
+        relay_unit = (ROOT / RELAY_UNIT_RELATIVE_PATH).read_text(encoding="utf-8")
+        relay_template = (ROOT / RELAY_TEMPLATE_RELATIVE_PATH).read_text(
+            encoding="utf-8"
+        )
     except OSError as error:
         raise CanaryError("sync canary release files are unavailable") from error
 
@@ -683,8 +698,6 @@ def validate_contract():
         'user: "65532:65532"',
         "read_only: true",
         'driver: "none"',
-        '"127.0.0.1:3022:3021"',
-        '"127.0.0.1:3021:3021"',
         "SUB2API_SYNC_DATABASE_HOST: postgres",
         "SUB2API_SYNC_DATABASE_USER: sub2api_sync",
         "SUB2API_INTERNAL_LOGIN_URL: http://sub2api:8080/api/v1/auth/login",
@@ -703,6 +716,7 @@ def validate_contract():
         "privileged: true",
         "build:",
         "sync-canary-redis-nonce:",
+        "\n    ports:",
     )
     if any(marker in source for marker in forbidden):
         raise CanaryError("sync canary Compose contract is unsafe")
@@ -718,6 +732,24 @@ def validate_contract():
         raise CanaryError("sync image source contract is incomplete")
     if any(marker in dockerfile for marker in ("apk add", "apt-get", "dnf ", "yum ")):
         raise CanaryError("sync image source contract permits package-manager drift")
+    relay_required = (
+        "sub2api-sync:3021",
+        "sub2api-sync-canary:3022",
+        "sub2api-sync-stable:3021",
+        "sub2api-gate-release_sub2api-data",
+        "TCP-LISTEN:${listen_port},bind=127.0.0.1",
+    )
+    if any(marker not in relay for marker in relay_required):
+        raise CanaryError("sync loopback relay contract is incomplete")
+    if (
+        "ExecStart=/usr/local/libexec/sub2api-sync-loopback-relay\n"
+        not in relay_unit
+        or "ExecStart=/usr/local/libexec/sub2api-sync-loopback-relay %i\n"
+        not in relay_template
+        or "NoNewPrivileges=true" not in relay_unit
+        or "NoNewPrivileges=true" not in relay_template
+    ):
+        raise CanaryError("sync loopback relay unit contract is incomplete")
 
 
 def parse_private_env(path):
@@ -955,7 +987,7 @@ def require_target_runtime(*, runner=run_command):
     except (TypeError, ValueError, json.JSONDecodeError) as error:
         raise CanaryError("live sync network could not be verified") from error
     names = {str(item.get("Name") or "") for item in containers.values() if isinstance(item, dict)}
-    required = {TARGET_POSTGRES, TARGET_APP, NONCE_REDIS, LEGACY_SYNC_CONTAINER}
+    required = {TARGET_POSTGRES, TARGET_APP, NONCE_REDIS}
     if internal != "true":
         raise CanaryError("live sync network is not internal")
     if not required.issubset(names):
@@ -988,6 +1020,11 @@ def require_sync_role(*, runner=run_command):
 
 
 def inspect_sync_container(name, expected_port, expected_image_id, *, runner=run_command):
+    if (name, expected_port) not in {
+        (CANARY_CONTAINER, SYNC_CANARY_PORT),
+        (STABLE_CONTAINER, SYNC_STABLE_PORT),
+    }:
+        raise CanaryError("sync container identity is invalid")
     template = (
         "{{.Image}}|{{.Config.Image}}|"
         "{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|"
@@ -1031,11 +1068,7 @@ def inspect_sync_container(name, expected_port, expected_image_id, *, runner=run
         or read_only != "true"
         or log_driver != "none"
         or any("docker.sock" in str(binding) for binding in (binds or []))
-        or ports != {
-            "3021/tcp": [
-                {"HostIp": "127.0.0.1", "HostPort": str(expected_port)}
-            ]
-        }
+        or ports != {"3021/tcp": None}
         or set(networks) != {TARGET_NETWORK}
         or labels.get("com.docker.compose.project") != "sub2api-gate-sync-canary"
         or labels.get("com.docker.compose.service") != expected_service
@@ -1307,6 +1340,24 @@ def require_port_free(port):
         probe.close()
 
 
+def wait_for_loopback(
+    port, *, clock=time.monotonic, sleeper=time.sleep, connector=socket.create_connection
+):
+    if port not in {SYNC_STABLE_PORT, SYNC_CANARY_PORT}:
+        raise CanaryError("sync loopback port is invalid")
+    deadline = clock() + 15
+    while True:
+        try:
+            connection = connector(("127.0.0.1", port), timeout=1)
+        except OSError:
+            if clock() >= deadline:
+                raise CanaryError("sync loopback relay did not become available")
+            sleeper(0.25)
+            continue
+        connection.close()
+        return
+
+
 def start_profile(env_file, profile, service, environment, *, runner=run_command):
     runner(
         compose_command(
@@ -1332,10 +1383,12 @@ def stop_service(env_file, profile, service, environment, *, runner=run_command)
     )
 
 
-def systemctl(action, *, runner=run_command):
+def systemctl(action, unit=LEGACY_UNIT, *, runner=run_command):
     if action not in {"start", "stop", "enable", "disable"}:
         raise CanaryError("unsupported sync relay service action")
-    return runner(["systemctl", action, LEGACY_UNIT], timeout=30)
+    if unit not in RELAY_UNITS:
+        raise CanaryError("unsupported sync relay service")
+    return runner(["systemctl", action, unit], timeout=30)
 
 
 def container_action(action, name, *, runner=run_command):
@@ -1362,7 +1415,7 @@ def _require_reviewed_live_file(
         live_content = live_path.read_bytes()
         reviewed_content = reviewed_path.read_bytes()
     except OSError as error:
-        raise CanaryError("legacy sync relay file is unavailable") from error
+        raise CanaryError("sync relay file is unavailable") from error
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISREG(metadata.st_mode)
@@ -1372,17 +1425,22 @@ def _require_reviewed_live_file(
         or stat.S_IMODE(metadata.st_mode) != expected_mode
         or not hmac.compare_digest(live_content, reviewed_content)
     ):
-        raise CanaryError("legacy sync relay file does not match the reviewed release")
+        raise CanaryError("sync relay file does not match the reviewed release")
 
 
-def require_legacy_relay(
-    *, expected_active=True, expected_enabled=True, runner=run_command
+def require_relay(
+    unit, *, expected_active, expected_enabled, runner=run_command
 ):
+    if unit not in RELAY_UNITS:
+        raise CanaryError("unsupported sync relay service")
     _require_reviewed_live_file(LIVE_RELAY_UNIT, RELAY_UNIT_RELATIVE_PATH, 0o644)
+    _require_reviewed_live_file(
+        LIVE_RELAY_TEMPLATE, RELAY_TEMPLATE_RELATIVE_PATH, 0o644
+    )
     _require_reviewed_live_file(LIVE_RELAY_SCRIPT, RELAY_SCRIPT_RELATIVE_PATH, 0o755)
     result = runner(
         [
-            "systemctl", "show", LEGACY_UNIT,
+            "systemctl", "show", unit,
             "--property=ActiveState", "--property=SubState",
             "--property=UnitFileState", "--property=FragmentPath",
             "--property=User", "--property=NeedDaemonReload",
@@ -1393,23 +1451,44 @@ def require_legacy_relay(
     for line in decoded_stdout(result).splitlines():
         key, separator, value = line.partition("=")
         if not separator or key in fields:
-            raise CanaryError("legacy sync relay service metadata is invalid")
+            raise CanaryError("sync relay service metadata is invalid")
         fields[key] = value
-    active = fields.get("ActiveState") == "active" and fields.get("SubState") == "running"
-    enabled = fields.get("UnitFileState") == "enabled"
+    active = (
+        fields.get("ActiveState") == "active"
+        and fields.get("SubState") == "running"
+    )
+    inactive = (
+        fields.get("ActiveState") == "inactive"
+        and fields.get("SubState") == "dead"
+    )
+    expected_fragment = (
+        LIVE_RELAY_UNIT if unit == LEGACY_UNIT else LIVE_RELAY_TEMPLATE
+    )
     if (
         set(fields) != {
             "ActiveState", "SubState", "UnitFileState", "FragmentPath", "User",
             "NeedDaemonReload",
         }
-        or fields.get("FragmentPath") != str(LIVE_RELAY_UNIT)
+        or fields.get("FragmentPath") != str(expected_fragment)
         or fields.get("User") != ""
         or fields.get("NeedDaemonReload") != "no"
-        or active != expected_active
-        or enabled != expected_enabled
+        or (active if expected_active else inactive) is not True
+        or fields.get("UnitFileState")
+        != ("enabled" if expected_enabled else "disabled")
     ):
-        raise CanaryError("legacy sync relay service runtime contract failed")
+        raise CanaryError("sync relay service runtime contract failed")
     return active
+
+
+def require_legacy_relay(
+    *, expected_active=True, expected_enabled=True, runner=run_command
+):
+    return require_relay(
+        LEGACY_UNIT,
+        expected_active=expected_active,
+        expected_enabled=expected_enabled,
+        runner=runner,
+    )
 
 
 def inspect_legacy_sync_container(
@@ -1480,6 +1559,15 @@ def wait_for_legacy_sync(
 def recover_legacy(
     env_file, environment, secret, legacy_id, *, runner=run_command
 ):
+    systemctl("stop", STABLE_RELAY_UNIT, runner=runner)
+    systemctl("disable", STABLE_RELAY_UNIT, runner=runner)
+    require_relay(
+        STABLE_RELAY_UNIT,
+        expected_active=False,
+        expected_enabled=False,
+        runner=runner,
+    )
+    require_port_free(SYNC_STABLE_PORT)
     stop_service(
         env_file, "sync-stable", STABLE_CONTAINER, environment, runner=runner
     )
@@ -1498,6 +1586,7 @@ def recover_legacy(
     require_legacy_relay(
         expected_active=True, expected_enabled=True, runner=runner
     )
+    wait_for_loopback(SYNC_STABLE_PORT)
     verify_signed_status(SYNC_STABLE_PORT, secret)
 
 
@@ -1507,6 +1596,18 @@ def start_canary(env_file, environment, secret, expected_image_id, *, runner=run
     inspect_nonce_redis(runner=runner)
     require_legacy_relay(
         expected_active=True, expected_enabled=True, runner=runner
+    )
+    require_relay(
+        CANARY_RELAY_UNIT,
+        expected_active=False,
+        expected_enabled=False,
+        runner=runner,
+    )
+    require_relay(
+        STABLE_RELAY_UNIT,
+        expected_active=False,
+        expected_enabled=False,
+        runner=runner,
     )
     inspect_legacy_sync_container(True, runner=runner)
     verify_signed_status(SYNC_STABLE_PORT, secret)
@@ -1518,10 +1619,22 @@ def start_canary(env_file, environment, secret, expected_image_id, *, runner=run
             expected_image_id,
             runner=runner,
         )
+        systemctl("start", CANARY_RELAY_UNIT, runner=runner)
+        require_relay(
+            CANARY_RELAY_UNIT,
+            expected_active=True,
+            expected_enabled=False,
+            runner=runner,
+        )
+        wait_for_loopback(SYNC_CANARY_PORT)
         inspect_nonce_redis(runner=runner)
         verify_signed_status(SYNC_CANARY_PORT, secret)
     except (Exception, KeyboardInterrupt):
         with deferred_termination_signals():
+            try:
+                systemctl("stop", CANARY_RELAY_UNIT, runner=runner)
+            except CanaryError:
+                pass
             try:
                 stop_service(
                     env_file, "sync-canary", CANARY_CONTAINER, environment, runner=runner
@@ -1541,9 +1654,21 @@ def promote(env_file, environment, secret, expected_image_id, *, runner=run_comm
         runner=runner,
     )
     inspect_nonce_redis(runner=runner)
+    require_relay(
+        CANARY_RELAY_UNIT,
+        expected_active=True,
+        expected_enabled=False,
+        runner=runner,
+    )
     verify_signed_status(SYNC_CANARY_PORT, secret)
     require_legacy_relay(
         expected_active=True, expected_enabled=True, runner=runner
+    )
+    require_relay(
+        STABLE_RELAY_UNIT,
+        expected_active=False,
+        expected_enabled=False,
+        runner=runner,
     )
     legacy_id = inspect_legacy_sync_container(True, runner=runner)
     try:
@@ -1559,7 +1684,29 @@ def promote(env_file, environment, secret, expected_image_id, *, runner=run_comm
             expected_image_id,
             runner=runner,
         )
+        systemctl("start", STABLE_RELAY_UNIT, runner=runner)
+        require_relay(
+            STABLE_RELAY_UNIT,
+            expected_active=True,
+            expected_enabled=False,
+            runner=runner,
+        )
+        wait_for_loopback(SYNC_STABLE_PORT)
         verify_signed_status(SYNC_STABLE_PORT, secret)
+        systemctl("enable", STABLE_RELAY_UNIT, runner=runner)
+        require_relay(
+            STABLE_RELAY_UNIT,
+            expected_active=True,
+            expected_enabled=True,
+            runner=runner,
+        )
+        systemctl("stop", CANARY_RELAY_UNIT, runner=runner)
+        require_relay(
+            CANARY_RELAY_UNIT,
+            expected_active=False,
+            expected_enabled=False,
+            runner=runner,
+        )
         stop_service(
             env_file, "sync-canary", CANARY_CONTAINER, environment, runner=runner
         )
@@ -1595,12 +1742,33 @@ def rollback(env_file, environment, secret, expected_image_id, *, runner=run_com
         runner=runner,
     )
     inspect_nonce_redis(runner=runner)
+    require_relay(
+        STABLE_RELAY_UNIT,
+        expected_active=True,
+        expected_enabled=True,
+        runner=runner,
+    )
     verify_signed_status(SYNC_STABLE_PORT, secret)
     require_legacy_relay(
         expected_active=False, expected_enabled=False, runner=runner
     )
+    require_relay(
+        CANARY_RELAY_UNIT,
+        expected_active=False,
+        expected_enabled=False,
+        runner=runner,
+    )
     legacy_id = inspect_legacy_sync_container(False, runner=runner)
     try:
+        systemctl("stop", STABLE_RELAY_UNIT, runner=runner)
+        systemctl("disable", STABLE_RELAY_UNIT, runner=runner)
+        require_relay(
+            STABLE_RELAY_UNIT,
+            expected_active=False,
+            expected_enabled=False,
+            runner=runner,
+        )
+        require_port_free(SYNC_STABLE_PORT)
         stop_service(env_file, "sync-stable", STABLE_CONTAINER, environment, runner=runner)
         container_action("start", LEGACY_SYNC_CONTAINER, runner=runner)
         wait_for_legacy_sync(legacy_id, runner=runner)
@@ -1609,11 +1777,16 @@ def rollback(env_file, environment, secret, expected_image_id, *, runner=run_com
         require_legacy_relay(
             expected_active=True, expected_enabled=True, runner=runner
         )
+        wait_for_loopback(SYNC_STABLE_PORT)
         verify_signed_status(SYNC_STABLE_PORT, secret)
     except (Exception, KeyboardInterrupt) as recovery_error:
         with deferred_termination_signals():
             try:
                 systemctl("stop", runner=runner)
+            except CanaryError:
+                pass
+            try:
+                systemctl("disable", runner=runner)
             except CanaryError:
                 pass
             try:
@@ -1627,6 +1800,15 @@ def rollback(env_file, environment, secret, expected_image_id, *, runner=run_com
                 expected_image_id,
                 runner=runner,
             )
+            systemctl("start", STABLE_RELAY_UNIT, runner=runner)
+            systemctl("enable", STABLE_RELAY_UNIT, runner=runner)
+            require_relay(
+                STABLE_RELAY_UNIT,
+                expected_active=True,
+                expected_enabled=True,
+                runner=runner,
+            )
+            wait_for_loopback(SYNC_STABLE_PORT)
             verify_signed_status(SYNC_STABLE_PORT, secret)
         raise CanaryError(
             "legacy sync recovery failed; stable container was restored"
@@ -1746,6 +1928,12 @@ def main(argv=None, *, runner=run_command, stdin=sys.stdin, stdout=sys.stdout, s
                     CANARY_CONTAINER,
                     SYNC_CANARY_PORT,
                     expected_image_id,
+                    runner=runner,
+                )
+                require_relay(
+                    CANARY_RELAY_UNIT,
+                    expected_active=True,
+                    expected_enabled=False,
                     runner=runner,
                 )
                 inspect_nonce_redis(runner=runner)

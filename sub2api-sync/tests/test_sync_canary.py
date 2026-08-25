@@ -22,6 +22,10 @@ DOCKERFILE_PATH = ROOT / "sub2api-sync" / "Dockerfile"
 DOCKERIGNORE_PATH = ROOT / "sub2api-sync" / ".dockerignore"
 TOOL_PATH = ROOT / "deploy" / "sync-canary.py"
 ROLE_GATE_PATH = ROOT / "migrations" / "verify_sync_role_least_privilege.sql"
+RELAY_PATH = ROOT / "deploy" / "sub2api-sync-loopback-relay"
+RELAY_TEMPLATE_PATH = (
+    ROOT / "deploy" / "systemd" / "sub2api-sync-loopback-relay@.service"
+)
 
 
 def load_tool():
@@ -56,14 +60,33 @@ class SyncCanaryComposeTests(unittest.TestCase):
         self.assertIn("name: sub2api-gate-sync-canary", self.compose)
         canary = self.service("sub2api-sync-canary", "sub2api-sync-stable")
         stable = self.service("sub2api-sync-stable")
-        self.assertIn('"127.0.0.1:3022:3021"', canary)
-        self.assertIn('"127.0.0.1:3021:3021"', stable)
+        self.assertNotIn("ports:", canary)
+        self.assertNotIn("ports:", stable)
         self.assertIn("sub2api-gate.request-path: never-v1", canary)
         self.assertIn("sub2api-gate.request-path: never-v1", stable)
         self.assertNotIn("8080:", self.compose)
         self.assertNotIn("8081:", self.compose)
         self.assertNotIn("nginx", self.compose.lower())
         self.assertNotIn("mirror", self.compose.lower())
+
+    def test_internal_sync_ports_use_fixed_loopback_relay_instances(self):
+        relay = RELAY_PATH.read_text(encoding="utf-8")
+        unit = RELAY_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("sub2api-sync-canary:3022", relay)
+        self.assertIn("sub2api-sync-stable:3021", relay)
+        self.assertIn("sub2api-gate-release_sub2api-data", relay)
+        self.assertIn("TCP-LISTEN:${listen_port},bind=127.0.0.1", relay)
+        self.assertIn("ExecStart=/usr/local/libexec/sub2api-sync-loopback-relay %i", unit)
+        self.assertIn("NoNewPrivileges=true", unit)
+        self.assertIn("ProtectSystem=full", unit)
+
+        invalid = subprocess.run(
+            [RELAY_PATH, "unknown"], capture_output=True, check=False
+        )
+        self.assertEqual(invalid.returncode, 64)
+        self.assertEqual(invalid.stdout, b"")
+        self.assertEqual(invalid.stderr, b"")
 
     def test_sync_services_are_non_root_read_only_and_logless(self):
         template = self.compose.split("x-sync-service: &sync-service\n", 1)[1].split(
@@ -892,6 +915,87 @@ class SyncCanaryToolTests(unittest.TestCase):
         self.assertEqual(command[command.index("--pull") + 1], "never")
         self.assertNotIn("sync-canary-redis-nonce", command)
 
+    def test_loopback_wait_retries_and_rejects_unknown_ports(self):
+        connection = mock.Mock()
+        connector = mock.Mock(side_effect=[OSError("not ready"), connection])
+        self.tool.wait_for_loopback(
+            self.tool.SYNC_CANARY_PORT,
+            clock=mock.Mock(side_effect=[0, 0]),
+            sleeper=lambda _seconds: None,
+            connector=connector,
+        )
+        connection.close.assert_called_once_with()
+
+        with self.assertRaisesRegex(self.tool.CanaryError, "port is invalid"):
+            self.tool.wait_for_loopback(8080)
+
+        with self.assertRaisesRegex(self.tool.CanaryError, "did not become"):
+            self.tool.wait_for_loopback(
+                self.tool.SYNC_CANARY_PORT,
+                clock=mock.Mock(side_effect=[0, 15]),
+                sleeper=lambda _seconds: None,
+                connector=mock.Mock(side_effect=OSError("unavailable")),
+            )
+
+    def test_start_canary_starts_loopback_relay_before_signed_probe(self):
+        events = []
+
+        with mock.patch.object(self.tool, "require_target_runtime"), \
+             mock.patch.object(self.tool, "require_sync_role"), \
+             mock.patch.object(self.tool, "inspect_nonce_redis"), \
+             mock.patch.object(self.tool, "require_legacy_relay"), \
+             mock.patch.object(self.tool, "require_relay"), \
+             mock.patch.object(self.tool, "inspect_legacy_sync_container"), \
+             mock.patch.object(self.tool, "verify_signed_status", side_effect=lambda port, _secret: events.append(("verify", port))), \
+             mock.patch.object(self.tool, "start_profile", side_effect=lambda *_args, **_kwargs: events.append("container-start")), \
+             mock.patch.object(self.tool, "wait_for_container", side_effect=lambda *_args, **_kwargs: events.append("container-healthy")), \
+             mock.patch.object(self.tool, "systemctl", side_effect=lambda action, unit=self.tool.LEGACY_UNIT, **_kwargs: events.append(("systemctl", action, unit))), \
+             mock.patch.object(self.tool, "wait_for_loopback", side_effect=lambda port: events.append(("loopback", port))):
+            self.tool.start_canary(
+                pathlib.Path("/private/env"), {}, "s" * 32,
+                "sha256:" + "a" * 64, runner=lambda *_args, **_kwargs: None,
+            )
+
+        relay_start = (
+            "systemctl", "start", self.tool.CANARY_RELAY_UNIT
+        )
+        loopback = ("loopback", self.tool.SYNC_CANARY_PORT)
+        signed = ("verify", self.tool.SYNC_CANARY_PORT)
+        self.assertLess(events.index("container-healthy"), events.index(relay_start))
+        self.assertLess(events.index(relay_start), events.index(loopback))
+        self.assertLess(events.index(loopback), events.index(signed))
+
+    def test_start_canary_stops_relay_before_container_on_probe_failure(self):
+        events = []
+
+        def verify(port, _secret):
+            if port == self.tool.SYNC_CANARY_PORT:
+                raise self.tool.CanaryError("injected")
+
+        with mock.patch.object(self.tool, "require_target_runtime"), \
+             mock.patch.object(self.tool, "require_sync_role"), \
+             mock.patch.object(self.tool, "inspect_nonce_redis"), \
+             mock.patch.object(self.tool, "require_legacy_relay"), \
+             mock.patch.object(self.tool, "require_relay"), \
+             mock.patch.object(self.tool, "inspect_legacy_sync_container"), \
+             mock.patch.object(self.tool, "verify_signed_status", side_effect=verify), \
+             mock.patch.object(self.tool, "start_profile"), \
+             mock.patch.object(self.tool, "wait_for_container"), \
+             mock.patch.object(self.tool, "systemctl", side_effect=lambda action, unit=self.tool.LEGACY_UNIT, **_kwargs: events.append(("systemctl", action, unit))), \
+             mock.patch.object(self.tool, "wait_for_loopback"), \
+             mock.patch.object(self.tool, "stop_service", side_effect=lambda *_args, **_kwargs: events.append("container-stop")):
+            with self.assertRaisesRegex(self.tool.CanaryError, "temporary services"):
+                self.tool.start_canary(
+                    pathlib.Path("/private/env"), {}, "s" * 32,
+                    "sha256:" + "a" * 64,
+                    runner=lambda *_args, **_kwargs: None,
+                )
+
+        relay_stop = (
+            "systemctl", "stop", self.tool.CANARY_RELAY_UNIT
+        )
+        self.assertLess(events.index(relay_stop), events.index("container-stop"))
+
     def test_running_container_must_use_the_recorded_exact_image_id(self):
         image_id = "sha256:" + "a" * 64
         labels = {
@@ -909,9 +1013,7 @@ class SyncCanaryToolTests(unittest.TestCase):
                 "true",
                 "none",
                 "[]",
-                json.dumps({
-                    "3021/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3022"}]
-                }),
+                json.dumps({"3021/tcp": None}),
                 json.dumps({self.tool.TARGET_NETWORK: {}}),
                 json.dumps(labels),
             )
@@ -934,6 +1036,19 @@ class SyncCanaryToolTests(unittest.TestCase):
                 self.tool.CANARY_CONTAINER,
                 self.tool.SYNC_CANARY_PORT,
                 "sha256:" + "c" * 64,
+                runner=runner,
+            )
+
+        fields = metadata.decode().split("|")
+        fields[8] = json.dumps({
+            "3021/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3022"}]
+        })
+        metadata = "|".join(fields).encode()
+        with self.assertRaisesRegex(self.tool.CanaryError, "runtime contract"):
+            self.tool.inspect_sync_container(
+                self.tool.CANARY_CONTAINER,
+                self.tool.SYNC_CANARY_PORT,
+                image_id,
                 runner=runner,
             )
 
@@ -1042,8 +1157,8 @@ class SyncCanaryToolTests(unittest.TestCase):
     def test_promote_stops_the_live_relay_before_3021_and_recovers_on_failure(self):
         events = []
 
-        def systemctl(action, **_kwargs):
-            events.append(("systemctl", action))
+        def systemctl(action, unit=self.tool.LEGACY_UNIT, **_kwargs):
+            events.append(("systemctl", action, unit))
 
         def start_profile(*_args, **_kwargs):
             events.append(("start", self.tool.STABLE_CONTAINER))
@@ -1055,8 +1170,10 @@ class SyncCanaryToolTests(unittest.TestCase):
              mock.patch.object(self.tool, "require_target_runtime"), \
              mock.patch.object(self.tool, "require_sync_role"), \
              mock.patch.object(self.tool, "require_legacy_relay"), \
+             mock.patch.object(self.tool, "require_relay"), \
              mock.patch.object(self.tool, "inspect_legacy_sync_container", return_value="b" * 64), \
              mock.patch.object(self.tool, "wait_for_legacy_sync"), \
+             mock.patch.object(self.tool, "wait_for_loopback"), \
              mock.patch.object(self.tool, "systemctl", side_effect=systemctl), \
              mock.patch.object(self.tool, "require_port_free", side_effect=lambda _port: events.append(("port", 3021))), \
              mock.patch.object(self.tool, "start_profile", side_effect=start_profile), \
@@ -1069,9 +1186,10 @@ class SyncCanaryToolTests(unittest.TestCase):
                     "sha256:" + "a" * 64,
                     runner=lambda *_a, **_k: None,
                 )
-        self.assertEqual(events[0], ("systemctl", "stop"))
-        self.assertIn(("systemctl", "start"), events)
-        self.assertLess(events.index(("systemctl", "stop")), events.index(("port", 3021)))
+        legacy_stop = ("systemctl", "stop", self.tool.LEGACY_UNIT)
+        self.assertEqual(events[0], legacy_stop)
+        self.assertIn(("systemctl", "start", self.tool.LEGACY_UNIT), events)
+        self.assertLess(events.index(legacy_stop), events.index(("port", 3021)))
 
     def test_promote_preserves_identity_and_orders_the_successful_cutover(self):
         events = []
@@ -1087,9 +1205,11 @@ class SyncCanaryToolTests(unittest.TestCase):
              mock.patch.object(self.tool, "inspect_nonce_redis"), \
              mock.patch.object(self.tool, "verify_signed_status", side_effect=lambda port, _secret: events.append(("verify", port))), \
              mock.patch.object(self.tool, "require_legacy_relay"), \
+             mock.patch.object(self.tool, "require_relay"), \
              mock.patch.object(self.tool, "inspect_legacy_sync_container", side_effect=inspect_legacy), \
-             mock.patch.object(self.tool, "systemctl", side_effect=lambda action, **_kwargs: events.append(("systemctl", action))), \
+             mock.patch.object(self.tool, "systemctl", side_effect=lambda action, unit=self.tool.LEGACY_UNIT, **_kwargs: events.append(("systemctl", action, unit))), \
              mock.patch.object(self.tool, "require_port_free", side_effect=lambda port: events.append(("port-free", port))), \
+             mock.patch.object(self.tool, "wait_for_loopback", side_effect=lambda port: events.append(("loopback", port))), \
              mock.patch.object(self.tool, "start_profile", side_effect=lambda _env, _profile, service, _environment, **_kwargs: events.append(("start", service))), \
              mock.patch.object(self.tool, "wait_for_container", side_effect=lambda name, port, _image, **_kwargs: events.append(("healthy", name, port))), \
              mock.patch.object(self.tool, "stop_service", side_effect=lambda _env, _profile, service, _environment, **_kwargs: events.append(("stop", service))), \
@@ -1102,20 +1222,42 @@ class SyncCanaryToolTests(unittest.TestCase):
                 runner=lambda *_args, **_kwargs: None,
             )
 
-        relay_stop = events.index(("systemctl", "stop"))
+        relay_stop = events.index(
+            ("systemctl", "stop", self.tool.LEGACY_UNIT)
+        )
         stable_start = events.index(("start", self.tool.STABLE_CONTAINER))
+        stable_relay_start = events.index(
+            ("systemctl", "start", self.tool.STABLE_RELAY_UNIT)
+        )
+        stable_loopback = events.index(
+            ("loopback", self.tool.SYNC_STABLE_PORT)
+        )
         stable_verified = events.index(("verify", self.tool.SYNC_STABLE_PORT))
+        stable_relay_enable = events.index(
+            ("systemctl", "enable", self.tool.STABLE_RELAY_UNIT)
+        )
+        canary_relay_stop = events.index(
+            ("systemctl", "stop", self.tool.CANARY_RELAY_UNIT)
+        )
         canary_stop = events.index(("stop", self.tool.CANARY_CONTAINER))
         legacy_stop = events.index(
             ("container", "stop", self.tool.LEGACY_SYNC_CONTAINER)
         )
-        relay_disable = events.index(("systemctl", "disable"))
+        relay_disable = events.index(
+            ("systemctl", "disable", self.tool.LEGACY_UNIT)
+        )
         self.assertLess(
             relay_stop,
             events.index(("port-free", self.tool.SYNC_STABLE_PORT)),
         )
         self.assertLess(relay_stop, stable_start)
+        self.assertLess(stable_start, stable_relay_start)
+        self.assertLess(stable_relay_start, stable_loopback)
+        self.assertLess(stable_loopback, stable_verified)
         self.assertLess(stable_start, stable_verified)
+        self.assertLess(stable_verified, stable_relay_enable)
+        self.assertLess(stable_relay_enable, canary_relay_stop)
+        self.assertLess(canary_relay_stop, canary_stop)
         self.assertLess(stable_verified, canary_stop)
         self.assertLess(canary_stop, legacy_stop)
         self.assertLess(legacy_stop, relay_disable)
@@ -1126,7 +1268,6 @@ class SyncCanaryToolTests(unittest.TestCase):
             "postgres": {"Name": self.tool.TARGET_POSTGRES},
             "app": {"Name": self.tool.TARGET_APP},
             "nonce": {"Name": self.tool.NONCE_REDIS},
-            "sync": {"Name": self.tool.LEGACY_SYNC_CONTAINER},
         }
         network = ("true|" + json.dumps(containers)).encode()
         inspected = []
@@ -1159,26 +1300,35 @@ class SyncCanaryToolTests(unittest.TestCase):
         def container_action(action, _name, **_kwargs):
             events.append(("container", action))
 
-        def systemctl(action, **_kwargs):
-            events.append(("systemctl", action))
+        def systemctl(action, unit=self.tool.LEGACY_UNIT, **_kwargs):
+            events.append(("systemctl", action, unit))
 
         with mock.patch.object(self.tool, "inspect_sync_container"), \
              mock.patch.object(self.tool, "inspect_nonce_redis"), \
              mock.patch.object(self.tool, "verify_signed_status"), \
              mock.patch.object(self.tool, "require_target_runtime"), \
              mock.patch.object(self.tool, "require_legacy_relay", return_value=False), \
+             mock.patch.object(self.tool, "require_relay"), \
              mock.patch.object(self.tool, "inspect_legacy_sync_container"), \
              mock.patch.object(self.tool, "stop_service"), \
              mock.patch.object(self.tool, "container_action", side_effect=container_action), \
              mock.patch.object(self.tool, "wait_for_legacy_sync", side_effect=lambda *_args, **_kwargs: events.append(("container", "healthy"))), \
+             mock.patch.object(self.tool, "wait_for_loopback"), \
              mock.patch.object(self.tool, "systemctl", side_effect=systemctl):
             self.tool.rollback(
                 pathlib.Path("/private/env"), {}, "s" * 32,
                 "sha256:" + "a" * 64, runner=lambda *_args, **_kwargs: None,
             )
 
+        stable_relay_stop = (
+            "systemctl", "stop", self.tool.STABLE_RELAY_UNIT
+        )
+        legacy_relay_start = (
+            "systemctl", "start", self.tool.LEGACY_UNIT
+        )
+        self.assertLess(events.index(stable_relay_stop), events.index(("container", "start")))
         self.assertLess(events.index(("container", "start")), events.index(("container", "healthy")))
-        self.assertLess(events.index(("container", "healthy")), events.index(("systemctl", "start")))
+        self.assertLess(events.index(("container", "healthy")), events.index(legacy_relay_start))
 
     def test_mutating_release_actions_hold_the_sync_operation_lock(self):
         events = []
@@ -1249,6 +1399,56 @@ class SyncCanaryToolTests(unittest.TestCase):
                         expected_gid=os.getgid(),
                     )
 
+    def test_relay_runtime_requires_exact_instance_state_and_fragment(self):
+        def metadata(active, enabled, fragment):
+            return "\n".join((
+                f"ActiveState={'active' if active else 'inactive'}",
+                f"SubState={'running' if active else 'dead'}",
+                f"UnitFileState={'enabled' if enabled else 'disabled'}",
+                f"FragmentPath={fragment}",
+                "User=",
+                "NeedDaemonReload=no",
+            )).encode()
+
+        with mock.patch.object(
+            self.tool, "_require_reviewed_live_file"
+        ) as file_gate:
+            runner = mock.Mock(return_value=subprocess.CompletedProcess(
+                [], 0, stdout=metadata(
+                    True, False, self.tool.LIVE_RELAY_TEMPLATE
+                )
+            ))
+            self.assertTrue(self.tool.require_relay(
+                self.tool.CANARY_RELAY_UNIT,
+                expected_active=True,
+                expected_enabled=False,
+                runner=runner,
+            ))
+            self.assertEqual(file_gate.call_count, 3)
+            self.assertEqual(
+                runner.call_args.args[0][2], self.tool.CANARY_RELAY_UNIT
+            )
+
+            failed = metadata(
+                False, False, self.tool.LIVE_RELAY_TEMPLATE
+            ).replace(b"ActiveState=inactive", b"ActiveState=failed").replace(
+                b"SubState=dead", b"SubState=failed"
+            )
+            with self.assertRaisesRegex(
+                self.tool.CanaryError, "runtime contract"
+            ):
+                self.tool.require_relay(
+                    self.tool.CANARY_RELAY_UNIT,
+                    expected_active=False,
+                    expected_enabled=False,
+                    runner=mock.Mock(return_value=subprocess.CompletedProcess(
+                        [], 0, stdout=failed
+                    )),
+                )
+
+        with self.assertRaisesRegex(self.tool.CanaryError, "unsupported"):
+            self.tool.systemctl("start", "unreviewed.service")
+
     def test_cutover_signal_handler_restores_the_previous_handler(self):
         previous = signal.getsignal(signal.SIGTERM)
         with self.assertRaises(self.tool.TerminationRequested):
@@ -1266,6 +1466,7 @@ class SyncCanaryToolTests(unittest.TestCase):
              mock.patch.object(self.tool, "inspect_nonce_redis"), \
              mock.patch.object(self.tool, "verify_signed_status"), \
              mock.patch.object(self.tool, "require_legacy_relay"), \
+             mock.patch.object(self.tool, "require_relay"), \
              mock.patch.object(self.tool, "inspect_legacy_sync_container", return_value=legacy_id), \
              mock.patch.object(self.tool, "systemctl", side_effect=self.tool.TerminationRequested("interrupted")), \
              mock.patch.object(self.tool, "recover_legacy", side_effect=lambda _env, _environment, _secret, expected_id, **_kwargs: recovered.append(expected_id)):
@@ -1292,12 +1493,14 @@ class SyncCanaryToolTests(unittest.TestCase):
              mock.patch.object(self.tool, "inspect_nonce_redis"), \
              mock.patch.object(self.tool, "verify_signed_status"), \
              mock.patch.object(self.tool, "require_legacy_relay"), \
+             mock.patch.object(self.tool, "require_relay"), \
              mock.patch.object(self.tool, "inspect_legacy_sync_container", return_value="b" * 64), \
              mock.patch.object(self.tool, "stop_service", side_effect=stop_service), \
-             mock.patch.object(self.tool, "systemctl", side_effect=lambda action, **_kwargs: events.append(("systemctl", action))), \
+             mock.patch.object(self.tool, "systemctl", side_effect=lambda action, unit=self.tool.LEGACY_UNIT, **_kwargs: events.append(("systemctl", action, unit))), \
              mock.patch.object(self.tool, "container_action", side_effect=lambda action, name, **_kwargs: events.append(("container", action, name))), \
              mock.patch.object(self.tool, "start_profile", side_effect=lambda _env, _profile, service, _environment, **_kwargs: events.append(("start", service))), \
-             mock.patch.object(self.tool, "wait_for_container"):
+             mock.patch.object(self.tool, "wait_for_container"), \
+             mock.patch.object(self.tool, "wait_for_loopback"):
             with self.assertRaisesRegex(
                 self.tool.CanaryError, "stable container was restored"
             ):
