@@ -1042,7 +1042,7 @@ sudo python3 deploy/sync-canary.py verify \
 ```
 
 When a signed provisioning request returns a retryable failure, the stable sync
-process retains at most 64 in-memory, content-free diagnostics for 15 minutes.
+process retains at most 256 in-memory, content-free diagnostics for six hours.
 From the same private root TTY, query the request ID without writing data or
 changing services:
 

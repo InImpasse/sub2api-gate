@@ -951,6 +951,14 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("GRANT USAGE, SELECT ON SEQUENCE", LEAST_PRIVILEGE)
         self.assertIn("GRANT SELECT, INSERT, UPDATE ON TABLE", LEAST_PRIVILEGE)
         self.assertIn("GRANT SELECT, INSERT, DELETE ON TABLE", LEAST_PRIVILEGE)
+        self.assertIn(
+            "GRANT INSERT ON TABLE public.auth_cache_invalidation_outbox",
+            LEAST_PRIVILEGE,
+        )
+        self.assertIn(
+            "sub2api_sync auth cache outbox sequence privileges are unsafe",
+            LEAST_PRIVILEGE,
+        )
         self.assertIn("GRANT CONNECT ON DATABASE %I TO sub2api_sync", LEAST_PRIVILEGE)
         self.assertIn("GRANT EXECUTE ON FUNCTION public.crypt(text, text)", LEAST_PRIVILEGE)
         self.assertIn("GRANT EXECUTE ON FUNCTION public.gen_salt(text)", LEAST_PRIVILEGE)

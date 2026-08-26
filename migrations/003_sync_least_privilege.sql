@@ -407,6 +407,18 @@ GRANT SELECT, INSERT, DELETE ON TABLE
   public.user_allowed_groups
 TO sub2api_sync;
 
+-- Current Sub2API releases invalidate cached API-key authorization through
+-- invoker-rights triggers on users, groups, API keys, and allowed groups. The
+-- sync role may enqueue the privacy-guarded SHA-256 cache reference, but it
+-- must never read, update, delete, or claim queued work.
+DO $$
+BEGIN
+  IF to_regclass('public.auth_cache_invalidation_outbox') IS NOT NULL THEN
+    GRANT INSERT ON TABLE public.auth_cache_invalidation_outbox TO sub2api_sync;
+  END IF;
+END
+$$;
+
 -- A small core is required for stable ordering and accounting. Version-specific
 -- metadata columns are granted only when present and are never replaced with a
 -- table-level SELECT grant.
@@ -503,7 +515,8 @@ BEGIN
         'groups',
         'subscription_plans',
         'user_allowed_groups',
-        'user_subscriptions'
+        'user_subscriptions',
+        'auth_cache_invalidation_outbox'
       )
   LOOP
     EXECUTE format(
@@ -523,6 +536,7 @@ DO $$
 DECLARE
   sync_role RECORD;
   unexpected_column text;
+  auth_cache_outbox_sequence text;
   expected_settings CONSTANT text[] := ARRAY[
     'idle_in_transaction_session_timeout=15s',
     'lock_timeout=2s',
@@ -602,6 +616,52 @@ BEGIN
     OR has_table_privilege('sub2api_sync', 'public.sub2api_sync_invite_owners', 'REFERENCES')
     OR has_table_privilege('sub2api_sync', 'public.sub2api_sync_invite_owners', 'TRIGGER') THEN
     RAISE EXCEPTION 'sub2api_sync invite ownership privileges are unsafe';
+  END IF;
+
+  IF to_regclass('public.auth_cache_invalidation_outbox') IS NOT NULL
+    AND (
+      NOT has_table_privilege(
+        'sub2api_sync', 'public.auth_cache_invalidation_outbox', 'INSERT'
+      )
+      OR has_table_privilege(
+        'sub2api_sync', 'public.auth_cache_invalidation_outbox', 'SELECT'
+      )
+      OR has_table_privilege(
+        'sub2api_sync', 'public.auth_cache_invalidation_outbox', 'UPDATE'
+      )
+      OR has_table_privilege(
+        'sub2api_sync', 'public.auth_cache_invalidation_outbox', 'DELETE'
+      )
+      OR has_table_privilege(
+        'sub2api_sync', 'public.auth_cache_invalidation_outbox', 'TRUNCATE'
+      )
+      OR has_table_privilege(
+        'sub2api_sync', 'public.auth_cache_invalidation_outbox', 'REFERENCES'
+      )
+      OR has_table_privilege(
+        'sub2api_sync', 'public.auth_cache_invalidation_outbox', 'TRIGGER'
+      )
+    ) THEN
+    RAISE EXCEPTION 'sub2api_sync auth cache outbox privileges are unsafe';
+  END IF;
+
+  IF to_regclass('public.auth_cache_invalidation_outbox') IS NOT NULL THEN
+    SELECT pg_get_serial_sequence(
+      'public.auth_cache_invalidation_outbox',
+      'id'
+    ) INTO auth_cache_outbox_sequence;
+    IF auth_cache_outbox_sequence IS NULL
+      OR NOT has_sequence_privilege(
+        'sub2api_sync', auth_cache_outbox_sequence, 'USAGE'
+      )
+      OR NOT has_sequence_privilege(
+        'sub2api_sync', auth_cache_outbox_sequence, 'SELECT'
+      )
+      OR has_sequence_privilege(
+        'sub2api_sync', auth_cache_outbox_sequence, 'UPDATE'
+      ) THEN
+      RAISE EXCEPTION 'sub2api_sync auth cache outbox sequence privileges are unsafe';
+    END IF;
   END IF;
 
   SELECT attribute.attname

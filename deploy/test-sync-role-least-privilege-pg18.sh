@@ -97,6 +97,23 @@ CREATE TABLE user_subscriptions (
   user_id bigint,
   status text
 );
+CREATE TABLE auth_cache_invalidation_outbox (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  cache_key char(64) NOT NULL
+);
+CREATE FUNCTION enqueue_group_auth_cache_invalidation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  INSERT INTO auth_cache_invalidation_outbox (cache_key)
+  VALUES (repeat('a', 64));
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER trg_groups_auth_cache_invalidation
+AFTER UPDATE ON groups
+FOR EACH ROW EXECUTE FUNCTION enqueue_group_auth_cache_invalidation();
 -- requested_model is deliberately absent to prove optional-column compatibility.
 CREATE TABLE usage_logs (
   id bigint PRIMARY KEY,
@@ -196,6 +213,8 @@ SET ROLE sub2api_sync;
 SELECT id, request_id, model, input_tokens, output_tokens, total_cost,
        actual_cost, duration_ms, stream, request_type, inbound_endpoint, created_at
 FROM usage_logs;
+INSERT INTO groups (name) VALUES ('openai-default');
+UPDATE groups SET name = name WHERE name = 'openai-default';
 WITH new_user AS (
   INSERT INTO users (status) VALUES ('active') RETURNING id
 )
@@ -209,7 +228,37 @@ WHERE invite_fingerprint = repeat('a', 64);
 DELETE FROM sub2api_sync_invite_owners
 WHERE invite_fingerprint = repeat('a', 64);
 RESET ROLE;
+
+DO $$
+BEGIN
+  IF (SELECT count(*) FROM auth_cache_invalidation_outbox) <> 1 THEN
+    RAISE EXCEPTION 'sync-triggered auth cache invalidation was not queued';
+  END IF;
+  IF has_table_privilege(
+    'sub2api_sync',
+    'public.auth_cache_invalidation_outbox',
+    'SELECT'
+  ) OR has_table_privilege(
+    'sub2api_sync',
+    'public.auth_cache_invalidation_outbox',
+    'UPDATE'
+  ) OR has_table_privilege(
+    'sub2api_sync',
+    'public.auth_cache_invalidation_outbox',
+    'DELETE'
+  ) THEN
+    RAISE EXCEPTION 'sync role can inspect or mutate queued cache references';
+  END IF;
+END
+$$;
 SQL
+
+if docker exec -i "$container_name" psql -U postgres -d sync_success -v ON_ERROR_STOP=1 \
+  -c 'SET ROLE sub2api_sync; SELECT cache_key FROM auth_cache_invalidation_outbox;' \
+  >/dev/null 2>&1; then
+  echo "sync role can read auth cache invalidation references" >&2
+  exit 1
+fi
 
 if docker exec -i "$container_name" psql -U postgres -d sync_success -v ON_ERROR_STOP=1 \
   -c "SET ROLE sub2api_sync; INSERT INTO sub2api_sync_invite_owners (user_id,invite_fingerprint) SELECT id,'7c484f74-6d93-43d1-9441-00c7d8d4ab11' FROM users LIMIT 1;" \

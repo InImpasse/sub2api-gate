@@ -481,6 +481,10 @@ class SyncHttpContractTests(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(payload["error"], "unauthorized")
 
+    def test_failure_diagnostics_keep_a_bounded_six_hour_window(self):
+        self.assertEqual(SYNC.MAX_FAILURE_DIAGNOSTICS, 256)
+        self.assertEqual(SYNC.FAILURE_DIAGNOSTIC_TTL_SECONDS, 6 * 60 * 60)
+
     def test_login_upstream_failure_maps_to_bad_gateway(self):
         with RunningSyncServer() as server:
             status, _response_headers, payload = self.signed_action_request(

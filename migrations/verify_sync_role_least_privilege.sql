@@ -5,7 +5,7 @@
 WITH sync_role AS (
   SELECT * FROM pg_roles WHERE rolname = 'sub2api_sync'
 ),
-allowed_table_privileges(schema_name, table_name, privilege_type) AS (
+core_allowed_table_privileges(schema_name, table_name, privilege_type) AS (
   VALUES
     ('public', 'users', 'SELECT'),
     ('public', 'users', 'INSERT'),
@@ -32,6 +32,12 @@ allowed_table_privileges(schema_name, table_name, privilege_type) AS (
     ('public', 'sub2api_sync_invite_owners', 'INSERT'),
     ('public', 'sub2api_sync_invite_owners', 'UPDATE'),
     ('public', 'sub2api_sync_invite_owners', 'DELETE')
+),
+allowed_table_privileges(schema_name, table_name, privilege_type) AS (
+  SELECT * FROM core_allowed_table_privileges
+  UNION ALL
+  SELECT 'public', 'auth_cache_invalidation_outbox', 'INSERT'
+  WHERE to_regclass('public.auth_cache_invalidation_outbox') IS NOT NULL
 ),
 unexpected_table_privileges AS (
   SELECT privilege.table_schema, privilege.table_name, privilege.privilege_type
@@ -62,6 +68,20 @@ unexpected_usage_columns AS (
     AND has_column_privilege(
       'sub2api_sync', 'public.usage_logs', attribute.attname, 'SELECT'
     )
+),
+invalid_auth_cache_outbox_sequence AS (
+  SELECT sequence_name
+  FROM (
+    SELECT pg_get_serial_sequence(
+      'public.auth_cache_invalidation_outbox',
+      'id'
+    ) AS sequence_name
+    WHERE to_regclass('public.auth_cache_invalidation_outbox') IS NOT NULL
+  ) AS outbox
+  WHERE sequence_name IS NULL
+    OR NOT has_sequence_privilege('sub2api_sync', sequence_name, 'USAGE')
+    OR NOT has_sequence_privilege('sub2api_sync', sequence_name, 'SELECT')
+    OR has_sequence_privilege('sub2api_sync', sequence_name, 'UPDATE')
 )
 SELECT CASE WHEN
   (SELECT count(*) FROM sync_role) = 1
@@ -85,6 +105,7 @@ SELECT CASE WHEN
   AND NOT EXISTS (SELECT 1 FROM unexpected_table_privileges)
   AND NOT EXISTS (SELECT 1 FROM missing_table_privileges)
   AND NOT EXISTS (SELECT 1 FROM unexpected_usage_columns)
+  AND NOT EXISTS (SELECT 1 FROM invalid_auth_cache_outbox_sequence)
   AND NOT has_table_privilege('sub2api_sync', 'public.usage_logs', 'SELECT')
   AND NOT has_database_privilege('sub2api_sync', current_database(), 'CREATE')
   AND NOT has_database_privilege('sub2api_sync', current_database(), 'TEMPORARY')
