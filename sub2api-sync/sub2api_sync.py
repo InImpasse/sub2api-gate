@@ -965,7 +965,7 @@ def sync_user_keys(user_id, group_id, tokens):
             key_user_id = int(existing_key[1])
             key_deleted_at = existing_key[2] if len(existing_key) >= 3 else ""
             if key_user_id != user_id and not key_deleted_at:
-                raise RuntimeError("requested api key is already assigned to another active user")
+                raise RuntimeError("api_key_conflict")
             psql(
                 "UPDATE api_keys SET "
                 f"user_id={int(user_id)}, key={sql_quote(key, 128)}, name={sql_quote(name, 100)}, group_id={int(token_group_id)}, "
@@ -1030,6 +1030,17 @@ def _provision(payload):
             username,
             include_deleted=True,
         )
+
+    submitted_email = str(payload.get("email") or "").strip()
+    if submitted_email:
+        email_owner = first_row(
+            "SELECT id FROM users "
+            f"WHERE email={sql_quote(email, 255)} AND deleted_at IS NULL "
+            "LIMIT 1 FOR UPDATE;"
+        )
+        current_user_id = int(user[0]) if user else 0
+        if email_owner and int(email_owner[0]) != current_user_id:
+            raise RuntimeError("email_conflict")
 
     groups = resolve_provision_groups(payload)
     primary_group_id = groups[0][1]
@@ -1992,10 +2003,41 @@ class Handler(BaseHTTPRequestHandler):
                     409, "identity_conflict", retryable=False, action=action
                 )
                 return
+            if runtime_code in {"email_conflict", "api_key_conflict"}:
+                print(json.dumps({
+                    "level": "warning",
+                    "error_code": "sync_data_conflict",
+                    "action": action,
+                    "request_id": self.request_id,
+                }), flush=True)
+                self.respond_error(
+                    409, runtime_code, retryable=False, action=action
+                )
+                return
             if runtime_code in {
                 "database_command_failed",
                 "database_configuration_invalid",
             }:
+                if (
+                    isinstance(error, DatabaseCommandError)
+                    and error.sqlstate == "23505"
+                ):
+                    record_failure_diagnostic(
+                        self.request_id,
+                        action,
+                        "database_error",
+                        error.sqlstate,
+                    )
+                    print(json.dumps({
+                        "level": "warning",
+                        "error_code": "sync_data_conflict",
+                        "action": action,
+                        "request_id": self.request_id,
+                    }), flush=True)
+                    self.respond_error(
+                        409, "data_conflict", retryable=False, action=action
+                    )
+                    return
                 record_failure_diagnostic(
                     self.request_id,
                     action,

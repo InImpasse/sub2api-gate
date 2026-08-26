@@ -1,4 +1,4 @@
-import { authorizeVisitorIps, cleanupExpiredIpGroups, findInvite, getInviteApiConfigs, getInviteByUuid, getInviteIpRecords, handleAdmin, keyTestAttemptKey, keyTestNotice, loginInviteToSub2Api, sanitizeInviteForPublic, sub2ApiSyncFailureMetadata, testInviteApiKey } from "./admin.js";
+import { authorizeVisitorIps, cleanupExpiredIpGroups, findInvite, getInviteApiConfigs, getInviteByUuid, getInviteIpRecords, handleAdmin, keyTestAttemptKey, keyTestNotice, loginInviteToSub2Api, sanitizeInviteForPublic, sub2ApiSyncFailureMetadata, syncAvailableSub2ApiKeys, testInviteApiKey } from "./admin.js";
 import { createAuthStateStore, isAuthStateBindingConfigured } from "./auth-state.js";
 import {
   rateLimitFingerprint,
@@ -89,6 +89,15 @@ export default {
       }),
       authState.purgeExpiredSessions().catch(() => {
         console.error(JSON.stringify({ level: "error", message: "auth_session_cleanup_failed" }));
+      }),
+      syncAvailableSub2ApiKeys(env, _event?.scheduledTime).then((result) => {
+        console.log(JSON.stringify({
+          level: "info",
+          message: "sub2api_key_sync_complete",
+          ...result,
+        }));
+      }).catch(() => {
+        console.error(JSON.stringify({ level: "error", message: "sub2api_key_sync_failed" }));
       }),
     ]));
   },

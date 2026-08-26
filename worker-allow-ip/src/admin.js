@@ -76,6 +76,8 @@ const SYNC_AUTH_USER_KEYS = new Set([
 const GEOIP_TIMEOUT_MS = 5000;
 const AUTH_STATE_RECONCILE_ATTEMPTS = 3;
 const ADMIN_PAGE_SIZE = 25;
+const SCHEDULED_SUB2API_SYNC_BATCH_SIZE = 10;
+const SCHEDULED_SUB2API_SYNC_PERIOD_MS = 24 * 60 * 60 * 1000;
 const ADMIN_IP_GROUP_PAGE_SIZE = 20;
 const MAX_ADMIN_INVITE_PAGE = 400;
 const MAX_ADMIN_TRASH_PAGE = 800;
@@ -109,10 +111,9 @@ export async function handleAdmin(request, env) {
       );
     }
     if (error instanceof Sub2ApiSyncError) {
-      const retry = error.retryable ? " Try again after the dependency recovers." : "";
       const response = html(renderMessage(
         "Sub2API request failed",
-        `The sync service returned ${error.code}. Request ID: ${error.requestId}.${retry}`,
+        `${sub2ApiSyncFailureMessage(error)} Request ID: ${error.requestId}.`,
       ), error.status);
       response.headers.set("x-request-id", error.requestId);
       if (error.retryable && [429, 503, 504].includes(error.status)) {
@@ -126,6 +127,19 @@ export async function handleAdmin(request, env) {
       : "The requested admin action could not be completed. Refresh the admin page and try again.";
     return html(renderMessage("Admin action failed", message), isUserFacingAdminError(error) ? 400 : 500);
   }
+}
+
+function sub2ApiSyncFailureMessage(error) {
+  const messages = {
+    email_conflict: "This email is already used by another active Sub2API user. Change the email and save again.",
+    api_key_conflict: "This API key is already assigned to another active Sub2API user.",
+    data_conflict: "Sub2API rejected a duplicate value. Check the email and API keys, then save again.",
+    identity_conflict: "This Gate account no longer matches its Sub2API user. Refresh Sub2API before editing.",
+  };
+  const message = messages[String(error?.code || "")];
+  if (message) return message;
+  const retry = error?.retryable ? " Try again after the dependency recovers." : "";
+  return `The sync service returned ${String(error?.code || "unknown_error")}.${retry}`;
 }
 
 async function handleAdminRequest(request, env) {
@@ -641,6 +655,14 @@ export async function refreshInviteFromSub2Api(env, uuid) {
     return null;
   }
 
+  const pulled = await pullInviteFromSub2Api(env, invite);
+  await saveInvites(env, invites);
+  return invite;
+}
+
+async function pullInviteFromSub2Api(env, invite) {
+  const uuid = invite.uuid;
+
   const previousSync = invite.sub2apiSync || {};
   const syncResult = await callSub2ApiSync(env, "status", {
     uuid,
@@ -648,8 +670,13 @@ export async function refreshInviteFromSub2Api(env, uuid) {
     name: inviteUsername(invite) || uuid,
     sub2apiUserId: previousSync.userId || 0,
   });
+  const externalConfigs = (invite.apiConfigs || []).filter(
+    (config) => !isManagedSub2ApiConfig(env, config),
+  );
   if (!syncResult.exists) {
-    return invite;
+    invite.apiConfigs = dedupeApiConfigs(externalConfigs);
+    invite.updatedAt = new Date().toISOString();
+    return { invite, exists: false };
   }
 
   const nextPasswordFingerprint = String(syncResult.passwordHashFingerprint || "") || (
@@ -677,10 +704,70 @@ export async function refreshInviteFromSub2Api(env, uuid) {
     passwordChangedExternally,
   };
   delete invite.sub2apiSync.passwordHash;
-  invite.apiConfigs = mergeSub2ApiConfig(env, invite.apiConfigs, syncResult);
+  invite.apiConfigs = mergeSub2ApiConfig(env, externalConfigs, syncResult);
   invite.updatedAt = new Date().toISOString();
-  await saveInvites(env, invites);
-  return invite;
+  return { invite, exists: true };
+}
+
+export async function syncAvailableSub2ApiKeys(env, scheduledTime = Date.now()) {
+  const store = authStateStore(env);
+  const snapshot = await store.readInvites();
+  const items = normalizeStoredInvites(Array.isArray(snapshot?.items) ? snapshot.items : []);
+  const initialRevision = Number(snapshot?.revision);
+  if (!Number.isSafeInteger(initialRevision) || initialRevision < 0) {
+    throw new Error("auth_state_revision_invalid");
+  }
+  if (items.length === 0) {
+    return { total: 0, checked: 0, refreshed: 0, missing: 0, failed: 0, conflict: false };
+  }
+
+  const batch = scheduledSub2ApiSyncBatch(items, scheduledTime);
+  let revision = initialRevision;
+  let checked = 0;
+  let refreshed = 0;
+  let missing = 0;
+  let failed = 0;
+  let conflict = false;
+
+  for (const storedInvite of batch) {
+    checked += 1;
+    try {
+      const invite = await store.getInvite(storedInvite.uuid, { reveal: true });
+      if (!invite) {
+        missing += 1;
+        continue;
+      }
+      const pulled = await pullInviteFromSub2Api(env, invite);
+      const write = await store.upsertInvite(revision, pulled.invite);
+      if (write?.conflict) {
+        conflict = true;
+        break;
+      }
+      requireAuthStateWrite(write);
+      revision = write.revision;
+      if (pulled.exists) {
+        refreshed += 1;
+      } else {
+        missing += 1;
+      }
+    } catch {
+      failed += 1;
+    }
+  }
+
+  return { total: items.length, checked, refreshed, missing, failed, conflict };
+}
+
+function scheduledSub2ApiSyncBatch(items, scheduledTime) {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  const batchCount = Math.ceil(items.length / SCHEDULED_SUB2API_SYNC_BATCH_SIZE);
+  const timestamp = Number(scheduledTime);
+  const cycle = Math.floor(
+    (Number.isFinite(timestamp) && timestamp >= 0 ? timestamp : Date.now())
+      / SCHEDULED_SUB2API_SYNC_PERIOD_MS,
+  );
+  const offset = (cycle % batchCount) * SCHEDULED_SUB2API_SYNC_BATCH_SIZE;
+  return items.slice(offset, offset + SCHEDULED_SUB2API_SYNC_BATCH_SIZE);
 }
 
 export async function resetInviteSub2ApiPassword(env, uuid) {
@@ -1005,8 +1092,12 @@ async function getAdminDashboard(env, adminUrl) {
   };
 }
 
-async function hydrateAdminInvite(env, storedInvite, _editUuid = "", requestedIpPage = 1) {
+async function hydrateAdminInvite(env, storedInvite, editUuid = "", requestedIpPage = 1) {
   const invite = summarizeStoredInvite(env, storedInvite);
+  if (editUuid) {
+    const revealed = await revealStoredInvite(env, storedInvite);
+    invite.apiConfigs = normalizeApiConfigEditorRows(revealed.apiConfigs);
+  }
   const { records, recordsOversized } = await getAdminIpRecords(env, invite.uuid);
   const recordCount = records.length;
   const ipPageCount = Math.max(1, Math.ceil(recordCount / ADMIN_IP_GROUP_PAGE_SIZE));
@@ -3017,6 +3108,12 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
       document.addEventListener("input", (event) => {
         const input = event.target.closest('[data-field="api-key"]');
         if (!input) return;
+        const row = input.closest(".api-config-row");
+        if (row?.dataset.existingCredentialId) {
+          delete row.dataset.existingCredentialId;
+          row.querySelector(".credential-meta")?.remove();
+          input.placeholder = "sk-...";
+        }
         const field = input.closest(".api-key-field");
         const hasValue = Boolean(input.value);
         const revealButton = field?.querySelector(".toggle-api-key");
@@ -3148,7 +3245,7 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
             const existingMarker = row.dataset.existingCredentialId
               ? "${EXISTING_CREDENTIAL_MARKER_PREFIX}" + encodeURIComponent(row.dataset.existingCredentialId)
               : "";
-            const credential = apiKey || existingMarker;
+            const credential = existingMarker || apiKey;
             if (!baseUrl && !credential) return "";
             return [name || "Sub2API", baseUrl, credential].join(" | ");
           })
@@ -3628,7 +3725,7 @@ function renderApiConfigEditor(editorId, apiConfigs, defaultBaseUrl) {
 
 function renderApiConfigInputRow(config) {
   const credentialId = config.credentialConfigured ? String(config.id || "") : "";
-  const apiKey = credentialId ? "" : String(config.apiKey || "");
+  const apiKey = String(config.apiKey || "");
   const credentialAttributes = credentialId
     ? ` data-existing-credential-id="${escapeHtml(credentialId)}"`
     : "";
@@ -3637,10 +3734,10 @@ function renderApiConfigInputRow(config) {
       <input type="text" data-field="name" aria-label="API link name" maxlength="80" placeholder="Name" value="${escapeHtml(config.name || "")}" />
       <input type="url" data-field="base-url" aria-label="API base URL" placeholder="https://example.com/v1" value="${escapeHtml(config.baseUrl || "")}" />
       <div class="api-key-field">
-        <input type="password" data-field="api-key" aria-label="API key" placeholder="${credentialId ? "Saved - leave blank to keep" : "sk-..."}" value="${escapeHtml(apiKey)}" autocomplete="new-password" spellcheck="false" />
+        <input type="password" data-field="api-key" aria-label="API key" placeholder="sk-..." value="${escapeHtml(apiKey)}" autocomplete="new-password" spellcheck="false" />
         <button class="secondary compact toggle-api-key" type="button" aria-label="Show API key"${apiKey ? "" : " disabled"}>Show</button>
         <button class="secondary compact copy-api-key" type="button"${apiKey ? "" : " disabled"}>Copy</button>
-        ${credentialId ? `<small class="credential-meta">Credential ID: ${escapeHtml(credentialId)}. Saved; leave blank to keep this credential. Enter a new key to replace it.</small>` : ""}
+        ${credentialId ? `<small class="credential-meta">Credential ID: ${escapeHtml(credentialId)}. Saved; leave unchanged to keep this credential. Edit the key to replace it.</small>` : ""}
       </div>
       <button class="secondary compact remove-api-link" type="button">Remove</button>
     </div>
@@ -5060,6 +5157,9 @@ function renderIssuedAccessKeys(items, remainingCount = 0, returnHref = ADMIN_PA
     ? items.map((item) => `
       <div class="endpoint-summary">
         <strong>${escapeHtml(item.username || item.uuid)}</strong>
+        <span class="muted">UUID</span>
+        <code>${escapeHtml(item.uuid)}</code>
+        <span class="muted">Access key</span>
         <code>${escapeHtml(item.accessKey)}</code>
         <button class="secondary compact copy-value" type="button" data-copy="${escapeHtml(item.accessKey)}">Copy</button>
       </div>
@@ -6188,6 +6288,7 @@ export const __test = Object.freeze({
   exceedsUtf8ByteLimit,
   SUB2API_SYNC_TIMEOUT_MS,
   sub2apiSyncTimeoutForAction,
+  sub2ApiSyncFailureMessage,
   totp,
   verifyTotp,
   createInvite,
@@ -6206,6 +6307,8 @@ export const __test = Object.freeze({
   loadKeyGroupCatalog,
   renderKeyGroupPicker,
   testInviteApiKey,
+  syncAvailableSub2ApiKeys,
+  scheduledSub2ApiSyncBatch,
   keyTestNotice,
   keyTestAttemptKey,
   purgeSub2ApiUser,

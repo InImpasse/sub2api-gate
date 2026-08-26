@@ -149,6 +149,47 @@ class Sub2ApiCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(statements, [])
 
+    def test_provision_rejects_an_email_owned_by_another_active_user_before_write(self):
+        statements = []
+        secret = "s" * 32
+        owner = SYNC.hmac.new(
+            secret.encode(),
+            b"sub2api-invite-owner:v1:" + self.UUID.encode(),
+            SYNC.hashlib.sha256,
+        ).hexdigest()
+
+        def first_row(sql):
+            if "FROM users u" in sql and "u.id=9" in sql:
+                return [
+                    "9", "alice-example", "user", owner,
+                    "old@example.test", "bcrypt-hash", "active",
+                ]
+            if "FROM users WHERE email=" in sql:
+                return ["10"]
+            raise AssertionError(sql)
+
+        with mock.patch.dict(
+            SYNC.os.environ,
+            {"SUB2API_SYNC_SECRET": secret},
+            clear=True,
+        ), mock.patch.object(
+            SYNC, "database_transaction", return_value=nullcontext()
+        ), mock.patch.object(
+            SYNC, "first_row", side_effect=first_row
+        ), mock.patch.object(
+            SYNC, "psql", side_effect=statements.append
+        ):
+            with self.assertRaisesRegex(RuntimeError, "email_conflict"):
+                SYNC.provision({
+                    "uuid": self.UUID,
+                    "username": "alice-example",
+                    "email": "taken@example.test",
+                    "sub2apiUserId": 9,
+                    "tokens": [],
+                })
+
+        self.assertEqual(statements, [])
+
     def test_status_rejects_a_user_id_owned_by_another_invite_before_key_lookup(self):
         foreign_owner = "f" * 64
 

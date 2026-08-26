@@ -157,7 +157,7 @@ async function postCreate(miniflare, apiConfigs) {
   });
 }
 
-test("admin edit keeps encrypted credentials without exposing them and rejects invalid reuse", { timeout: 30_000 }, async (t) => {
+test("admin edit reveals only the selected API credential and safely reuses it", { timeout: 30_000 }, async (t) => {
   const outboundBodies = [];
   const miniflare = makeMiniflare(outboundBodies);
   t.after(async () => await miniflare.dispose());
@@ -185,13 +185,17 @@ test("admin edit keeps encrypted credentials without exposing them and rejects i
   );
   const editHtml = await editResponse.text();
   assert.equal(editResponse.status, 200);
-  assert.doesNotMatch(editHtml, new RegExp(API_SECRET));
+  assert.match(editHtml, new RegExp(API_SECRET));
   assert.doesNotMatch(editHtml, new RegExp(LOGIN_SECRET));
   assert.doesNotMatch(editHtml, /apiKeyEncrypted|A256GCM/);
   assert.match(editHtml, new RegExp(`Credential ID: ${CREDENTIAL_ID}`));
-  assert.match(editHtml, /Saved; leave blank to keep this credential/);
+  assert.match(editHtml, /Saved; leave unchanged to keep this credential/);
   assert.match(editHtml, new RegExp(`data-existing-credential-id="${CREDENTIAL_ID}"`));
-  assert.match(editHtml, /data-field="api-key"[^>]*value=""/);
+  assert.match(editHtml, new RegExp(`data-field="api-key"[^>]*value="${API_SECRET}"`));
+  const apiKeyField = editHtml.match(/<div class="api-key-field">[\s\S]*?<\/div>/)?.[0] || "";
+  assert.match(apiKeyField, /toggle-api-key/);
+  assert.match(apiKeyField, /copy-api-key/);
+  assert.doesNotMatch(apiKeyField, / disabled/);
 
   const hiddenValue = Array.from(editHtml.matchAll(/name="api_configs" value="([^"]*)"/g))
     .map((match) => match[1])

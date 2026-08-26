@@ -383,6 +383,38 @@ class SyncHttpContractTests(unittest.TestCase):
         self.assertEqual(payload["requestId"], "req-contract-5")
         self.assertEqual(payload["action"], "status")
 
+    def test_email_and_api_key_conflicts_are_non_retryable(self):
+        for runtime_code, expected in (
+            ("email_conflict", "email_conflict"),
+            ("api_key_conflict", "api_key_conflict"),
+        ):
+            with self.subTest(runtime_code=runtime_code), RunningSyncServer() as server:
+                status, response_headers, payload = self.signed_action_request(
+                    server,
+                    "provision",
+                    request_id=f"req-{runtime_code}",
+                    side_effect=RuntimeError(runtime_code),
+                )
+
+            self.assertEqual(status, 409)
+            self.assertNotIn("retry-after", response_headers)
+            self.assertEqual(payload["error"], expected)
+            self.assertFalse(payload["retryable"])
+
+    def test_unique_violation_maps_to_non_retryable_data_conflict(self):
+        with RunningSyncServer() as server:
+            status, response_headers, payload = self.signed_action_request(
+                server,
+                "provision",
+                request_id="req-data-conflict",
+                side_effect=SYNC.DatabaseCommandError("23505"),
+            )
+
+        self.assertEqual(status, 409)
+        self.assertNotIn("retry-after", response_headers)
+        self.assertEqual(payload["error"], "data_conflict")
+        self.assertFalse(payload["retryable"])
+
     def test_dependency_timeout_maps_to_retryable_gateway_timeout(self):
         with RunningSyncServer() as server:
             status, response_headers, payload = self.signed_action_request(
@@ -422,7 +454,7 @@ class SyncHttpContractTests(unittest.TestCase):
                 server,
                 "status",
                 request_id=request_id,
-                side_effect=SYNC.DatabaseCommandError("23505"),
+                side_effect=SYNC.DatabaseCommandError("42P01"),
             )
             self.assertEqual(status, 503)
             self.assertEqual(payload["error"], "dependency_unavailable")
@@ -446,7 +478,7 @@ class SyncHttpContractTests(unittest.TestCase):
             "requestId": request_id,
             "action": "status",
             "category": "database_error",
-            "sqlstate": "23505",
+            "sqlstate": "42P01",
             "recordedAt": payload["diagnostic"]["recordedAt"],
         })
         self.assertIsInstance(payload["diagnostic"]["recordedAt"], int)

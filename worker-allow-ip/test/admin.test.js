@@ -409,6 +409,21 @@ test("admin preserves stable sync failures without exposing upstream detail", as
   }
 });
 
+test("admin explains Sub2API data conflicts without exposing values", () => {
+  assert.equal(
+    __test.sub2ApiSyncFailureMessage({ code: "email_conflict", retryable: false }),
+    "This email is already used by another active Sub2API user. Change the email and save again.",
+  );
+  assert.equal(
+    __test.sub2ApiSyncFailureMessage({ code: "api_key_conflict", retryable: false }),
+    "This API key is already assigned to another active Sub2API user.",
+  );
+  assert.equal(
+    __test.sub2ApiSyncFailureMessage({ code: "data_conflict", retryable: false }),
+    "Sub2API rejected a duplicate value. Check the email and API keys, then save again.",
+  );
+});
+
 test("Cloudflare deletion resolves current IDs instead of stale stored IDs", () => {
   const ids = __test.resolveCurrentCloudflareDeleteIds(
     [{ listItemId: "stale", listValue: "198.51.100.0/24" }],
@@ -635,7 +650,7 @@ test("selected admin detail reads one invite record and paginates IP groups by 2
   assert.equal(dashboard.selectedInvite.records[19].id, "group-39");
 });
 
-test("edit URL returns credential metadata without decrypting the selected invite", async () => {
+test("edit URL reveals only the selected invite API credential", async () => {
   const editUuid = "00000000-0000-4000-8000-000000000001";
   let recordReads = 0;
   let detailLookups = 0;
@@ -666,7 +681,7 @@ test("edit URL returns credential metadata without decrypting the selected invit
           id: "credential-edit-1",
           name: "OpenAI",
           baseUrl: "https://provider.example.test/v1",
-          apiKeyEncrypted: { v: 2, alg: "A256GCM", iv: "not-decryptable", data: "not-decryptable" },
+          apiKey: "sk-selected-edit-only",
         }],
         sub2apiSync: {},
       };
@@ -701,9 +716,10 @@ test("edit URL returns credential metadata without decrypting the selected invit
     id: "credential-edit-1",
     name: "OpenAI",
     baseUrl: "https://provider.example.test/v1",
-    credentialConfigured: true,
+    apiKey: "sk-selected-edit-only",
+    credentialConfigured: false,
   }]);
-  assert.doesNotMatch(JSON.stringify(dashboard.selectedInvite), /apiKey|A256GCM|not-decryptable/);
+  assert.match(JSON.stringify(dashboard.selectedInvite), /sk-selected-edit-only/);
 });
 
 test("removing the final saved API row clears its credential reference", () => {

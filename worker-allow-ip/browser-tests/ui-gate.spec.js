@@ -1399,6 +1399,19 @@ test("admin copy actions report clipboard rejection without unhandled errors", a
   await expect(page.locator('input[name="admin_context"][value$="v=e"]')).not.toHaveCount(0);
   await expect(page.locator('form:has(input[name="action"][value="update_invite"]) input[name="step_up_token"]')).toHaveCount(0);
   await expect(page.locator('form:has(input[name="action"][value="reset_sub2api_password"]) input[name="step_up_token"]')).toHaveCount(0);
+  const editForm = page.locator('form:has(input[name="action"][value="update_invite"])');
+  const savedApiKey = editForm.locator('[data-field="api-key"]');
+  const savedReveal = editForm.locator('.toggle-api-key');
+  const savedCopy = editForm.locator('.copy-api-key');
+  await expect(savedApiKey).toHaveValue("sk-browser-ui-test-sentinel");
+  await expect(savedReveal).toBeEnabled();
+  await expect(savedCopy).toBeEnabled();
+  await savedReveal.click();
+  await expect(savedApiKey).toHaveAttribute("type", "text");
+  await savedReveal.click();
+  await expect(savedApiKey).toHaveAttribute("type", "password");
+  await savedCopy.click();
+  await expect(savedCopy).toHaveText("Copy failed");
   const copyRow = page.locator(".copy-row").first();
   await copyRow.click();
   await expect(copyRow).toHaveText("Copy failed");
@@ -1409,6 +1422,7 @@ test("admin copy actions report clipboard rejection without unhandled errors", a
     rotateForm.getByRole("button", { name: "Rotate key" }).click(),
   ]);
   const issuedKeyCopy = page.locator(".copy-value").first();
+  await expect(page.getByText(PUBLIC_UUID, { exact: true })).toBeVisible();
   await issuedKeyCopy.click();
   await expect(issuedKeyCopy).toHaveText("Copy failed");
   await expect(page.locator("#clipboard-status")).toHaveAttribute("role", "alert");

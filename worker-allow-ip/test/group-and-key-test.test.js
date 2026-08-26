@@ -8,6 +8,7 @@ import {
   hasInviteStorageSchema,
   parseKeyGroupName,
   protectInviteCredentials,
+  revealInviteCredentials,
 } from "../src/credential-security.js";
 import { consumeRateLimitAttempt } from "../src/auth-rate-limiter.js";
 import { renderInviteSummary } from "../src/invite-summary.js";
@@ -29,6 +30,135 @@ test("parseKeyGroupName accepts real groups and rejects default", () => {
   for (const invalid of ["default", "Default", "DEFAULT", "bad name", "../x", ""]) {
     if (!invalid) continue;
     assert.throws(() => parseKeyGroupName(invalid), /Invalid key group/);
+  }
+});
+
+test("scheduled Sub2API key sync caps and rotates daily batches", () => {
+  const items = Array.from({ length: 11 }, (_, index) => ({ uuid: String(index) }));
+  const first = adminTest.scheduledSub2ApiSyncBatch(items, Date.UTC(2026, 7, 26));
+  const second = adminTest.scheduledSub2ApiSyncBatch(items, Date.UTC(2026, 7, 27));
+  assert.deepEqual([first.length, second.length].sort((left, right) => left - right), [1, 10]);
+  assert.equal(first.some((item) => second.includes(item)), false);
+});
+
+test("scheduled Sub2API key sync pulls active keys and keeps them encrypted", async () => {
+  const oldKey = `sk-${"a".repeat(64)}`;
+  const newKey = `sk-${"b".repeat(64)}`;
+  const externalKey = `sk-${"e".repeat(64)}`;
+  let revision = 4;
+  let stored = await protectInviteCredentials({
+    uuid: UUID,
+    username: "alice",
+    name: "alice",
+    accessKeyHmac: "c".repeat(64),
+    credentialVersion: 2,
+    accessCredentialVersion: 1,
+    apiConfigs: [{
+      id: "sub2api-sync",
+      name: "Sub2API",
+      baseUrl: "https://api.example.test/v1",
+      apiKey: oldKey,
+      groupName: "openai-default",
+    }, {
+      id: "external-provider",
+      name: "External",
+      baseUrl: "https://provider.example.test/v1",
+      apiKey: externalKey,
+    }],
+    sub2apiSync: { userId: 9, apiKeyId: 21, tokenId: 21, username: "alice" },
+  }, AES_KEY, HMAC_KEY);
+  const stub = {
+    async status() { return { migrated: true }; },
+    async getInvites() { return { revision, items: [stored] }; },
+    async getInvite(uuid) {
+      assert.equal(uuid, UUID);
+      return stored;
+    },
+    async upsertInvite(expectedRevision, invite) {
+      assert.equal(expectedRevision, revision);
+      assert.doesNotMatch(JSON.stringify(invite), new RegExp(`${oldKey}|${newKey}|${externalKey}`));
+      stored = invite;
+      revision += 1;
+      return { ok: true, conflict: false, revision };
+    },
+  };
+  const env = {
+    AUTH_STATE: { getByName() { return stub; } },
+    CREDENTIAL_ENCRYPTION_KEY: AES_KEY,
+    INVITE_ACCESS_HMAC_KEY: HMAC_KEY,
+    ALLOWED_HOSTNAMES: "api.example.test",
+    PROVIDER_ALLOWED_HOSTNAMES: "provider.example.test",
+    SUB2API_SYNC_SECRET: "s".repeat(32),
+    SUB2API_SYNC_URL: "https://api.example.test/_sub2api-sync/provision",
+    SUB2API_DEFAULT_BASE_URL: "https://api.example.test/v1",
+  };
+  const originalFetch = globalThis.fetch;
+  let exists = true;
+  globalThis.fetch = async (_url, init) => {
+    const request = JSON.parse(init.body);
+    assert.equal(request.action, "status");
+    assert.equal(request.uuid, UUID);
+    if (!exists) {
+      return Response.json({
+        ok: true,
+        action: "status",
+        uuid: UUID,
+        exists: false,
+        tokens: [],
+        syncedAt: new Date().toISOString(),
+      });
+    }
+    return Response.json({
+      ok: true,
+      action: "status",
+      uuid: UUID,
+      exists: true,
+      username: "alice",
+      email: "alice@example.test",
+      userId: 9,
+      tokenId: 21,
+      passwordHashFingerprint: "d".repeat(64),
+      tokens: [{
+        tokenId: 21,
+        apiKeyId: 21,
+        name: "Sub2API",
+        tokenKey: newKey,
+        apiKey: newKey,
+        status: 1,
+        groupName: "openai-default",
+      }],
+      baseUrl: "https://api.example.test/v1",
+      loginUrl: "https://api.example.test/login",
+      syncedAt: new Date().toISOString(),
+    });
+  };
+  try {
+    const result = await adminTest.syncAvailableSub2ApiKeys(env, Date.UTC(2026, 7, 26));
+    assert.deepEqual(result, {
+      total: 1,
+      checked: 1,
+      refreshed: 1,
+      missing: 0,
+      failed: 0,
+      conflict: false,
+    });
+    const revealed = await revealInviteCredentials(stored, AES_KEY);
+    assert.equal(revealed.apiConfigs.some((config) => config.apiKey === newKey), true);
+    assert.equal(revealed.apiConfigs.some((config) => config.apiKey === oldKey), false);
+    assert.equal(revealed.apiConfigs.some((config) => config.apiKey === externalKey), true);
+    assert.doesNotMatch(JSON.stringify(stored), new RegExp(`${oldKey}|${newKey}|${externalKey}`));
+
+    exists = false;
+    assert.deepEqual(
+      await adminTest.syncAvailableSub2ApiKeys(env, Date.UTC(2026, 7, 27)),
+      { total: 1, checked: 1, refreshed: 0, missing: 1, failed: 0, conflict: false },
+    );
+    const afterRemoval = await revealInviteCredentials(stored, AES_KEY);
+    assert.equal(afterRemoval.apiConfigs.some((config) => config.apiKey === newKey), false);
+    assert.equal(afterRemoval.apiConfigs.some((config) => config.apiKey === externalKey), true);
+    assert.doesNotMatch(JSON.stringify(stored), new RegExp(`${oldKey}|${newKey}|${externalKey}`));
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 

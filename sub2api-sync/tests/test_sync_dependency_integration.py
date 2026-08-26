@@ -442,6 +442,43 @@ class SyncDependencyIntegrationTests(unittest.TestCase):
         })
         self.assertEqual(reprovisioned["userId"], provisioned["userId"])
         self.assertEqual(reprovisioned["apiKeyId"], provisioned["apiKeyId"])
+        conflicting_email = "already-used@example.test"
+        conflicting_key = "sk-" + "b" * 48
+        SYNC.psql(
+            "INSERT INTO users "
+            "(email,password_hash,role,balance,concurrency,status,username,created_at,updated_at) "
+            f"VALUES ({SYNC.sql_quote(conflicting_email)},crypt('temporary-password',gen_salt('bf')),'user',0,5,'active',"
+            "'other-active-user',now(),now());"
+            "INSERT INTO api_keys "
+            "(user_id,key,name,status,quota,quota_used,created_at,updated_at) "
+            "SELECT id,"
+            f"{SYNC.sql_quote(conflicting_key)},'Other key','active',0,0,now(),now() "
+            "FROM users WHERE username='other-active-user';"
+        )
+        with self.assertRaisesRegex(RuntimeError, "email_conflict"):
+            SYNC.provision({
+                **provision_payload,
+                "sub2apiUserId": provisioned["userId"],
+                "email": conflicting_email,
+            })
+        with self.assertRaisesRegex(RuntimeError, "api_key_conflict"):
+            SYNC.provision({
+                **provision_payload,
+                "sub2apiUserId": provisioned["userId"],
+                "tokens": [{"tokenKey": conflicting_key, "tokenName": "Conflict"}],
+            })
+        self.assertEqual(
+            self._scalar(
+                f"SELECT email FROM users WHERE id={provisioned['userId']};"
+            ),
+            email,
+        )
+        self.assertEqual(
+            self._scalar(
+                f"SELECT key FROM api_keys WHERE id={provisioned['apiKeyId']};"
+            ),
+            token,
+        )
         status = SYNC.status({
             "uuid": invite_uuid,
             "username": username,

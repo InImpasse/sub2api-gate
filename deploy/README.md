@@ -1266,3 +1266,14 @@ The Worker enforces five failed admin logins per 15-minute HMAC-keyed window.
 Keep a Cloudflare rate-limit rule on public/admin POST endpoints as an outer
 abuse control, but do not add a Worker or sync hop to `/v1/*`. The WAF allowlist
 continues to protect API traffic without changing the direct origin path.
+
+The existing `17 3 * * *` UTC Cron also refreshes active Sub2API keys for up
+to 10 existing Gate accounts per run. Larger collections rotate to the next
+batch by UTC day. Sub2API `status` is authoritative only for managed Sub2API
+keys: inactive or deleted managed keys are removed, while external provider
+links, Gate access keys, and IP records are unchanged. Existing password
+fingerprint handling may mark a Sub2API login password as externally changed,
+but never imports that password.
+Every updated key is encrypted before the AuthState CAS write. Scheduled logs
+contain counts only; no username, UUID, key, or response body is logged, and
+ordinary public/admin GET requests never trigger the batch.
