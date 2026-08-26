@@ -304,6 +304,11 @@ browser-login proof. Do not replace this controller with a bare `wrangler
 deploy`, and do not use it for final-source until the documented promoted-seed
 proof has completed.
 
+After the documented final-source proof and removal of both rotation staging
+Secrets, later canonical Worker releases use `--totp-rotation-stage canonical`.
+That stage repeats the final-source scan and requires the temporary Secret names
+to remain absent; it never recreates them.
+
 `deploy/recover-worker-admin.py --apply` can read the new password and TOTP
 seed from a pair of operator-owned mode-`0600` files instead of `getpass`,
 which often truncates or corrupts pasted input. Both files must be absolute

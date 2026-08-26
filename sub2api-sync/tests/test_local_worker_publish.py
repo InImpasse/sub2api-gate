@@ -36,6 +36,7 @@ class LocalWorkerPublishTests(unittest.TestCase):
         staged = PUBLISHER.release_spec("stage")
         promoted = PUBLISHER.release_spec("promoted")
         final_source = PUBLISHER.release_spec("final-source")
+        canonical = PUBLISHER.release_spec("canonical")
 
         self.assertEqual(compatibility.commit, PUBLISHER.COMPATIBILITY_RELEASE)
         self.assertEqual(compatibility.secret_requirement, "--forbid-totp-rotation-staging")
@@ -45,6 +46,9 @@ class LocalWorkerPublishTests(unittest.TestCase):
         self.assertEqual(promoted.secret_requirement, "--require-totp-rotation-staging")
         self.assertEqual(final_source.commit, PUBLISHER.FINAL_SOURCE_RELEASE)
         self.assertTrue(final_source.verify_final_source)
+        self.assertEqual(canonical.commit, PUBLISHER.FINAL_SOURCE_RELEASE)
+        self.assertEqual(canonical.secret_requirement, "--forbid-totp-rotation-staging")
+        self.assertTrue(canonical.verify_final_source)
         with self.assertRaisesRegex(PUBLISHER.LocalPublishError, "unsupported"):
             PUBLISHER.release_spec("unknown")
 

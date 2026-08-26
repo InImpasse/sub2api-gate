@@ -183,6 +183,12 @@ def release_spec(stage):
             "--require-totp-rotation-staging",
             verify_final_source=True,
         )
+    if stage == "canonical":
+        return ReleaseSpec(
+            FINAL_SOURCE_RELEASE,
+            "--forbid-totp-rotation-staging",
+            verify_final_source=True,
+        )
     raise LocalPublishError("unsupported local Worker TOTP rotation stage")
 
 
@@ -432,7 +438,7 @@ def main(argv=None, *, runner=subprocess.run):
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("check",), nargs="?")
     parser.add_argument("--apply", action="store_true", help="publish the reviewed Worker release after all gates pass")
-    parser.add_argument("--totp-rotation-stage", choices=("compatibility", "stage", "promoted", "final-source"), default="compatibility")
+    parser.add_argument("--totp-rotation-stage", choices=("compatibility", "stage", "promoted", "final-source", "canonical"), default="compatibility")
     parser.add_argument("--node", type=pathlib.Path, default=pathlib.Path(shutil.which("node") or ""))
     parser.add_argument("--home", type=pathlib.Path, default=pathlib.Path(os.environ.get("HOME", "")))
     parser.add_argument("--wrangler-config", type=pathlib.Path, default=ROOT / PRIVATE_CONFIG_RELATIVE)
