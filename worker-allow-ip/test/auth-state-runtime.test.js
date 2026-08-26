@@ -578,7 +578,7 @@ test("AuthState rejects invite fields outside the v2 storage schema", { timeout:
   }
 });
 
-test("AuthState rejects malformed credential envelopes and raw fingerprints", { timeout: 30_000 }, async (t) => {
+test("AuthState rejects malformed credential envelopes and raw fingerprints", { timeout: 30_000 }, async () => {
   const unsafeInvites = [
     {
       ...invite(),
@@ -606,20 +606,23 @@ test("AuthState rejects malformed credential envelopes and raw fingerprints", { 
 
   for (const unsafeInvite of unsafeInvites) {
     const miniflare = makeMiniflare();
-    t.after(async () => await miniflare.dispose());
-    const result = await postRaw(miniflare, "/import", {
-      snapshot: {
-        invites: [unsafeInvite],
-        trash: [],
-        adminSessions: [],
-        publicSessions: [],
-      },
-    });
-    assert.equal(result.response.status, 500);
-    assert.match(
-      result.value.error,
-      /^auth_state_(?:invite_schema|access_key_hmac)_invalid$/,
-    );
+    try {
+      const result = await postRaw(miniflare, "/import", {
+        snapshot: {
+          invites: [unsafeInvite],
+          trash: [],
+          adminSessions: [],
+          publicSessions: [],
+        },
+      });
+      assert.equal(result.response.status, 500);
+      assert.match(
+        result.value.error,
+        /^auth_state_(?:invite_schema|access_key_hmac)_invalid$/,
+      );
+    } finally {
+      await miniflare.dispose();
+    }
   }
 });
 

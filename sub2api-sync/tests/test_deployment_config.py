@@ -29,6 +29,7 @@ REDIS_NONCE_TEST = ROOT / "deploy" / "test-sync-nonce-redis.sh"
 NGINX_TEST = ROOT / "deploy" / "test-nginx-config.sh"
 SUB2API_LOG_TEST = ROOT / "deploy" / "test-sub2api-no-content-logging.sh"
 MIGRATION_RUNNER = ROOT / "deploy" / "run-database-migration.sh"
+ACTIVE_POSTGRES_EXEC = ROOT / "deploy" / "active-postgres-exec.py"
 MIGRATION_TOTP = ROOT / "deploy" / "verify-migration-totp.py"
 SECRET_GENERATOR = ROOT / "deploy" / "generate-worker-secrets.py"
 SECURITY_PREFLIGHT = ROOT / "deploy" / "security-preflight.sh"
@@ -229,6 +230,10 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn(
             '"$PYTHON3" -I "$pg_env_exec" --target-private-env-file "$env_file"', script
         )
+        self.assertIn('active_pg_exec="$repo_dir/deploy/active-postgres-exec.py"', script)
+        self.assertIn("--active-app-id", script)
+        self.assertIn("--active-postgres-id", script)
+        self.assertIn('"$PYTHON3" -I "$active_pg_exec"', script)
         self.assertIn('source_pg_exec="$repo_dir/deploy/source-postgres-exec.py"', script)
         self.assertIn("--source-app-container", script)
         self.assertIn("--source-app-id", script)
@@ -281,6 +286,61 @@ class DeploymentConfigTests(unittest.TestCase):
                 "migrations/verify_no_conversation_content.sql"
             ),
         )
+
+    def test_sync_role_check_accepts_exact_active_container_ids_without_opening_database(self):
+        result = subprocess.run(
+            [
+                MIGRATION_RUNNER,
+                "sync-role",
+                "check",
+                "--active-app-id",
+                "a" * 64,
+                "--active-postgres-id",
+                "b" * 64,
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no database connection was opened", result.stdout)
+        self.assertIn("active production PostgreSQL container", result.stdout)
+
+    def test_active_container_ids_are_paired_and_limited_to_sync_role(self):
+        cases = (
+            ["sync-role", "check", "--active-app-id", "a" * 64],
+            [
+                "sync-role",
+                "check",
+                "--active-app-id",
+                "a" * 63,
+                "--active-postgres-id",
+                "b" * 64,
+            ],
+            [
+                "usage-indexes",
+                "check",
+                "--active-app-id",
+                "a" * 64,
+                "--active-postgres-id",
+                "b" * 64,
+            ],
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    [MIGRATION_RUNNER, *arguments],
+                    cwd=ROOT,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 2)
+
+    def test_active_postgres_helper_is_tracked_and_executable(self):
+        self.assertTrue(ACTIVE_POSTGRES_EXEC.is_file())
+        self.assertTrue(ACTIVE_POSTGRES_EXEC.stat().st_mode & 0o100)
 
     def test_privacy_apply_requires_totp_before_database_credentials_or_psql(self):
         script = MIGRATION_RUNNER.read_text()

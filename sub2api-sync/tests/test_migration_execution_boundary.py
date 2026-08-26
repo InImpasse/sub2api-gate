@@ -46,6 +46,20 @@ class MigrationExecutionBoundaryTests(unittest.TestCase):
                 "sha256sum",
             ),
             (SAFE_EXPORT, ["--apply", *self.apply_arguments()], "timeout"),
+            (
+                MIGRATION_RUNNER,
+                [
+                    "sync-role",
+                    "--apply",
+                    "--env-file",
+                    "/tmp/not-opened-before-security-gate.env",
+                    "--active-app-id",
+                    "a" * 64,
+                    "--active-postgres-id",
+                    "b" * 64,
+                ],
+                "sha256sum",
+            ),
         )
         with tempfile.TemporaryDirectory() as directory:
             directory_path = pathlib.Path(directory)

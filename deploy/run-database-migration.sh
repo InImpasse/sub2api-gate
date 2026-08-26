@@ -64,7 +64,8 @@ require_production_apply_context() {
   [ "$repo_dir" = "$TRUSTED_RELEASE_ROOT" ] \
     && [ "$source_path" = "$TRUSTED_CONTROLLER" ] || release_failure
   for trusted_path in / "$TRUSTED_RELEASE_PARENT" "$TRUSTED_RELEASE_ROOT" \
-    "$TRUSTED_RELEASE_ROOT/deploy" "$TRUSTED_CONTROLLER" "$TRUSTED_CLEAN_WORKTREE"; do
+    "$TRUSTED_RELEASE_ROOT/deploy" "$TRUSTED_CONTROLLER" "$TRUSTED_CLEAN_WORKTREE" \
+    "$TRUSTED_RELEASE_ROOT/deploy/active-postgres-exec.py"; do
     case "$trusted_path" in
       /|"$TRUSTED_RELEASE_PARENT"|"$TRUSTED_RELEASE_ROOT"|"$TRUSTED_RELEASE_ROOT/deploy")
         require_trusted_path "$trusted_path" directory
@@ -85,16 +86,19 @@ target="${1:-}"
 mode="${2:-check}"
 pg_env_exec="$repo_dir/deploy/pg-env-exec.py"
 source_pg_exec="$repo_dir/deploy/source-postgres-exec.py"
+active_pg_exec="$repo_dir/deploy/active-postgres-exec.py"
 runtime_logging_gate="$repo_dir/deploy/verify-postgres-runtime-logging.sql"
 env_file=""
 source_app_container=""
 source_app_id=""
 source_postgres_container=""
 source_postgres_id=""
+active_app_id=""
+active_postgres_id=""
 privacy_deadline_seconds=300
 
 usage() {
-  echo "usage: $0 <privacy|sync-role|default-group|usage-indexes|verify-content|audit-default-group> [check|--apply] [--env-file ABSOLUTE_PATH --source-app-container NAME --source-app-id FULL_ID --source-postgres-container NAME --source-postgres-id FULL_ID]" >&2
+  echo "usage: $0 <privacy|sync-role|default-group|usage-indexes|verify-content|audit-default-group> [check|--apply] [--env-file ABSOLUTE_PATH --source-app-container NAME --source-app-id FULL_ID --source-postgres-container NAME --source-postgres-id FULL_ID | --active-app-id FULL_ID --active-postgres-id FULL_ID]" >&2
   exit 2
 }
 
@@ -132,6 +136,18 @@ if [ "$#" -gt 2 ]; then
         [ -z "$source_postgres_id" ] || usage
         source_postgres_id="$1"
         ;;
+      --active-app-id)
+        shift
+        [ "$#" -gt 0 ] || usage
+        [ -z "$active_app_id" ] || usage
+        active_app_id="$1"
+        ;;
+      --active-postgres-id)
+        shift
+        [ "$#" -gt 0 ] || usage
+        [ -z "$active_postgres_id" ] || usage
+        active_postgres_id="$1"
+        ;;
       *) usage ;;
     esac
     shift
@@ -148,7 +164,7 @@ case "$target" in
     files="deploy/verify-migration-totp.py deploy/source-postgres-exec.py migrations/002_remove_conversation_capture.sql migrations/verify_conversation_guards.sql migrations/002_scrub_conversation_history.sql migrations/verify_no_conversation_content.sql"
     ;;
   sync-role)
-    files="migrations/003_sync_least_privilege.sql"
+    files="deploy/active-postgres-exec.py migrations/003_sync_least_privilege.sql migrations/verify_sync_role_least_privilege.sql"
     ;;
   default-group)
     files="migrations/audit_default_group.sql migrations/001_default_to_openai_default.sql"
@@ -176,6 +192,19 @@ if [ "$target" != "privacy" ] && [ -n "$source_identity_arguments" ]; then
   echo "source container arguments are supported only for the source privacy migration" >&2
   exit 2
 fi
+active_identity_arguments="$active_app_id$active_postgres_id"
+if [ -n "$active_identity_arguments" ]; then
+  if [ "$target" != "sync-role" ] || [ -n "$source_identity_arguments" ] \
+    || [ -z "$active_app_id" ] || [ -z "$active_postgres_id" ]; then
+    usage
+  fi
+  for container_id in "$active_app_id" "$active_postgres_id"; do
+    case "$container_id" in
+      *[!0-9a-f]*) usage ;;
+    esac
+    [ "${#container_id}" -eq 64 ] || usage
+  done
+fi
 
 if [ "$mode" = "--apply" ]; then
   if [ -z "$env_file" ]; then
@@ -201,6 +230,8 @@ if [ "$mode" != "--apply" ]; then
   echo "check only; no database connection was opened"
   if [ "$target" = "privacy" ]; then
     echo "apply uses SUB2API_SOURCE_DATABASE_URL from the private environment file"
+  elif [ -n "$active_identity_arguments" ]; then
+    echo "apply uses the exact active production PostgreSQL container"
   else
     echo "apply uses SUB2API_TARGET_DATABASE_URL from the private environment file"
   fi
@@ -221,6 +252,13 @@ if [ "$target" = "privacy" ]; then
     --source-app-state running
   )
   privacy_started_at=$SECONDS
+elif [ -n "$active_identity_arguments" ]; then
+  database_exec=(
+    "$PYTHON3" -I "$active_pg_exec"
+    --env-file "$env_file"
+    --app-id "$active_app_id"
+    --postgres-id "$active_postgres_id"
+  )
 else
   database_exec=("$PYTHON3" -I "$pg_env_exec" --target-private-env-file "$env_file")
 fi
@@ -267,14 +305,31 @@ else
   if ! SUB2API_PGOPTIONS='-c default_transaction_read_only=on -c lock_timeout=5000 -c statement_timeout=10000 -c idle_in_transaction_session_timeout=30000' \
     "${database_exec[@]}" \
       psql --no-psqlrc --quiet -v ON_ERROR_STOP=1 \
-      --file "$runtime_logging_gate" >/dev/null 2>/dev/null; then
+      < "$runtime_logging_gate" >/dev/null 2>/dev/null; then
     echo "database migration PostgreSQL logging gate failed" >&2
     exit 1
   fi
 fi
 run_sql() {
   "${database_exec[@]}" \
-    psql --no-psqlrc -v ON_ERROR_STOP=1 --file "$repo_dir/$1" 2>/dev/null
+    psql --no-psqlrc -v ON_ERROR_STOP=1 < "$repo_dir/$1" 2>/dev/null
+}
+
+verify_sync_role() {
+  local result
+  result="$(
+    SUB2API_PGOPTIONS='-c default_transaction_read_only=on -c lock_timeout=5000 -c statement_timeout=10000 -c idle_in_transaction_session_timeout=30000' \
+      "${database_exec[@]}" \
+        psql --no-psqlrc --quiet --tuples-only --no-align -v ON_ERROR_STOP=1 \
+        < "$repo_dir/migrations/verify_sync_role_least_privilege.sql" 2>/dev/null
+  )" || {
+    echo "sync runtime role verification gate failed" >&2
+    exit 1
+  }
+  [ "$result" = "ok" ] || {
+    echo "sync runtime role verification gate failed" >&2
+    exit 1
+  }
 }
 
 case "$target" in
@@ -287,6 +342,7 @@ case "$target" in
     ;;
   sync-role)
     run_sql migrations/003_sync_least_privilege.sql
+    verify_sync_role
     ;;
   default-group)
     run_sql migrations/audit_default_group.sql

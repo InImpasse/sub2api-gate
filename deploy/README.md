@@ -144,6 +144,32 @@ because a generated `ALTER ROLE` statement contains the password internally;
 failure exposes only `sub2api_sync_role_prepare_failed` or
 `sub2api_app_role_prepare_failed`.
 
+After the sanitized target becomes the active main Compose stack, PostgreSQL
+has no host-published port and the retired source URL may no longer be usable.
+Online Sub2API upgrades can still add invoker-rights triggers that require a
+least-privilege sync-role replay. For that one `sync-role` target, collect the
+current full IDs with read-only `docker inspect`, review them, and use the
+active-container mode from the trusted private root TTY:
+
+```bash
+bash deploy/run-database-migration.sh sync-role check \
+  --active-app-id FULL_SUB2API_CONTAINER_ID \
+  --active-postgres-id FULL_POSTGRES_CONTAINER_ID
+sudo bash deploy/run-database-migration.sh sync-role --apply \
+  --env-file /mnt/data/sub2api-gate/private/.env \
+  --active-app-id FULL_SUB2API_CONTAINER_ID \
+  --active-postgres-id FULL_POSTGRES_CONTAINER_ID
+```
+
+`active-postgres-exec.py` ignores the retired source URL. It validates the
+target/app URL identity only in memory, then pins the exact running app and
+PostgreSQL IDs, Compose labels, shared network, reviewed PostgreSQL image,
+storage mount, absent host port, healthy state, and `log=none` contract. SQL is
+streamed over stdin through the container's local Unix socket; no URL or
+password enters an argument. The runner repeats the PostgreSQL logging gate
+before applying and requires the read-only sync-role verifier to return `ok`
+afterward. Active-container mode is rejected for every other migration target.
+
 The privacy migration is deliberately two-phase. The short
 `002_remove_conversation_capture.sql` transaction installs and commits write
 guards first, `verify_conversation_guards.sql` checks them without reading
