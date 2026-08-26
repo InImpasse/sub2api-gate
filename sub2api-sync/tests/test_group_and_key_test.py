@@ -150,6 +150,16 @@ class GroupCatalogTests(unittest.TestCase):
         self.assertEqual(SYNC.group_profile("grok")[0], "openai")
         self.assertIn("Grok", SYNC.group_profile("grok")[1])
 
+    def test_ensure_group_sets_default_rate_only_on_insert(self):
+        with mock.patch.object(SYNC, "psql") as execute, \
+             mock.patch.object(SYNC, "lookup_active_group_id", return_value=9):
+            self.assertEqual(SYNC.ensure_group("openai-default"), 9)
+
+        sql = execute.call_args.args[0]
+        insert_sql, update_sql = sql.split("UPDATE groups SET", 1)
+        self.assertIn("rate_multiplier", insert_sql)
+        self.assertNotIn("rate_multiplier", update_sql)
+
 
 class ProvisionSelectedGroupTests(unittest.TestCase):
     def test_provision_assigns_only_the_selected_group(self):

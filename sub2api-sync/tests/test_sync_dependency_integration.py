@@ -436,12 +436,23 @@ class SyncDependencyIntegrationTests(unittest.TestCase):
             "tokens": [{"tokenKey": token, "tokenName": "Temporary key"}],
         }
         provisioned = SYNC.provision(provision_payload)
+        SYNC.psql(
+            "UPDATE groups SET rate_multiplier=2.75 "
+            "WHERE name='openai-default' AND deleted_at IS NULL;"
+        )
         reprovisioned = SYNC.provision({
             **provision_payload,
             "sub2apiUserId": provisioned["userId"],
         })
         self.assertEqual(reprovisioned["userId"], provisioned["userId"])
         self.assertEqual(reprovisioned["apiKeyId"], provisioned["apiKeyId"])
+        self.assertEqual(
+            self._scalar(
+                "SELECT rate_multiplier FROM groups "
+                "WHERE name='openai-default' AND deleted_at IS NULL;"
+            ),
+            "2.75",
+        )
         conflicting_email = "already-used@example.test"
         conflicting_key = "sk-" + "b" * 48
         SYNC.psql(

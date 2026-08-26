@@ -785,7 +785,7 @@ def ensure_group(group):
         f"{sql_quote(name)},{sql_quote(description)},"
         f"{sql_quote(platform)},'standard',0,'active',true,now(),now() "
         f"WHERE NOT EXISTS (SELECT 1 FROM groups WHERE name={sql_quote(name)} AND deleted_at IS NULL);"
-        "UPDATE groups SET subscription_type='standard', rate_multiplier=0, "
+        "UPDATE groups SET subscription_type='standard', "
         f"description=CASE WHEN COALESCE(description,'')='' THEN {sql_quote(description)} ELSE description END, "
         "status='active', allow_messages_dispatch=true, updated_at=now() "
         f"WHERE name={sql_quote(name)} AND deleted_at IS NULL;"
