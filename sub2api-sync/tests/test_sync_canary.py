@@ -1066,6 +1066,21 @@ class SyncCanaryToolTests(unittest.TestCase):
         self.assertEqual(checker.call_count, 2)
         sleeper.assert_called_once_with(0.25)
 
+    def test_port_release_probe_matches_relay_reuseaddr_contract(self):
+        probe = mock.Mock()
+        with mock.patch.object(self.tool.socket, "socket", return_value=probe):
+            self.tool.require_port_free(self.tool.SYNC_STABLE_PORT)
+
+        probe.setsockopt.assert_called_once_with(
+            self.tool.socket.SOL_SOCKET,
+            self.tool.socket.SO_REUSEADDR,
+            1,
+        )
+        probe.bind.assert_called_once_with(
+            ("127.0.0.1", self.tool.SYNC_STABLE_PORT)
+        )
+        probe.close.assert_called_once_with()
+
     def test_port_release_wait_is_bounded_and_rejects_unknown_ports(self):
         with self.assertRaisesRegex(self.tool.CanaryError, "port is invalid"):
             self.tool.wait_for_port_free(8080, checker=mock.Mock())

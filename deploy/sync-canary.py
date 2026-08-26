@@ -1388,7 +1388,7 @@ def prompt_secret(secret_reader=getpass.getpass):
 def require_port_free(port):
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         probe.bind(("127.0.0.1", port))
     except OSError as error:
         raise CanaryError("stable sync loopback port is still occupied") from error
