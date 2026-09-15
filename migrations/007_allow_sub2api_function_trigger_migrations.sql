@@ -1,6 +1,6 @@
 \set ON_ERROR_STOP on
 
--- Sub2API 0.1.176 admin online updates apply goose 222/223-style
+-- Sub2API 0.2.5 admin online updates apply goose 222/223-style
 -- CREATE FUNCTION/TRIGGER on usage_logs. Replay after 005/006.
 -- 0.1.178 goose 226 also needs additive ALTER TABLE plus table ownership.
 

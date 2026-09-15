@@ -1,6 +1,6 @@
 \set ON_ERROR_STOP on
 
--- Sub2API 0.1.176 remains the reviewed recreate baseline. Admin online
+-- Sub2API 0.2.5 remains the reviewed recreate baseline. Admin online
 -- updates through 0.1.178 goose 226 need additive ALTER TABLE on
 -- privacy-adjacent tables (channel_monitor_histories.quota) and table
 -- ownership so sub2api_app can apply those statements. Replay after 005/007.

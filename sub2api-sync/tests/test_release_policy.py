@@ -54,7 +54,7 @@ class ReleasePolicyTests(unittest.TestCase):
     def test_reviewed_policy_matches_all_active_consumers(self):
         policy = POLICY.read_policy()
         self.assertTrue(POLICY.verify(policy))
-        self.assertEqual(policy["sub2api"]["version"], "0.1.176")
+        self.assertEqual(policy["sub2api"]["version"], "0.2.5")
 
     def test_policy_rejects_a_digest_or_source_revision_drift(self):
         policy = POLICY.read_policy()
@@ -91,7 +91,7 @@ class ReleasePolicyTests(unittest.TestCase):
                         policy["postgres"]["image"],
                     )
                 )
-                + "\nSub2API 0.1.176\n",
+                + "\nSub2API 0.2.5\n",
                 encoding="ascii",
             )
             with self.assertRaisesRegex(POLICY.ReleasePolicyError, "unreviewed Redis"):

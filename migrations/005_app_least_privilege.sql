@@ -197,7 +197,7 @@ $$;
 
 GRANT USAGE, CREATE ON SCHEMA public TO sub2api_app;
 
--- Sub2API 0.1.176 still emits the exact schema_migrations CREATE TABLE IF
+-- Sub2API 0.2.5 still emits the exact schema_migrations CREATE TABLE IF
 -- NOT EXISTS on every startup. Admin online updates apply additive goose
 -- through a deny-list DDL guard: unknown CREATE/ALTER tags fail open,
 -- while GRANT, extensions, trigger bypass, privacy-function replacement,

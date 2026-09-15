@@ -193,7 +193,7 @@ END
 $$;
 SQL
 
-# Startup compatibility plus additive Sub2API 0.1.176 goose migrations.
+# Startup compatibility plus additive Sub2API 0.2.5 goose migrations.
 docker exec -i "$container_name" psql -U sub2api_app -d app_role_test -v ON_ERROR_STOP=1 \
   -c $'CREATE TABLE IF NOT EXISTS schema_migrations (\n\tfilename   TEXT PRIMARY KEY,\n\tchecksum   TEXT NOT NULL,\n\tapplied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n);' \
   >/dev/null

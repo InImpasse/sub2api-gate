@@ -1,6 +1,6 @@
 \set ON_ERROR_STOP on
 
--- Sub2API 0.1.176 remains the reviewed recreate baseline. This deny-list
+-- Sub2API 0.2.5 remains the reviewed recreate baseline. This deny-list
 -- guard lets 0.1.178+ admin online updates apply unknown additive goose
 -- tags (CREATE VIEW, DROP FUNCTION, ALTER FUNCTION, extra ALTER TABLE)
 -- while still blocking privacy, GRANT, extensions, and trigger bypass.

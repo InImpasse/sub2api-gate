@@ -96,7 +96,7 @@ class ReleaseSafetyTests(unittest.TestCase):
     def test_runtime_images_are_pinned_to_reviewed_release_manifests(self):
         sub2api_image = (
             "weishaw/sub2api@sha256:"
-            "905baf250580334dacd902471f61da7b8b1e5da57e3c8c1769489952d51771a1"
+            "f7e42f0fc67caf38bd617bc98527c0ff50c5e087ac509ad9d8a9fd898d16d2c4"
         )
         redis_image = (
             "redis@sha256:"
@@ -114,7 +114,7 @@ class ReleaseSafetyTests(unittest.TestCase):
             "sha256:7aec734b2bb298a1d769fd8729f13b8514a41bf90fcdd1f38ec52267fbaa8ee6",
             NO_CONTENT_LOGGING_TEST,
         )
-        self.assertIn("Sub2API 0.1.176", COMPOSE)
+        self.assertIn("Sub2API 0.2.5", COMPOSE)
         self.assertIn("redis-server --version", COMPOSE)
         self.assertIn("v=8.8.0", COMPOSE)
         sync_image = "sub2api-gate/sub2api-sync:pg18.4-r1"
@@ -194,8 +194,8 @@ class ReleaseSafetyTests(unittest.TestCase):
         self.assertIn("cap_drop:\n      - ALL", body)
         self.assertIn("no-new-privileges:true", body)
         self.assertIn("UPDATE_GITHUB_TOKEN", body)
-        self.assertNotIn("grep -F 'Sub2API 0.1.176'", body)
-        self.assertIn("Sub2API 0.1.176", body)
+        self.assertNotIn("grep -F 'Sub2API 0.2.5'", body)
+        self.assertIn("Sub2API 0.2.5", body)
         self.assertIn('http://localhost:8080/health', body)
 
     def test_postgres_runs_non_root_with_a_read_only_root_filesystem(self):

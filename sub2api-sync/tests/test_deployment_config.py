@@ -130,6 +130,8 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("SECURITY_URL_ALLOWLIST_ALLOW_INSECURE_HTTP=false", sub2api_service)
         self.assertIn("SECURITY_URL_ALLOWLIST_ALLOW_PRIVATE_HOSTS=false", sub2api_service)
         self.assertIn("SECURITY_URL_ALLOWLIST_UPSTREAM_HOSTS=${SECURITY_URL_ALLOWLIST_UPSTREAM_HOSTS:?", sub2api_service)
+        self.assertIn("cloudcode-pa.googleapis.com", (ROOT / ".env.example").read_text())
+        self.assertIn("generativelanguage.googleapis.com", (ROOT / ".env.example").read_text())
         self.assertIn("SUB2API_SYNC_DATABASE_USER=sub2api_sync", COMPOSE)
         self.assertNotIn("SUB2API_SYNC_DATABASE_USER=${", COMPOSE)
         for secret in (
@@ -607,7 +609,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("CREATE TRIGGER", function_guard)
         self.assertIn("strip_conversation_content", function_guard)
         self.assertIn("security definer", function_guard)
-        self.assertIn("0.1.176", function_guard)
+        self.assertIn("0.2.5", function_guard)
         alter_guard = (
             ROOT / "migrations" / "008_allow_sub2api_additive_alter_migrations.sql"
         ).read_text()
@@ -615,7 +617,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("add column( if not exists)?|alter column", alter_guard)
         self.assertIn("channel_monitor_histories", alter_guard)
         self.assertIn("OWNER TO sub2api_app", alter_guard)
-        self.assertIn("0.1.176", alter_guard)
+        self.assertIn("0.2.5", alter_guard)
         self.assertIn("0.1.178", alter_guard)
         self.assertIn("007_allow_sub2api_function_trigger_migrations.sql", PREPARE_APP_ROLE.read_text())
         self.assertIn("006_allow_sub2api_schema_migrations.sql", PREPARE_APP_ROLE.read_text())
@@ -627,7 +629,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("'GRANT'", deny_list_guard)
         self.assertIn("'CREATE EXTENSION'", deny_list_guard)
         self.assertIn("unknown additive goose", deny_list_guard)
-        self.assertIn("0.1.176", deny_list_guard)
+        self.assertIn("0.2.5", deny_list_guard)
         self.assertIn("009_allow_sub2api_deny_list_ddl_guard.sql", PREPARE_APP_ROLE.read_text())
         self.assertIn("sub2api_gate_guard_app_ddl.sql", PREPARE_APP_ROLE.read_text())
         guard_span_start = "CREATE OR REPLACE FUNCTION public.sub2api_gate_guard_app_ddl()"
@@ -1228,7 +1230,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertTrue(SUB2API_LOG_TEST.exists())
         script = SUB2API_LOG_TEST.read_text()
         self.assertIn(
-            'sub2api_expected_version="${SUB2API_TEST_EXPECTED_VERSION:-0.1.176}"',
+            'sub2api_expected_version="${SUB2API_TEST_EXPECTED_VERSION:-0.2.5}"',
             script,
         )
         self.assertIn('"Sub2API $sub2api_expected_version"', script)

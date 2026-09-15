@@ -18,9 +18,9 @@ require_compose_text() {
   fi
 }
 
-require_compose_text "weishaw/sub2api@sha256:905baf250580334dacd902471f61da7b8b1e5da57e3c8c1769489952d51771a1"
+require_compose_text "weishaw/sub2api@sha256:f7e42f0fc67caf38bd617bc98527c0ff50c5e087ac509ad9d8a9fd898d16d2c4"
 require_compose_text "redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005"
-require_compose_text "Sub2API 0.1.176"
+require_compose_text "Sub2API 0.2.5"
 require_compose_text "v=8.8.0"
 require_compose_text "postgres --version"
 
@@ -49,7 +49,7 @@ sub2api_version="$(docker exec "$sub2api_container" /app/sub2api --version 2>&1)
   exit 1
 }
 # Admin online updates may advance the binary past the reviewed recreate baseline.
-if [[ ! "$sub2api_version" =~ ^Sub2API\ [0-9]+\.[0-9]+\.[0-9]+([[:space:]].*)?$ ]]; then
+if [[ ! "$sub2api_version" =~ Sub2API\ [0-9]+\.[0-9]+\.[0-9]+([[:space:]]|\(|$) ]]; then
   echo "running Sub2API binary did not report a recognizable version" >&2
   exit 1
 fi

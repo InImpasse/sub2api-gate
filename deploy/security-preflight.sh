@@ -365,10 +365,10 @@ if [[ "${values[SECURITY_URL_ALLOWLIST_UPSTREAM_HOSTS]-}" == *"your-resource"* ]
   failed=1
 fi
 
-if ! grep -Fq 'weishaw/sub2api@sha256:905baf250580334dacd902471f61da7b8b1e5da57e3c8c1769489952d51771a1' "$repo_dir/docker-compose.yml" \
+if ! grep -Fq 'weishaw/sub2api@sha256:f7e42f0fc67caf38bd617bc98527c0ff50c5e087ac509ad9d8a9fd898d16d2c4' "$repo_dir/docker-compose.yml" \
   || ! grep -Eq 'postgres@sha256:[0-9a-f]{64}' "$repo_dir/docker-compose.yml" \
   || ! grep -Fq 'redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005' "$repo_dir/docker-compose.yml"; then
-  echo "Compose images must use the reviewed Sub2API 0.1.176, PostgreSQL 18, and Redis 8.8.0 digests" >&2
+  echo "Compose images must use the reviewed Sub2API 0.2.5, PostgreSQL 18, and Redis 8.8.0 digests" >&2
   failed=1
 fi
 sync_image='sub2api-gate/sub2api-sync:pg18.4-r1'
@@ -411,7 +411,7 @@ for postgres_logging_setting in \
     break
   fi
 done
-if ! grep -Fq "Sub2API 0.1.176" "$repo_dir/docker-compose.yml" \
+if ! grep -Fq "Sub2API 0.2.5" "$repo_dir/docker-compose.yml" \
   || ! grep -Fq "v=8.8.0" "$repo_dir/docker-compose.yml" \
   || [ "$(grep -Fc 'create_host_path: false' "$repo_dir/docker-compose.yml")" -lt 5 ] \
   || ! grep -Fq 'x-required-data-root: ${SUB2API_DATA_ROOT:?' "$repo_dir/docker-compose.yml" \

@@ -1,9 +1,9 @@
 {
   "schema": 1,
   "sub2api": {
-    "version": "0.1.176",
-    "image": "weishaw/sub2api@sha256:905baf250580334dacd902471f61da7b8b1e5da57e3c8c1769489952d51771a1",
-    "source_revision": "e803e3851c0a7e222cfadeafad7b8636ab959d11"
+    "version": "0.2.5",
+    "image": "weishaw/sub2api@sha256:f7e42f0fc67caf38bd617bc98527c0ff50c5e087ac509ad9d8a9fd898d16d2c4",
+    "source_revision": "86f93c28ee34cc74b629dafb748bd5ac5ca8c5ea"
   },
   "postgres": {
     "major": "18",

@@ -1,6 +1,6 @@
 \set ON_ERROR_STOP on
 
--- Owner-applied copy of Sub2API 0.1.176 backend/migrations/221_group_model_pricing.sql.
+-- Owner-applied copy of Sub2API 0.2.5 backend/migrations/221_group_model_pricing.sql.
 -- Additive and idempotent. The app role may apply the same statements after
 -- migrations/006_allow_sub2api_schema_migrations.sql.
 

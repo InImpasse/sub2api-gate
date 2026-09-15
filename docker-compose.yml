@@ -21,8 +21,8 @@ services:
   # Sub2API Application
   # ===========================================================================
   sub2api:
-    # Reviewed recreate baseline: Sub2API 0.1.176
-    image: weishaw/sub2api@sha256:905baf250580334dacd902471f61da7b8b1e5da57e3c8c1769489952d51771a1
+    # Reviewed recreate baseline: Sub2API 0.2.5
+    image: weishaw/sub2api@sha256:f7e42f0fc67caf38bd617bc98527c0ff50c5e087ac509ad9d8a9fd898d16d2c4
     container_name: sub2api
     restart: unless-stopped
     user: "1000:1000"
@@ -59,7 +59,7 @@ services:
       # Auto Setup (REQUIRED for Docker deployment)
       # =======================================================================
       - AUTO_SETUP=false
-      # Sub2API 0.1.176 probes DATA_DIR for writability and its pricing service
+      # Sub2API 0.2.5 probes DATA_DIR for writability and its pricing service
       # atomically refreshes reviewed model metadata here. The bind itself is
       # owner-only.
       - DATA_DIR=/app/data
@@ -195,7 +195,7 @@ services:
       - no-new-privileges:true
     healthcheck:
       # Do not pin --version: later admin online updates change the binary while
-      # the reviewed Sub2API 0.1.176 digest remains the recreate baseline.
+      # the reviewed Sub2API 0.2.5 digest remains the recreate baseline.
       test: ["CMD", "wget", "-q", "-T", "5", "-O", "/dev/null", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
