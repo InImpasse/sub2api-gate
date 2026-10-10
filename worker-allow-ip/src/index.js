@@ -893,7 +893,7 @@ function renderSub2ApiLogin(invite, requestUrl, csrf = "") {
       <form method="post" action="/allow-ip">
         <input type="hidden" name="action" value="open_sub2api" />
         <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
-        <button class="ghost-wide" type="submit">Open Sub2API</button>
+        <button class="sub2api-open" type="submit">Open Sub2API</button>
       </form>
       <div class="copy-line"><code title="${escapeHtml(loginUrl)}">${escapeHtml(loginUrl)}</code><button class="ghost compact copy-value" type="button" data-copy="${escapeHtml(loginUrl)}">Copy URL</button></div>
     </div>
@@ -1350,6 +1350,8 @@ function page(title, body) {
       background: rgba(0, 113, 227, 0.12);
       transform: none;
     }
+    .sub2api-open { width: 100%; background: #0071e3; color: #fff; }
+    .sub2api-open:hover { background: #0066cc; }
     button.ghost-wide {
       width: 100%;
       background: rgba(0, 0, 0, 0.05);
