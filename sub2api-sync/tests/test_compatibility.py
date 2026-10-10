@@ -30,6 +30,30 @@ USAGE = load_module("usage_metadata_compat", ROOT / "usage_metadata.py")
 class Sub2ApiCompatibilityTests(unittest.TestCase):
     UUID = "7c484f74-6d93-43d1-9441-00c7d8d4ab11"
 
+    def test_login_recovery_validates_flag_password_and_active_owned_account(self):
+        payload = {"uuid": self.UUID, "username": "alice", "recoverLoginPassword": True, "loginPassword": "a" * 64}
+        for override in ({"recoverLoginPassword": "true"}, {"loginPassword": "short"}):
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                SYNC.login({**payload, **override})
+        for user in (None, [9, "alice", "user", "owner", "", "hash", "active"],
+                     [9, "alice", "user", "owner", "alice@example.test", "hash", "disabled"]):
+            with mock.patch.object(SYNC, "database_transaction", return_value=nullcontext()), \
+                 mock.patch.object(SYNC, "resolve_invite_user", return_value=user), \
+                 mock.patch.object(SYNC, "psql") as writes, \
+                 self.assertRaisesRegex(RuntimeError, "invite_identity_mismatch"):
+                SYNC.login(payload)
+            writes.assert_not_called()
+
+    def test_login_server_failure_is_not_classified_as_rejected_credentials(self):
+        payload = {"uuid": self.UUID, "username": "alice", "email": "alice@example.test", "loginPassword": "password"}
+        user = [9, "alice", "user", "owner", "alice@example.test", "hash", "active"]
+        for status, expected in ((503, "sub2api_login_upstream_unavailable"), (429, "sub2api_login_rate_limited"), (401, "sub2api_login_rejected")):
+            with mock.patch.object(SYNC, "database_transaction", return_value=nullcontext()), \
+                 mock.patch.object(SYNC, "resolve_invite_user", return_value=user), \
+                 mock.patch.object(SYNC.urllib.request, "urlopen", side_effect=SYNC.urllib.error.HTTPError("http://127.0.0.1/login", status, "fixture", {}, None)), \
+                 self.assertRaisesRegex(RuntimeError, expected):
+                SYNC.login(payload)
+
     def test_payload_identity_prefers_clean_display_name(self):
         uuid = "7c484f74-6d93-43d1-9441-00c7d8d4ab11"
         identity = SYNC.payload_identity({"uuid": uuid, "username": "u7c484f746d9", "name": "Alice Example"})

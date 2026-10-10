@@ -417,6 +417,30 @@ class SyncDependencyIntegrationTests(unittest.TestCase):
                     SYNC.login(rejected)
             self.assertEqual(upstream.requests, 3)
 
+            recovery = {**login_payload, "recoverLoginPassword": True, "loginPassword": "b" * 64}
+            expected["password"] = recovery["loginPassword"]
+            SYNC.psql(f"UPDATE users SET balance=37.5,concurrency=8 WHERE id={legacy_user_id};")
+            before = self._scalar(f"SELECT row_to_json(u)::text FROM users u WHERE id={legacy_user_id};")
+            self.assertEqual(SYNC.login(recovery)["auth"]["user"]["id"], legacy_user_id)
+            after = self._scalar(f"SELECT row_to_json(u)::text FROM users u WHERE id={legacy_user_id};")
+            before_fields, after_fields = json.loads(before), json.loads(after)
+            for field in ("password_hash", "updated_at"):
+                before_fields.pop(field)
+                after_fields.pop(field)
+            self.assertEqual(before_fields, after_fields)
+            self.assertEqual(SYNC.login(recovery)["auth"]["user"]["id"], legacy_user_id)
+            self.assertEqual(self._scalar(f"SELECT row_to_json(u)::text FROM users u WHERE id={legacy_user_id};"), after)
+            for rejected in (
+                {**recovery, "uuid": foreign_uuid},
+                {**recovery, "email": "foreign@example.test"},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "invite_identity_mismatch"):
+                    SYNC.login(rejected)
+            SYNC.psql(f"UPDATE users SET status='disabled' WHERE id={legacy_user_id};")
+            with self.assertRaisesRegex(RuntimeError, "invite_identity_mismatch"):
+                SYNC.login(recovery)
+            self.assertEqual(upstream.requests, 5)
+
         SYNC.purge({
             "uuid": invite_uuid,
             "username": username,
@@ -500,6 +524,7 @@ class SyncDependencyIntegrationTests(unittest.TestCase):
 
         expected["user_id"] = provisioned["userId"]
         expected["response_user_id"] = provisioned["userId"]
+        expected["password"] = password
         with running_login_upstream(expected) as upstream:
             os.environ["SUB2API_INTERNAL_LOGIN_URL"] = (
                 f"http://127.0.0.1:{upstream.server_port}/api/v1/auth/login"
@@ -513,6 +538,15 @@ class SyncDependencyIntegrationTests(unittest.TestCase):
             }
             self.assertEqual(SYNC.login(login_payload)["auth"]["user"]["id"], provisioned["userId"])
             self.assertEqual(upstream.requests, 1)
+            preserved_tables = ("api_keys", "groups", "user_allowed_groups", "user_subscriptions", "subscription_plans")
+            snapshots = {table: self._scalar(f"SELECT COALESCE(json_agg(t ORDER BY id)::text,'[]') FROM {table} t;")
+                         for table in preserved_tables if table != "user_allowed_groups"}
+            snapshots["user_allowed_groups"] = self._scalar("SELECT COALESCE(json_agg(t ORDER BY user_id,group_id)::text,'[]') FROM user_allowed_groups t;")
+            expected["password"] = "c" * 64
+            self.assertEqual(SYNC.login({**login_payload, "loginPassword": expected["password"], "recoverLoginPassword": True})["auth"]["user"]["id"], provisioned["userId"])
+            for table, snapshot in snapshots.items():
+                order = "user_id,group_id" if table == "user_allowed_groups" else "id"
+                self.assertEqual(self._scalar(f"SELECT COALESCE(json_agg(t ORDER BY {order})::text,'[]') FROM {table} t;"), snapshot)
 
         SYNC.deprovision({
             "uuid": invite_uuid,

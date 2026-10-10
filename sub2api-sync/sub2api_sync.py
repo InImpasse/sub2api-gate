@@ -1174,7 +1174,12 @@ def login(payload):
     uuid, legacy_username, username = payload_identity(payload)
     email = str(payload.get("email") or "").strip()
     password = str(payload.get("loginPassword") or "").strip()
-    if not email or not password:
+    recover_password = payload.get("recoverLoginPassword", False)
+    if not isinstance(recover_password, bool):
+        raise ValueError("invalid login recovery flag")
+    if recover_password and not re.fullmatch(r"[a-f0-9]{64}", password):
+        raise ValueError("invalid login recovery password")
+    if (not email and not recover_password) or not password:
         raise ValueError("missing login credentials")
     user_id = payload_user_id(payload)
     with database_transaction():
@@ -1185,9 +1190,21 @@ def login(payload):
             user_id=user_id,
             allow_bind=user_id > 0,
         )
-        if not user or str(user[4]).strip().lower() != email.lower():
+        if not user or (email and str(user[4]).strip().lower() != email.lower()):
             raise RuntimeError("invite_identity_mismatch")
         user_id = int(user[0])
+        if recover_password:
+            if user[2] != "user" or user[6] != "active":
+                raise RuntimeError("invite_identity_mismatch")
+            email = str(user[4]).strip()
+            if not email:
+                raise RuntimeError("invite_identity_mismatch")
+            # Retrying a lost response must not rotate the same recovered password again.
+            psql(
+                f"UPDATE users SET password_hash=crypt({sql_quote(password)},gen_salt('bf')),updated_at=now() "
+                f"WHERE id={user_id} AND CASE WHEN password_hash LIKE '$2%' "
+                f"THEN password_hash IS DISTINCT FROM crypt({sql_quote(password)},password_hash) ELSE true END;"
+            )
     body = json.dumps({"email": email, "password": password}, separators=(",", ":")).encode()
     request = urllib.request.Request(
         os.environ.get("SUB2API_INTERNAL_LOGIN_URL", "http://127.0.0.1:8080/api/v1/auth/login"),
@@ -1213,6 +1230,8 @@ def login(payload):
     except urllib.error.HTTPError as error:
         if error.code == 429:
             raise RuntimeError("sub2api_login_rate_limited") from error
+        if error.code >= 500:
+            raise RuntimeError("sub2api_login_upstream_unavailable") from error
         raise RuntimeError("sub2api_login_rejected") from error
     if not isinstance(payload, dict) or payload.get("code") != 0:
         raise RuntimeError("sub2api_login_rejected")
