@@ -32,12 +32,12 @@ FINAL_SOURCE_RELEASE = "18b22a00512c38bf6c4089b87665fa9fa5ebac33"
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_TOOLCHAIN_BYTES = 8 * 1024 * 1024
 REVIEWED_TOOLCHAIN_SHA256 = {
-    "package.json": "a3d11acfccda4e2776ccee98650d34d600df4d3eb9cd5532bb3cd2d8dc782790",
-    "package-lock.json": "408a8d2623a8950282eab6ba96998a57d27380f10df8dc01e5821e11056d2721",
+    "package.json": "8424a97301606bc38309c0169a6cce2d2343222e4db3ab9e483ec00335145bee",
+    "package-lock.json": "cf4fc90dc87dacf037a2c34392d5f0931c757347c00d1f9f26876d2589443570",
 }
 MINIFLARE_VERSION = "4.20260714.0"
-UNDICI_VERSION = "7.29.0"
-SHARP_VERSION = "0.35.3"
+UNDICI_VERSION = "7.30.0"
+SHARP_VERSION = "0.35.5"
 REMOTE_OUTCOME_UNKNOWN = (
     "remote_outcome_unknown: Worker publish may have completed; "
     "verify the exact remote deployment before retrying"

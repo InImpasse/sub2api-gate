@@ -255,8 +255,7 @@ async function handleAdminRequest(request, env) {
     const email = cleanText(form.get("email"), 160);
     const remark = cleanText(form.get("remark"), 240);
     const apiConfigs = parseApiConfigs(String(form.get("api_configs") || ""), env);
-    const keyGroup = parseKeyGroupName(form.get("key_group"));
-    const created = await createInvite(env, uuid, { username, email, remark, apiConfigs, keyGroup });
+    const created = await createInvite(env, uuid, { username, email, remark, apiConfigs });
     if (created.accessKey) {
       return html(renderIssuedAccessKeys([{
         uuid,
@@ -658,6 +657,15 @@ export async function refreshInviteFromSub2Api(env, uuid) {
   const pulled = await pullInviteFromSub2Api(env, invite);
   await saveInvites(env, invites);
   return invite;
+}
+
+export async function previewInviteKeysFromSub2Api(env, invite) {
+  const current = {
+    ...invite,
+    apiConfigs: Array.isArray(invite.apiConfigs) ? [...invite.apiConfigs] : [],
+    sub2apiSync: { ...(invite.sub2apiSync || {}) },
+  };
+  return (await pullInviteFromSub2Api(env, current)).invite;
 }
 
 async function pullInviteFromSub2Api(env, invite) {
@@ -1377,7 +1385,7 @@ async function createInvite(env, uuid, data) {
   const username = validateInviteUsername(data.username, uuid);
   assertUniqueInviteUsername(invites, username, null);
   const now = new Date().toISOString();
-  const keyGroup = parseKeyGroupName(data.keyGroup || DEFAULT_KEY_GROUP_NAME, { required: false }) || DEFAULT_KEY_GROUP_NAME;
+  const keyGroup = DEFAULT_KEY_GROUP_NAME;
   const syncResult = await provisionSub2ApiUser(env, {
     uuid,
     username: desiredSub2ApiUsername(username, uuid),
@@ -1387,11 +1395,14 @@ async function createInvite(env, uuid, data) {
     sub2apiUserId: 0,
     loginPassword: "",
     keyGroup,
-    tokens: desiredSub2ApiTokens(env, data.apiConfigs),
+    tokens: desiredSub2ApiTokens(env, data.apiConfigs).map((token) => ({
+      ...token,
+      groupName: keyGroup,
+    })),
   });
   const apiConfigs = mergeSub2ApiConfig(env, data.apiConfigs, syncResult).map((config) => ({
     ...config,
-    groupName: config.groupName || keyGroup,
+    groupName: keyGroup,
   }));
   const sub2apiSync = await sub2apiSyncMetadata(env, syncResult);
 
@@ -2951,7 +2962,10 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
               <label for="remark">Remark</label>
               <input id="remark" name="remark" type="text" maxlength="240" />
             </div>
-            ${renderKeyGroupPicker(keyGroups, DEFAULT_KEY_GROUP_NAME)}
+            <div class="field span-2">
+              <span>Key group</span>
+              <p>${DEFAULT_KEY_GROUP_NAME}</p>
+            </div>
           </div>
           ${renderApiConfigEditor("api-configs", [], defaultBaseUrl)}
           <div class="form-footer">

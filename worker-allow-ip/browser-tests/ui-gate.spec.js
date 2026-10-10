@@ -239,12 +239,12 @@ function installVitalsObserver() {
   } catch {}
 }
 
-async function seedWorker() {
+async function seedWorker(invites = Array.from({ length: 25 }, (_, index) => makeInvite(index))) {
   const response = await miniflare.dispatchFetch("https://api.example.test/__test__/seed", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      invites: Array.from({ length: 25 }, (_, index) => makeInvite(index)),
+      invites,
       records: makeRecords(),
       publicUuid: PUBLIC_UUID,
       publicSessionHash: sha256(PUBLIC_SESSION_TOKEN),
@@ -796,9 +796,8 @@ async function captureScenario(page, decoderPage, viewport, theme, scenario, url
   if (scenario === "admin-create") {
     await expect(page.locator('.admin-tabs [aria-current="page"]')).toHaveText("Create");
     await expect(page.locator('form.create input[name="username"]')).toBeVisible();
-    await expect(page.locator('form.create select[name="key_group"]')).toBeVisible();
-    await expect(page.locator('form.create select[name="key_group"] option[value="default"]')).toHaveCount(0);
-    await expect(page.locator('form.create select[name="key_group"] option[value="openai-default"]')).toHaveCount(1);
+    await expect(page.locator('form.create [name="key_group"]')).toHaveCount(0);
+    await expect(page.locator('form.create')).toContainText("openai-default");
     await expect(page.locator('form.create input[name="step_up_token"]')).toHaveCount(0);
     await expect(page.locator(".invite-list, .selected-invite-detail, .trash-list")).toHaveCount(0);
   }
@@ -1355,6 +1354,57 @@ test("dashboard reports clipboard rejection without an unhandled page error", as
   await expect(page.locator("#copy-status")).toHaveAttribute("role", "alert");
   await expect(page.locator("#copy-status")).toContainText("Select the value and copy it manually");
   expect(pageErrors).toEqual([]);
+});
+
+test("public model explorer lists and tests chat and image models on mobile", async ({ page, context }) => {
+  const invites = Array.from({ length: 25 }, (_, index) => makeInvite(index));
+  invites[0].apiConfigs = [{
+    id: "sub2api-sync", name: "Sub2API", baseUrl: "https://api.example.test/v1",
+    apiKey: "sk-browser-ui-model-test", groupName: "openai-default",
+  }];
+  await seedWorker(invites);
+  try {
+    await context.setExtraHTTPHeaders({ "CF-Connecting-IP": CLIENT_IP });
+    await context.addCookies([{
+      name: "sub2api_allow_uuid", value: PUBLIC_SESSION_TOKEN,
+      url: "https://api.example.test/allow-ip", httpOnly: true, sameSite: "Strict",
+    }]);
+    await page.route("https://api.example.test/allow-ip", fulfillWorkerGet);
+    await page.route("https://api.example.test/v1/models", async (route) => {
+      expect(route.request().headers().authorization).toBe("Bearer sk-browser-ui-model-test");
+      await route.fulfill({
+        status: 200, contentType: "application/json",
+        body: JSON.stringify({ data: [
+          { id: "claude-sonnet-4-5" }, { id: "gpt-image-1" }, { id: "bad model" },
+        ] }),
+      });
+    });
+    const tested = [];
+    await page.route("https://api.example.test/v1/chat/completions", async (route) => {
+      expect(route.request().headers().authorization).toBe("Bearer sk-browser-ui-model-test");
+      tested.push({ path: "chat", body: route.request().postDataJSON() });
+      await route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
+    });
+    await page.route("https://api.example.test/v1/images/generations", async (route) => {
+      expect(route.request().headers().authorization).toBe("Bearer sk-browser-ui-model-test");
+      tested.push({ path: "image", body: route.request().postDataJSON() });
+      await route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
+    });
+    await page.setViewportSize({ width: 320, height: 700 });
+    await page.goto("https://api.example.test/allow-ip", { waitUntil: "networkidle" });
+    await expect(page.locator(".model-status")).toHaveText("2 models available");
+    await expect(page.locator(".model-row")).toHaveCount(2);
+    await page.getByRole("button", { name: "Test chat model claude-sonnet-4-5" }).click();
+    await page.getByRole("button", { name: "Test image model gpt-image-1" }).click();
+    await expect(page.locator(".model-row").first()).toContainText("Available · HTTP 200");
+    await expect(page.locator(".model-row").last()).toContainText("Available · HTTP 200");
+    expect(tested.map((item) => item.path)).toEqual(["chat", "image"]);
+    expect(tested.map((item) => item.body.model)).toEqual(["claude-sonnet-4-5", "gpt-image-1"]);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await page.screenshot({ path: path.join(SCREENSHOT_ROOT, "public-model-explorer-320.png"), fullPage: true });
+  } finally {
+    await seedWorker();
+  }
 });
 
 test("admin copy actions report clipboard rejection without unhandled errors", async ({ page, context }) => {

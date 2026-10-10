@@ -1,4 +1,4 @@
-import { authorizeVisitorIps, cleanupExpiredIpGroups, findInvite, getInviteApiConfigs, getInviteByUuid, getInviteIpRecords, handleAdmin, keyTestAttemptKey, keyTestNotice, loginInviteToSub2Api, sanitizeInviteForPublic, sub2ApiSyncFailureMetadata, syncAvailableSub2ApiKeys, testInviteApiKey } from "./admin.js";
+import { authorizeVisitorIps, cleanupExpiredIpGroups, findInvite, getInviteApiConfigs, getInviteByUuid, getInviteIpRecords, handleAdmin, keyTestAttemptKey, keyTestNotice, loginInviteToSub2Api, previewInviteKeysFromSub2Api, sanitizeInviteForPublic, sub2ApiSyncFailureMetadata, syncAvailableSub2ApiKeys, testInviteApiKey } from "./admin.js";
 import { createAuthStateStore, isAuthStateBindingConfigured } from "./auth-state.js";
 import {
   rateLimitFingerprint,
@@ -139,7 +139,7 @@ async function handleSubmit(request, env, uuidSession) {
     ), 400);
   }
   const action = String(form.get("action") || "");
-  if (action !== "" && action !== "logout_uuid" && action !== "test_api_key") {
+  if (action !== "" && action !== "logout_uuid" && action !== "test_api_key" && action !== "refresh_keys") {
     return html(renderMessage(
       "Unknown form action",
       "Refresh the page and use one of the available actions.",
@@ -161,6 +161,19 @@ async function handleSubmit(request, env, uuidSession) {
     }
     await deleteUuidSession(env, request);
     return redirect("/allow-ip", clearUuidCookie());
+  }
+
+  if (action === "refresh_keys") {
+    if (!uuidSession?.invite || !(await timingSafeEqual(String(form.get("csrf") || ""), uuidSession.csrf))) {
+      return html(renderMessage("Invalid request", "Sign in and try again."), 403);
+    }
+    const attemptKey = await keyTestAttemptKey(env, uuidSession.invite.uuid);
+    if (!(await consumeAuthAttempt(env, "keytest", attemptKey))) {
+      return html(renderMessage("Too many refreshes", "Try again later."), 429);
+    }
+    const invite = await previewInviteKeysFromSub2Api(env, uuidSession.invite);
+    const currentStatus = await getCurrentAllowStatus(env, request, invite);
+    return html(renderDashboard(env, new URL(request.url), invite, request, "Current API keys loaded.", currentStatus, uuidSession.csrf));
   }
 
   if (action === "test_api_key") {
@@ -393,8 +406,13 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
       </form>` : ""}
       <div class="api-list">
         ${renderSub2ApiLogin(invite)}
-        ${configs.length ? configs.map((config) => renderApiConfig(config, { csrf, uuid: invite.uuid, action: url.pathname })).join("") : `<p class="lede">No OpenAI API link has been configured for this UUID.</p>`}
+        ${configs.length ? configs.map((config) => renderApiConfig(config, { csrf, uuid: invite.uuid, action: url.pathname, modelExplorer: new URL(config.baseUrl).origin === url.origin && new URL(config.baseUrl).pathname === "/v1" })).join("") : `<p class="lede">No OpenAI API link has been configured for this UUID.</p>`}
       </div>
+      <form method="post" action="${escapeHtml(url.pathname)}">
+        <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
+        <input type="hidden" name="action" value="refresh_keys" />
+        <button class="ghost-wide" type="submit">Load current API keys</button>
+      </form>
       <p id="copy-status" class="copy-status" role="status" aria-live="polite"></p>
       <form method="post" action="${escapeHtml(url.pathname)}">
         <input type="hidden" name="action" value="logout_uuid" />
@@ -450,6 +468,7 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
           button.textContent = "Testing...";
         });
       });
+      ${modelExplorerScript()}
     </script>
   `);
 }
@@ -630,7 +649,7 @@ function renderCurrentIpStatus(status) {
   return `<p class="warning">Current network is not linked to this user yet: ${escapeHtml(values)}. It may already be globally authorized through another user. IPv4 uses the full /24 network.</p>`;
 }
 
-function renderApiConfig(config, { csrf = "", uuid = "", action = "/allow-ip" } = {}) {
+function renderApiConfig(config, { csrf = "", uuid = "", action = "/allow-ip", modelExplorer = false } = {}) {
   const key = config.apiKey || "";
   const curl = `curl ${config.baseUrl}/chat/completions -H "Authorization: Bearer ${key}"`;
   const maskedCurl = `curl ${config.baseUrl}/chat/completions -H "Authorization: Bearer ${maskSecret(key)}"`;
@@ -658,7 +677,115 @@ function renderApiConfig(config, { csrf = "", uuid = "", action = "/allow-ip" } 
           <button class="ghost-wide" type="submit"${key ? "" : " disabled"}>Test API key</button>
         </form>
       ` : ""}
+      ${modelExplorer && key ? `<div class="model-explorer">
+        <div class="model-toolbar"><strong>Available models</strong><button class="ghost compact refresh-models" type="button">Refresh</button></div>
+        <p class="model-status" role="status" aria-live="polite">Loading models...</p>
+        <div class="model-list"></div>
+        <p class="hint">Model tests may incur API usage charges.</p>
+      </div>` : ""}
     </div>
+  `;
+}
+
+function modelExplorerScript() {
+  return `
+    const readModels = async (response) => {
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("invalid_response");
+      const chunks = [];
+      let size = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > 256 * 1024) {
+          await reader.cancel();
+          throw new Error("response_too_large");
+        }
+        chunks.push(value);
+      }
+      const bytes = new Uint8Array(size);
+      let offset = 0;
+      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+      const data = JSON.parse(new TextDecoder().decode(bytes)).data;
+      if (!Array.isArray(data)) throw new Error("invalid_response");
+      return [...new Set(data.map((item) => item?.id).filter((id) =>
+        typeof id === "string" && /^[A-Za-z0-9._:/-]{1,128}$/.test(id)
+      ))].sort().slice(0, 256);
+    };
+    document.querySelectorAll(".model-explorer").forEach((explorer) => {
+      const card = explorer.closest(".api-card");
+      const key = card.querySelector(".copy-secret")?.value || "";
+      const status = explorer.querySelector(".model-status");
+      const list = explorer.querySelector(".model-list");
+      const refresh = explorer.querySelector(".refresh-models");
+      const load = async () => {
+        refresh.disabled = true;
+        status.textContent = "Loading models...";
+        list.replaceChildren();
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 10000);
+        try {
+          const response = await fetch("/v1/models", {
+            headers: { authorization: "Bearer " + key, accept: "application/json" },
+            cache: "no-store", credentials: "omit", redirect: "error", signal: controller.signal,
+          });
+          if (!response.ok) throw new Error("HTTP " + response.status);
+          const models = await readModels(response);
+          status.textContent = models.length === 256
+            ? "Showing first 256 models"
+            : models.length ? models.length + " models available" : "No models available for this key.";
+          for (const model of models) {
+            const imageModel = /^(gpt-image|dall-e)/i.test(model);
+            const row = document.createElement("div");
+            row.className = "model-row";
+            const name = document.createElement("code");
+            name.textContent = model;
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "ghost compact";
+            button.textContent = imageModel ? "Test image" : "Test chat";
+            button.setAttribute("aria-label", "Test " + (imageModel ? "image" : "chat") + " model " + model);
+            const result = document.createElement("span");
+            result.setAttribute("role", "status");
+            button.addEventListener("click", async () => {
+              button.disabled = true;
+              result.textContent = "Testing...";
+              const probe = new AbortController();
+              const deadline = window.setTimeout(() => probe.abort(), imageModel ? 90000 : 20000);
+              const started = performance.now();
+              try {
+                const response = await fetch(imageModel ? "/v1/images/generations" : "/v1/chat/completions", {
+                  method: "POST",
+                  headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+                  body: JSON.stringify(imageModel
+                    ? { model, prompt: "A solid white square.", size: "1024x1024", n: 1 }
+                    : { model, messages: [{ role: "user", content: "Reply OK." }],
+                      [/^gpt-[5-9]/i.test(model) ? "max_completion_tokens" : "max_tokens"]: 16 }),
+                  credentials: "omit", cache: "no-store", redirect: "error", signal: probe.signal,
+                });
+                await response.body?.cancel().catch(() => {});
+                result.textContent = (response.ok ? "Available" : "Failed") + " · HTTP " + response.status + " · " + Math.round(performance.now() - started) + " ms";
+              } catch {
+                result.textContent = "Request failed or timed out.";
+              } finally {
+                window.clearTimeout(deadline);
+                button.disabled = false;
+              }
+            });
+            row.append(name, button, result);
+            list.append(row);
+          }
+        } catch {
+          status.textContent = "Could not load models. Refresh to retry.";
+        } finally {
+          window.clearTimeout(timer);
+          refresh.disabled = false;
+        }
+      };
+      refresh.addEventListener("click", load);
+      load();
+    });
   `;
 }
 
@@ -1252,6 +1379,14 @@ function page(title, body) {
       border-radius: 8px;
       background: rgba(255, 255, 255, 0.8);
     }
+    .model-explorer { min-width: 0; border-top: 1px solid rgba(0, 0, 0, 0.12); padding-top: 12px; }
+    .model-toolbar, .model-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .model-toolbar { justify-content: space-between; }
+    .model-status, .model-row span { color: #6e6e73; font-size: 13px; }
+    .model-list { max-height: 300px; overflow: auto; margin-top: 8px; }
+    .model-row { min-height: 40px; padding: 4px 0; border-top: 1px solid rgba(0, 0, 0, 0.08); flex-wrap: wrap; }
+    .model-row code { min-width: 0; flex: 1 1 150px; }
+    .model-row span { flex: 0 0 100%; }
     [hidden] { display: none !important; }
     .turnstile-control {
       min-height: 116px;
@@ -1360,7 +1495,9 @@ function page(title, body) {
           0 4px 12px rgba(0, 0, 0, 0.28),
           0 0 0 1px rgba(255, 255, 255, 0.12);
       }
-      .eyebrow, .lede, .hint, .api-card label, .turnstile-status, .copy-status { color: #a1a1a6; }
+      .eyebrow, .lede, .hint, .api-card label, .turnstile-status, .copy-status, .model-status, .model-row span { color: #a1a1a6; }
+      .model-explorer { border-color: rgba(255, 255, 255, 0.16); }
+      .model-row { border-color: rgba(255, 255, 255, 0.1); }
       .turnstile-control[data-state="error"] .turnstile-status,
       .turnstile-control[data-state="expired"] .turnstile-status,
       .copy-status[role="alert"] { color: #ffb340; }

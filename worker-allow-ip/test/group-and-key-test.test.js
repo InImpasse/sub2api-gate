@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { Script } from "node:vm";
 
 import worker from "../src/index.js";
 import { __test as adminTest } from "../src/admin.js";
@@ -221,7 +222,7 @@ test("invite summary test forms stay CSRF-bound and never serialize API keys", (
   assert.match(html, /name="admin_context" value="p=2&amp;t=3&amp;i=2&amp;v=d"/);
 });
 
-test("provision payload selects a real group and never sends default", async () => {
+test("new invites always provision into openai-default", async () => {
   const env = validAdminEnv(memoryKv(new Map([["invites", "[]"], ["trash", "[]"]])));
   let payload;
   const originalFetch = globalThis.fetch;
@@ -246,9 +247,9 @@ test("provision payload selects a real group and never sends default", async () 
         tokenKey: API_KEY,
         apiKey: API_KEY,
         status: 1,
-        groupName: "grok",
+        groupName: "openai-default",
       }],
-      allowedGroups: ["grok"],
+      allowedGroups: ["openai-default"],
       baseUrl: "https://api.example.test/v1",
       loginUrl: "https://api.example.test/login",
       syncedAt: new Date().toISOString(),
@@ -263,26 +264,89 @@ test("provision payload selects a real group and never sends default", async () 
         name: "Sub2API",
         baseUrl: "https://api.example.test/v1",
         apiKey: API_KEY,
+        groupName: "grok",
       }],
       keyGroup: "grok",
     });
     assert.equal(payload.action, "provision");
-    assert.deepEqual(payload.allowedGroups, ["grok"]);
-    assert.equal(payload.tokens[0].groupName, "grok");
-    assert.notEqual(payload.allowedGroups[0].toLowerCase(), "default");
-    assert.equal(issued.invite.apiConfigs[0].groupName, "grok");
+    assert.deepEqual(payload.allowedGroups, ["openai-default"]);
+    assert.equal(payload.tokens[0].groupName, "openai-default");
+    assert.equal(issued.invite.apiConfigs[0].groupName, "openai-default");
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
 
-  await assert.rejects(
-    adminTest.createInvite(env, "8c484f74-6d93-43d1-9441-00c7d8d4ab13", {
-      username: "bob",
-      apiConfigs: [],
-      keyGroup: "default",
-    }),
-    /Invalid key group/,
-  );
+test("public key refresh is session-bound, CSRF-bound, and does not persist keys", async () => {
+  const token = "public-key-refresh-session";
+  const oldKey = `sk-${"a".repeat(64)}`;
+  const newKey = `sk-${"b".repeat(64)}`;
+  const storedInvite = await protectInviteCredentials({
+    uuid: UUID,
+    username: "alice",
+    name: "alice",
+    credentialVersion: 2,
+    accessCredentialVersion: 1,
+    accessKeyHmac: "a".repeat(64),
+    apiConfigs: [{ id: "sub2api-sync", name: "Sub2API", baseUrl: "https://api.example.test/v1", apiKey: oldKey }],
+    sub2apiSync: { userId: 9, apiKeyId: 21, tokenId: 21, username: "alice" },
+  }, AES_KEY, HMAC_KEY);
+  const values = new Map([
+    [`uuid-session:${await sha256Hex(token)}`, JSON.stringify({
+      uuid: UUID, csrf: "refresh-csrf", authenticationMethod: "access_key",
+      accessCredentialVersion: 1, expiresAt: Date.now() + 60_000,
+    })],
+    ["invites", JSON.stringify([storedInvite])],
+    ["trash", "[]"],
+    [`records:${UUID}`, "[]"],
+  ]);
+  const env = {
+    ...validAdminEnv(memoryKv(values)),
+    TURNSTILE_SITE_KEY: "test-site-key",
+    TURNSTILE_SECRET_KEY: "test-turnstile-secret",
+  };
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async (_url, init) => {
+    calls += 1;
+    const body = JSON.parse(init.body);
+    assert.equal(body.action, "status");
+    assert.equal(body.uuid, UUID);
+    return Response.json({
+      ok: true, action: "status", uuid: UUID, exists: true, userId: 9,
+      username: "alice", apiKeyId: 21, tokenId: 21, apiKey: newKey, tokenKey: newKey,
+      tokens: [{ apiKeyId: 21, tokenId: 21, name: "Sub2API", apiKey: newKey, tokenKey: newKey, status: 1 }],
+      baseUrl: "https://api.example.test/v1", syncedAt: new Date().toISOString(),
+    });
+  };
+  const post = (cookie, csrf, requestEnv = env) => worker.fetch(new Request("https://api.example.test/allow-ip", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", ...(cookie ? { cookie } : {}) },
+    body: new URLSearchParams({ action: "refresh_keys", csrf }),
+  }), requestEnv);
+  try {
+    assert.equal((await post("", "refresh-csrf")).status, 403);
+    assert.equal((await post(`sub2api_allow_uuid=${token}`, "wrong")).status, 403);
+    assert.equal(calls, 0);
+    const response = await post(`sub2api_allow_uuid=${token}`, "refresh-csrf");
+    const html = await response.text();
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.equal(calls, 1);
+    assert.match(html, /Available models|Loading models/);
+    assert.match(html, new RegExp(newKey));
+    assert.equal(values.get("invites"), JSON.stringify([storedInvite]));
+    for (const script of html.matchAll(/<script nonce="[^"]+">([\s\S]*?)<\/script>/g)) {
+      assert.doesNotThrow(() => new Script(script[1]));
+    }
+    const limited = await post(`sub2api_allow_uuid=${token}`, "refresh-csrf", {
+      ...env, AUTH_RATE_LIMITER: observingRateLimiter(false),
+    });
+    assert.equal(limited.status, 429);
+    assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("sync list_groups and test_api_key results reject content leaks", async () => {
@@ -429,7 +493,7 @@ test("admin and public key tests are CSRF-bound, rate-limited, and metadata-only
     const adminHtml = await adminOk.text();
     assert.equal(adminOk.status, 200);
     assert.match(adminHtml, /API key works/);
-    assert.doesNotMatch(adminHtml, /PRIVATE_CONVERSATION|"choices"|completion_tokens/);
+    assert.doesNotMatch(adminHtml, /PRIVATE_CONVERSATION|"choices"|"completion_tokens"\s*:/);
     assert.doesNotMatch(adminHtml, new RegExp(API_KEY));
 
     const publicOk = await worker.fetch(new Request("https://api.example.test/allow-ip", {
@@ -450,7 +514,7 @@ test("admin and public key tests are CSRF-bound, rate-limited, and metadata-only
     assert.match(publicHtml, /API key works/);
     assert.match(publicHtml, /role="status"/);
     assert.match(publicHtml, /Test API key/);
-    assert.doesNotMatch(publicHtml, /PRIVATE_CONVERSATION|"choices"|completion_tokens/);
+    assert.doesNotMatch(publicHtml, /PRIVATE_CONVERSATION|"choices"|"completion_tokens"\s*:/);
     assert.equal(seenActions.length, 2);
 
     const limitedEnv = {
@@ -552,7 +616,7 @@ test("key-test timeouts map to an accessible failure without leaking bodies", as
     assert.equal(response.status, 502);
     assert.match(html, /role="alert"/);
     assert.match(html, /API key test failed/);
-    assert.doesNotMatch(html, /PRIVATE_CONVERSATION|"choices"|completion_tokens/);
+    assert.doesNotMatch(html, /PRIVATE_CONVERSATION|"choices"|"completion_tokens"\s*:/);
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -357,7 +357,7 @@ class ReleaseSafetyTests(unittest.TestCase):
             WORKER_PACKAGE["devDependencies"]["miniflare"],
             "4.20260714.0",
         )
-        self.assertEqual(WORKER_PACKAGE["overrides"]["sharp"], "0.35.3")
+        self.assertEqual(WORKER_PACKAGE["overrides"]["sharp"], "0.35.5")
         worker_deploy = (ROOT / "deploy" / "deploy-worker.sh").read_text()
         audit_command = (
             'run_publish_command "$npm_bin" --prefix "$worker_dir" '

@@ -911,7 +911,7 @@ test("create and maintenance are focused views and legacy trash bookmarks canoni
   const createBody = await create.text();
   assert.equal(create.status, 200);
   assert.match(createBody, /<h2>Create UUID<\/h2>/);
-  assert.match(createBody, /name="key_group"/);
+  assert.doesNotMatch(createBody, /name="key_group"/);
   assert.match(createBody, /openai-default/);
   assert.doesNotMatch(createBody, /<h2>Access key migration<\/h2>|<h2>UUIDs<\/h2>|<h2>Recycle Bin<\/h2>/);
 
