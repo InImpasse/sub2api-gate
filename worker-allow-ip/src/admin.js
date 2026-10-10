@@ -4489,7 +4489,7 @@ function validateSub2ApiSyncResult(result, action, requestPayload) {
     if (!Array.isArray(result.tokens) || result.tokens.length > SUB2API_SYNC_MAX_TOKENS) {
       throw new Error("Sub2API sync request failed");
     }
-    for (const token of result.tokens) validateSyncToken(token);
+    for (const token of result.tokens) validateSyncToken(token, action);
   }
 
   if (action === "login") {
@@ -4564,12 +4564,14 @@ function validateKeyTestResult(result) {
   validateOptionalSyncString(result, "errorCode", 64);
 }
 
-function validateSyncToken(token) {
+function validateSyncToken(token, action) {
   if (!isPlainJsonObject(token)) throw new Error("Sub2API sync request failed");
   validateSyncApiKey(token, "apiKey");
   validateSyncApiKey(token, "tokenKey");
   validateOptionalSyncString(token, "name", 100);
-  if (Object.hasOwn(token, "groupName") && token.groupName) {
+  // Existing legacy keys can still be read before the default-group migration.
+  if (Object.hasOwn(token, "groupName") && token.groupName
+      && !(action === "status" && token.groupName === "default")) {
     try {
       parseKeyGroupName(token.groupName);
     } catch {

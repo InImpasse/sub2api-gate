@@ -315,7 +315,7 @@ test("public key refresh is session-bound, CSRF-bound, and does not persist keys
     return Response.json({
       ok: true, action: "status", uuid: UUID, exists: true, userId: 9,
       username: "alice", apiKeyId: 21, tokenId: 21, apiKey: newKey, tokenKey: newKey,
-      tokens: [{ apiKeyId: 21, tokenId: 21, name: "Sub2API", apiKey: newKey, tokenKey: newKey, status: 1 }],
+      tokens: [{ apiKeyId: 21, tokenId: 21, name: "Sub2API", apiKey: newKey, tokenKey: newKey, status: 1, groupName: "default" }],
       baseUrl: "https://api.example.test/v1", syncedAt: new Date().toISOString(),
     });
   };
@@ -344,6 +344,33 @@ test("public key refresh is session-bound, CSRF-bound, and does not persist keys
     });
     assert.equal(limited.status, 429);
     assert.equal(calls, 1);
+    globalThis.fetch = async () => { throw new Error("private upstream failure"); };
+    const failed = await post(`sub2api_allow_uuid=${token}`, "refresh-csrf");
+    const failedHtml = await failed.text();
+    assert.equal(failed.status, 502);
+    assert.match(failedHtml, /Previously loaded keys are still shown/);
+    assert.match(failedHtml, /transport_unavailable/);
+    assert.match(failedHtml, new RegExp(oldKey));
+    assert.doesNotMatch(failedHtml, /private upstream failure/);
+    assert.equal(values.get("invites"), JSON.stringify([storedInvite]));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("legacy default keys are accepted only in read-only status responses", async () => {
+  const env = validAdminEnv(memoryKv(new Map()));
+  const originalFetch = globalThis.fetch;
+  let groupName = "default";
+  globalThis.fetch = async (_url, init) => Response.json({
+    ok: true, action: JSON.parse(init.body).action, uuid: UUID,
+    tokens: [{ tokenId: 21, tokenKey: API_KEY, status: 1, groupName }],
+  });
+  try {
+    await adminTest.callSub2ApiSync(env, "status", { uuid: UUID });
+    await assert.rejects(adminTest.callSub2ApiSync(env, "provision", { uuid: UUID }), /sync request failed/);
+    groupName = "bad group";
+    await assert.rejects(adminTest.callSub2ApiSync(env, "status", { uuid: UUID }), /sync request failed/);
   } finally {
     globalThis.fetch = originalFetch;
   }

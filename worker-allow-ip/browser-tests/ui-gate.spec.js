@@ -1369,9 +1369,27 @@ test("public model explorer lists and tests chat and image models on mobile", as
       name: "sub2api_allow_uuid", value: PUBLIC_SESSION_TOKEN,
       url: "https://api.example.test/allow-ip", httpOnly: true, sameSite: "Strict",
     }]);
-    await page.route("https://api.example.test/allow-ip", fulfillWorkerGet);
+    let refreshAttempts = 0;
+    let expectedKey = "sk-browser-ui-model-test";
+    await page.route("https://api.example.test/allow-ip", async (route) => {
+      if (route.request().method() === "GET") return fulfillWorkerGet(route);
+      const form = new URLSearchParams(route.request().postData());
+      expect(form.get("action")).toBe("refresh_keys");
+      expect(form.get("csrf")).toBeTruthy();
+      refreshAttempts += 1;
+      if (refreshAttempts === 1) {
+        return route.fulfill({ status: 502, contentType: "text/html", body: "Unavailable" });
+      }
+      const response = await miniflare.dispatchFetch(route.request().url(), {
+        headers: route.request().headers(),
+      });
+      expectedKey = "sk-browser-ui-refreshed-key";
+      const body = (await response.text()).replaceAll("sk-browser-ui-model-test", expectedKey)
+        .replace('<section class="panel dashboard">', '<section class="panel dashboard"><p data-dashboard-notice>API keys are up to date.</p>');
+      await route.fulfill({ status: 200, contentType: "text/html", body });
+    });
     await page.route("https://api.example.test/v1/models", async (route) => {
-      expect(route.request().headers().authorization).toBe("Bearer sk-browser-ui-model-test");
+      expect(route.request().headers().authorization).toBe("Bearer " + expectedKey);
       await route.fulfill({
         status: 200, contentType: "application/json",
         body: JSON.stringify({ data: [
@@ -1392,6 +1410,8 @@ test("public model explorer lists and tests chat and image models on mobile", as
     });
     await page.setViewportSize({ width: 320, height: 700 });
     await page.goto("https://api.example.test/allow-ip", { waitUntil: "networkidle" });
+    await expect(page.locator("#key-refresh-status")).toContainText("Previously loaded keys are still shown");
+    expect(refreshAttempts).toBe(1);
     await expect(page.locator(".model-status")).toHaveText("2 models available");
     await expect(page.locator(".model-row")).toHaveCount(2);
     await page.getByRole("button", { name: "Test chat model claude-sonnet-4-5" }).click();
@@ -1400,6 +1420,11 @@ test("public model explorer lists and tests chat and image models on mobile", as
     await expect(page.locator(".model-row").last()).toContainText("Available · HTTP 200");
     expect(tested.map((item) => item.path)).toEqual(["chat", "image"]);
     expect(tested.map((item) => item.body.model)).toEqual(["claude-sonnet-4-5", "gpt-image-1"]);
+    await page.getByRole("button", { name: "Refresh API keys", exact: true }).click();
+    await expect(page.locator("#key-refresh-status")).toHaveText("API keys are up to date.");
+    await expect(page.locator(".copy-secret")).toHaveValue("sk-browser-ui-refreshed-key");
+    await expect(page.locator(".model-status")).toHaveText("2 models available");
+    expect(refreshAttempts).toBe(2);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await page.screenshot({ path: path.join(SCREENSHOT_ROOT, "public-model-explorer-320.png"), fullPage: true });
   } finally {

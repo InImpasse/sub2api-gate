@@ -171,9 +171,17 @@ async function handleSubmit(request, env, uuidSession) {
     if (!(await consumeAuthAttempt(env, "keytest", attemptKey))) {
       return html(renderMessage("Too many refreshes", "Try again later."), 429);
     }
-    const invite = await previewInviteKeysFromSub2Api(env, uuidSession.invite);
-    const currentStatus = await getCurrentAllowStatus(env, request, invite);
-    return html(renderDashboard(env, new URL(request.url), invite, request, "Current API keys loaded.", currentStatus, uuidSession.csrf));
+    const currentStatus = await getCurrentAllowStatus(env, request, uuidSession.invite);
+    try {
+      const invite = await previewInviteKeysFromSub2Api(env, uuidSession.invite);
+      return html(renderDashboard(env, new URL(request.url), invite, request, "API keys are up to date.", currentStatus, uuidSession.csrf));
+    } catch (error) {
+      const failure = sub2ApiSyncFailureMetadata(error);
+      const detail = failure ? ` (${failure.code}; request ID: ${failure.requestId})` : "";
+      return html(renderDashboard(env, new URL(request.url), uuidSession.invite, request,
+        `Could not refresh API keys${detail}. Previously loaded keys are still shown. Retry in a moment.`,
+        currentStatus, uuidSession.csrf, "error"), failure?.status || 502);
+    }
   }
 
   if (action === "test_api_key") {
@@ -397,7 +405,7 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
       <p class="lede">UUID ${escapeHtml(invite.uuid)} is signed in on this browser.</p>
     </section>
     <section class="panel dashboard">
-      ${notice ? `<p class="${noticeClass}" role="${noticeRole}">${escapeHtml(notice)}</p>` : ""}
+      ${notice ? `<p data-dashboard-notice class="${noticeClass}" role="${noticeRole}">${escapeHtml(notice)}</p>` : ""}
       ${statusText}
       ${shouldShowAddIp ? `<form id="allow-network-form" method="post" action="${escapeHtml(url.pathname)}">
         <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
@@ -408,11 +416,12 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
         ${renderSub2ApiLogin(invite)}
         ${configs.length ? configs.map((config) => renderApiConfig(config, { csrf, uuid: invite.uuid, action: url.pathname, modelExplorer: new URL(config.baseUrl).origin === url.origin && new URL(config.baseUrl).pathname === "/v1" })).join("") : `<p class="lede">No OpenAI API link has been configured for this UUID.</p>`}
       </div>
-      <form method="post" action="${escapeHtml(url.pathname)}">
+      <form id="refresh-keys-form" method="post" action="${escapeHtml(url.pathname)}">
         <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
         <input type="hidden" name="action" value="refresh_keys" />
-        <button class="ghost-wide" type="submit">Load current API keys</button>
+        <button class="ghost-wide" type="submit">Refresh API keys</button>
       </form>
+      <p id="key-refresh-status" class="copy-status" role="status" aria-live="polite"></p>
       <p id="copy-status" class="copy-status" role="status" aria-live="polite"></p>
       <form method="post" action="${escapeHtml(url.pathname)}">
         <input type="hidden" name="action" value="logout_uuid" />
@@ -424,7 +433,9 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
     <script nonce="${nonce}">
       ${shouldShowAddIp ? turnstileInitializer(env.TURNSTILE_SITE_KEY) : ""}
       const copyStatus = document.getElementById("copy-status");
-      document.querySelectorAll(".copy-value").forEach((button) => {
+      const apiList = document.querySelector(".api-list");
+      const initializeApiCards = () => {
+      apiList.querySelectorAll(".copy-value").forEach((button) => {
         button.addEventListener("click", async () => {
           const originalLabel = button.textContent;
           try {
@@ -446,7 +457,7 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
           }, 1400);
         });
       });
-      document.querySelectorAll(".toggle-dashboard-secret").forEach((button) => {
+      apiList.querySelectorAll(".toggle-dashboard-secret").forEach((button) => {
         button.addEventListener("click", () => {
           const card = button.closest(".api-card");
           const input = button.closest(".secret-copy-line")?.querySelector(".copy-secret");
@@ -460,7 +471,7 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
           });
         });
       });
-      document.querySelectorAll(".key-test-form").forEach((form) => {
+      apiList.querySelectorAll(".key-test-form").forEach((form) => {
         form.addEventListener("submit", () => {
           const button = form.querySelector('button[type="submit"]');
           if (!button || button.disabled) return;
@@ -469,6 +480,46 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
         });
       });
       ${modelExplorerScript()}
+      };
+      initializeApiCards();
+      const refreshForm = document.getElementById("refresh-keys-form");
+      const refreshStatus = document.getElementById("key-refresh-status");
+      const refreshButton = refreshForm.querySelector("button");
+      const refreshKeys = async () => {
+        if (refreshButton.disabled) return;
+        refreshButton.disabled = true;
+        refreshStatus.setAttribute("role", "status");
+        refreshStatus.textContent = "Refreshing API keys...";
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 12000);
+        try {
+          const response = await fetch(refreshForm.getAttribute("action"), {
+            method: "POST", body: new URLSearchParams(new FormData(refreshForm)),
+            credentials: "same-origin", cache: "no-store", redirect: "error", signal: controller.signal,
+          });
+          const page = new DOMParser().parseFromString(await response.text(), "text/html");
+          const nextList = page.querySelector(".api-list");
+          const notice = page.querySelector("[data-dashboard-notice]");
+          if (!response.ok || !nextList || !notice) {
+            refreshStatus.setAttribute("role", "alert");
+            refreshStatus.textContent = notice?.textContent || (response.status === 429
+              ? "Too many refreshes. Previously loaded keys are still shown. Try again later."
+              : "Could not refresh API keys. Previously loaded keys are still shown. Retry in a moment.");
+            return;
+          }
+          apiList.replaceChildren(...nextList.childNodes);
+          initializeApiCards();
+          refreshStatus.textContent = notice.textContent;
+        } catch {
+          refreshStatus.setAttribute("role", "alert");
+          refreshStatus.textContent = "Could not refresh API keys. Previously loaded keys are still shown. Retry in a moment.";
+        } finally {
+          window.clearTimeout(timer);
+          refreshButton.disabled = false;
+        }
+      };
+      refreshForm.addEventListener("submit", (event) => { event.preventDefault(); refreshKeys(); });
+      refreshKeys();
     </script>
   `);
 }
