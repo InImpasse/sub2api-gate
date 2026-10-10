@@ -159,6 +159,14 @@ function syncResponse(request) {
         syncedAt: "2026-07-21T12:30:00.000Z",
       });
     }
+    if (body.action === "status") {
+      return Response.json({
+        ok: true, action: "status", uuid: body.uuid, exists: true,
+        userId: 11, username: makeInvite(0).username,
+        passwordHashFingerprint: "f".repeat(64), tokens: [],
+        loginUrl: "https://api.example.test/login", baseUrl: "https://api.example.test/v1",
+      });
+    }
     if (body.action === "test_api_key") {
       return Response.json({
         ok: true,
@@ -1557,6 +1565,7 @@ test("static demo mirrors verification, focused errors, and clipboard recovery",
 for (const viewport of VIEWPORTS) {
   for (const theme of THEMES) {
     test(`${viewport.name} ${theme} responsive matrix`, async ({ page, context }) => {
+      await seedWorker();
       await page.setViewportSize({ width: viewport.width, height: viewport.height });
       await page.emulateMedia({ colorScheme: theme, reducedMotion: "reduce" });
       await page.addInitScript(installVitalsObserver);
@@ -1597,6 +1606,7 @@ for (const viewport of VIEWPORTS) {
 }
 
 test("200 percent zoom equivalent reflows at 240 CSS px", async ({ page, context }) => {
+  await seedWorker();
   const viewport = { name: "zoom-200-equivalent-240x400", width: 240, height: 400 };
   await page.setViewportSize({ width: viewport.width, height: viewport.height });
   await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });

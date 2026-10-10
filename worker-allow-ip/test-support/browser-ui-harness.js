@@ -1,5 +1,6 @@
 import productionWorker, { AuthRateLimiter, AuthState } from "../src/worker-entry.js";
-import { __test as adminTest } from "../src/admin.js";
+import { __test as adminTest, keyTestAttemptKey } from "../src/admin.js";
+import { resetAuthAttempts } from "../src/auth-rate-limiter.js";
 import { createAuthStateStore } from "../src/auth-state.js";
 
 export { AuthRateLimiter, AuthState };
@@ -34,6 +35,7 @@ export default {
         accessCredentialVersion: 1,
       });
       await store.putRecords(body.publicUuid, body.records || []);
+      await resetAuthAttempts(env, "keytest", await keyTestAttemptKey(env, body.publicUuid));
       return Response.json({ ok: true, inviteCount: body.invites?.length || 0 });
     }
 
