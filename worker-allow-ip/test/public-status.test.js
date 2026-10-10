@@ -369,7 +369,8 @@ test("Sub2API auto-login rejects a cross-origin login URL before fetching a toke
   }
 });
 
-test("Sub2API auto-login fetches a token when the login URL has the request origin", async () => {
+for (const loginUrl of ["https://api.example.test/login", ""]) {
+test(`Sub2API auto-login supports a same-origin or missing login URL (${Boolean(loginUrl)})`, async () => {
   const token = "same-origin-login-session";
   const sessionKey = `uuid-session:${await sha256Hex(token)}`;
   const storedInvite = await protectInviteCredentials({
@@ -382,7 +383,7 @@ test("Sub2API auto-login fetches a token when the login URL has the request orig
       username: "alice",
       email: "alice@example.test",
       loginPassword: "test-login-password",
-      loginUrl: "https://api.example.test/login",
+      loginUrl,
     },
   }, AES_KEY, HMAC_KEY);
   const values = new Map([
@@ -502,6 +503,8 @@ test("Sub2API auto-login fetches a token when the login URL has the request orig
     globalThis.fetch = originalFetch;
   }
 });
+
+}
 
 test("an already-authorized dashboard does not load the Turnstile client", async () => {
   const token = "authorized-network-session";

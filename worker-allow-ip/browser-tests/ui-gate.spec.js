@@ -1406,6 +1406,44 @@ test("account spans both key cards on desktop and keys stack on mobile", async (
   }
 });
 
+test("Open Sub2API stays visible for accounts without automatic login credentials", async ({ page, context }) => {
+  await context.setExtraHTTPHeaders({ "CF-Connecting-IP": CLIENT_IP });
+  await context.addCookies([{
+    name: "sub2api_allow_uuid", value: PUBLIC_SESSION_TOKEN,
+    url: "https://api.example.test/allow-ip", httpOnly: true, sameSite: "Strict",
+  }]);
+  await page.route("https://api.example.test/allow-ip", async (route) => {
+    if (route.request().method() === "GET") return fulfillWorkerGet(route);
+    const response = await miniflare.dispatchFetch(route.request().url(), {
+      method: "POST", headers: route.request().headers(), body: route.request().postData(),
+    });
+    await route.fulfill({ status: response.status, headers: Object.fromEntries(response.headers), body: await response.text() });
+  });
+  await page.route("https://api.example.test/login", (route) => route.fulfill({
+    contentType: "text/html", body: "<h1>Sub2API sign in</h1>",
+  }));
+  try {
+    for (const noAccountMetadata of [false, true]) {
+      const invites = Array.from({ length: 25 }, (_, index) => makeInvite(index));
+      if (noAccountMetadata) invites[0].sub2apiSync = {};
+      else delete invites[0].sub2apiSync.loginPassword;
+      await seedWorker(invites);
+      await page.goto("https://api.example.test/allow-ip");
+      await expect(page.locator("#key-refresh-status")).toHaveText("API keys are up to date.");
+      const entry = page.getByRole("link", { name: "Open Sub2API", exact: true });
+      await expect(entry).toBeVisible();
+      await expect(entry).toHaveAttribute("href", "https://api.example.test/login");
+      await expect(page.locator(".account-card")).toContainText("Automatic sign-in is unavailable");
+      await page.getByRole("button", { name: "Refresh API keys", exact: true }).click();
+      await expect(entry).toBeVisible();
+      await entry.click();
+      await expect(page).toHaveURL("https://api.example.test/login");
+    }
+  } finally {
+    await seedWorker();
+  }
+});
+
 test("Claude cards show and test the Anthropic Messages protocol", async ({ page, context }) => {
   const invites = Array.from({ length: 25 }, (_, index) => makeInvite(index));
   invites[0].apiConfigs = [{

@@ -413,7 +413,7 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
         <button id="submit-button" type="submit" disabled>Link current network to this user</button>
       </form>` : ""}
       <div class="api-list">
-        ${renderSub2ApiLogin(invite)}
+        ${renderSub2ApiLogin(invite, url)}
         ${configs.length ? configs.map((config) => renderApiConfig(config, { csrf, uuid: invite.uuid, action: url.pathname, modelExplorer: new URL(config.baseUrl).origin === url.origin && new URL(config.baseUrl).pathname === "/v1" })).join("") : `<p class="lede">No OpenAI API link has been configured for this UUID.</p>`}
       </div>
       <form id="refresh-keys-form" method="post" action="${escapeHtml(url.pathname)}">
@@ -867,22 +867,22 @@ function normalizeApiName(name) {
   return String(name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function renderSub2ApiLogin(invite) {
+function sub2ApiLoginUrl(sync, requestUrl) {
+  return hasSameOrigin(sync.loginUrl, requestUrl) ? sync.loginUrl : new URL("/login", requestUrl).href;
+}
+
+function renderSub2ApiLogin(invite, requestUrl) {
   const sync = invite.sub2apiSync || {};
-  const loginUrl = sync.loginUrl || "";
-  const hasLogin = Boolean(sync.username && sync.loginPassword && loginUrl);
-  if (!sync.username) {
-    return "";
-  }
+  const loginUrl = sub2ApiLoginUrl(sync, requestUrl);
+  const hasLogin = Boolean((sync.email || sync.username) && sync.loginPassword
+    && (!sync.loginUrl || hasSameOrigin(sync.loginUrl, requestUrl)));
 
   return `
     <div class="api-card account-card">
       <strong>Sub2API account</strong>
-      <p class="lede">Use the button below to open Sub2API. Manual username and password sign-in is not available from this page.</p>
-      ${hasLogin
-        ? `<a class="ghost-wide" href="/allow-ip/sub2api-login">Open Sub2API</a>`
-        : `<p class="warning">Sub2API login is not ready for this UUID. Contact the administrator to refresh this account.</p>`}
-      ${loginUrl ? `<div class="copy-line"><code title="${escapeHtml(loginUrl)}">${escapeHtml(loginUrl)}</code><button class="ghost compact copy-value" type="button" data-copy="${escapeHtml(loginUrl)}">Copy URL</button></div>` : ""}
+      <p class="lede">${hasLogin ? "Open Sub2API and sign in automatically." : "Open the Sub2API sign-in page. Automatic sign-in is unavailable for this account; contact the administrator to restore it."}</p>
+      <a class="ghost-wide" href="${hasLogin ? "/allow-ip/sub2api-login" : escapeHtml(loginUrl)}">Open Sub2API</a>
+      <div class="copy-line"><code title="${escapeHtml(loginUrl)}">${escapeHtml(loginUrl)}</code><button class="ghost compact copy-value" type="button" data-copy="${escapeHtml(loginUrl)}">Copy URL</button></div>
     </div>
   `;
 }
@@ -892,8 +892,8 @@ async function renderSub2ApiAutoLogin(env, invite, requestUrl) {
   const username = sync.username || "";
   const email = sync.email || (username ? `${username}@sub2api.local` : "");
   const password = sync.loginPassword || "";
-  const loginUrl = sync.loginUrl || "";
-  if (!email || !password || !loginUrl || !hasSameOrigin(loginUrl, requestUrl)) {
+  const loginUrl = sub2ApiLoginUrl(sync, requestUrl);
+  if (!email || !password || (sync.loginUrl && !hasSameOrigin(sync.loginUrl, requestUrl))) {
     return renderMessage("Sub2API login unavailable", "This UUID is not ready for direct Sub2API login. Contact the administrator to refresh this account.");
   }
   let auth;
@@ -1801,4 +1801,5 @@ export const __test = Object.freeze({
   html,
   renderTrustedHtml,
   renderApiConfig,
+  renderSub2ApiLogin,
 });
