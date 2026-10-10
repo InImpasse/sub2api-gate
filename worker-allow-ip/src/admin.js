@@ -1386,6 +1386,15 @@ async function createInvite(env, uuid, data) {
   assertUniqueInviteUsername(invites, username, null);
   const now = new Date().toISOString();
   const keyGroup = DEFAULT_KEY_GROUP_NAME;
+  const tokens = desiredSub2ApiTokens(env, data.apiConfigs).map((token) => ({
+    ...token,
+    groupName: keyGroup,
+  }));
+  for (const [tokenName, groupName] of [["GPT", keyGroup], ["Claude", "anthropic-default"]]) {
+    if (!tokens.some((token) => token.groupName === groupName)) {
+      tokens.push({ tokenName, groupName, tokenKey: `sk-${randomHex(32)}` });
+    }
+  }
   const syncResult = await provisionSub2ApiUser(env, {
     uuid,
     username: desiredSub2ApiUsername(username, uuid),
@@ -1395,15 +1404,9 @@ async function createInvite(env, uuid, data) {
     sub2apiUserId: 0,
     loginPassword: "",
     keyGroup,
-    tokens: desiredSub2ApiTokens(env, data.apiConfigs).map((token) => ({
-      ...token,
-      groupName: keyGroup,
-    })),
+    tokens,
   });
-  const apiConfigs = mergeSub2ApiConfig(env, data.apiConfigs, syncResult).map((config) => ({
-    ...config,
-    groupName: keyGroup,
-  }));
+  const apiConfigs = mergeSub2ApiConfig(env, data.apiConfigs, syncResult);
   const sub2apiSync = await sub2apiSyncMetadata(env, syncResult);
 
   const issued = await issueInviteAccessCredential({
@@ -2963,8 +2966,8 @@ function renderAdmin(invites, trash, csrf, request, env, dashboard = {}) {
               <input id="remark" name="remark" type="text" maxlength="240" />
             </div>
             <div class="field span-2">
-              <span>Key group</span>
-              <p>${DEFAULT_KEY_GROUP_NAME}</p>
+              <span>Default API keys</span>
+              <p>GPT (${DEFAULT_KEY_GROUP_NAME}) and Claude (anthropic-default) keys are created automatically.</p>
             </div>
           </div>
           ${renderApiConfigEditor("api-configs", [], defaultBaseUrl)}
@@ -3718,7 +3721,7 @@ function renderApiConfigEditor(editorId, apiConfigs, defaultBaseUrl) {
     <section class="api-config-editor" id="${escapeHtml(editorId)}">
       <input type="hidden" name="api_configs" value="${escapeHtml(formatApiConfigEditorRows(rows))}" />
       <div class="subhead">
-        <h3>OpenAI API links</h3>
+        <h3>API links</h3>
         <div class="inline-actions">
           <button class="secondary compact generate-key" type="button" data-editor="${escapeHtml(editorId)}" data-base-url="${escapeHtml(defaultBaseUrl)}">Generate key</button>
           <button class="secondary compact add-api-link" type="button" data-editor="${escapeHtml(editorId)}" data-base-url="${escapeHtml(defaultBaseUrl)}">Add link</button>
@@ -4964,6 +4967,7 @@ function resolveExistingCredentialReferences(env, configs, storedInvite, reveale
       name: config.name,
       baseUrl: storedBaseUrl,
       apiKey: String(revealedConfig.apiKey),
+      ...(revealedConfig.groupName ? { groupName: revealedConfig.groupName } : {}),
     };
   });
 }

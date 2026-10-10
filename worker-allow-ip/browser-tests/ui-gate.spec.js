@@ -1364,6 +1364,48 @@ test("dashboard reports clipboard rejection without an unhandled page error", as
   expect(pageErrors).toEqual([]);
 });
 
+test("account spans both key cards on desktop and keys stack on mobile", async ({ page, context }) => {
+  const invites = Array.from({ length: 25 }, (_, index) => makeInvite(index));
+  invites[0].apiConfigs.push({
+    id: "claude-provider", name: "Claude", baseUrl: "https://provider.example.test/v1",
+    apiKey: "sk-browser-ui-claude-test", groupName: "anthropic-default",
+  });
+  await seedWorker(invites);
+  try {
+    await context.setExtraHTTPHeaders({ "CF-Connecting-IP": CLIENT_IP });
+    await context.addCookies([{
+      name: "sub2api_allow_uuid", value: PUBLIC_SESSION_TOKEN,
+      url: "https://api.example.test/allow-ip", httpOnly: true, sameSite: "Strict",
+    }]);
+    await page.route("https://api.example.test/allow-ip", async (route) => {
+      if (route.request().method() === "GET") return fulfillWorkerGet(route);
+      return route.fulfill({ status: 502, body: "Unavailable" });
+    });
+    for (const width of [1366, 320]) {
+      await page.setViewportSize({ width, height: 900 });
+      await page.goto("https://api.example.test/allow-ip");
+      const account = await page.locator(".account-card").boundingBox();
+      const cards = page.locator(".api-card:not(.account-card)");
+      await expect(cards).toHaveCount(2);
+      const gpt = await cards.nth(0).boundingBox();
+      const claude = await cards.nth(1).boundingBox();
+      expect(gpt.y).toBeGreaterThan(account.y + account.height);
+      if (width > 1000) {
+        expect(gpt.y).toBe(claude.y);
+        expect(claude.x).toBeGreaterThan(gpt.x + gpt.width);
+        expect(account.width).toBeGreaterThan(gpt.width + claude.width);
+      } else {
+        expect(claude.y).toBeGreaterThan(gpt.y + gpt.height);
+        expect(gpt.x).toBe(claude.x);
+      }
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      await page.screenshot({ path: path.join(SCREENSHOT_ROOT, `account-key-layout-${width}.png`), fullPage: true });
+    }
+  } finally {
+    await seedWorker();
+  }
+});
+
 test("public model explorer lists and tests chat and image models on mobile", async ({ page, context }) => {
   const invites = Array.from({ length: 25 }, (_, index) => makeInvite(index));
   invites[0].apiConfigs = [{

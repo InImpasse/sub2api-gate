@@ -858,7 +858,7 @@ function renderSub2ApiLogin(invite) {
   }
 
   return `
-    <div class="api-card">
+    <div class="api-card account-card">
       <strong>Sub2API account</strong>
       <p class="lede">Use the button below to open Sub2API. Manual username and password sign-in is not available from this page.</p>
       ${hasLogin
@@ -1394,6 +1394,7 @@ function page(title, body) {
       border-radius: 16px;
       background: rgba(255, 255, 255, 0.4);
     }
+    .account-card { grid-column: 1 / -1; }
     .key-test-form { margin: 0; }
     .api-card strong {
       overflow-wrap: anywhere;

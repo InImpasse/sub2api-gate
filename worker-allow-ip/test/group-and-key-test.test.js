@@ -222,7 +222,8 @@ test("invite summary test forms stay CSRF-bound and never serialize API keys", (
   assert.match(html, /name="admin_context" value="p=2&amp;t=3&amp;i=2&amp;v=d"/);
 });
 
-test("new invites always provision into openai-default", async () => {
+for (const withExistingKey of [false, true]) {
+test(`new invites provision GPT and Claude keys (supplied key: ${withExistingKey})`, async () => {
   const env = validAdminEnv(memoryKv(new Map([["invites", "[]"], ["trash", "[]"]])));
   let payload;
   const originalFetch = globalThis.fetch;
@@ -240,16 +241,16 @@ test("new invites always provision into openai-default", async () => {
       tokenKey: API_KEY,
       loginPassword: "generated-password",
       passwordHashFingerprint: "f".repeat(64),
-      tokens: [{
-        tokenId: 21,
-        apiKeyId: 21,
-        name: "Sub2API",
-        tokenKey: API_KEY,
-        apiKey: API_KEY,
+      tokens: payload.tokens.map((token, index) => ({
+        tokenId: 21 + index,
+        apiKeyId: 21 + index,
+        name: token.tokenName,
+        tokenKey: token.tokenKey,
+        apiKey: token.tokenKey,
         status: 1,
-        groupName: "openai-default",
-      }],
-      allowedGroups: ["openai-default"],
+        groupName: token.groupName,
+      })),
+      allowedGroups: ["openai-default", "anthropic-default"],
       baseUrl: "https://api.example.test/v1",
       loginUrl: "https://api.example.test/login",
       syncedAt: new Date().toISOString(),
@@ -260,22 +261,43 @@ test("new invites always provision into openai-default", async () => {
       username: "alice",
       email: "alice@example.test",
       remark: "",
-      apiConfigs: [{
+      apiConfigs: withExistingKey ? [{
         name: "Sub2API",
         baseUrl: "https://api.example.test/v1",
         apiKey: API_KEY,
         groupName: "grok",
-      }],
+      }] : [],
       keyGroup: "grok",
     });
     assert.equal(payload.action, "provision");
     assert.deepEqual(payload.allowedGroups, ["openai-default"]);
     assert.equal(payload.tokens[0].groupName, "openai-default");
-    assert.equal(issued.invite.apiConfigs[0].groupName, "openai-default");
+    assert.equal(payload.tokens.length, 2);
+    assert.equal(payload.tokens[1].groupName, "anthropic-default");
+    assert.equal(payload.tokens[1].tokenName, "Claude");
+    assert.match(payload.tokens[1].tokenKey, /^sk-[a-f0-9]{64}$/);
+    assert.notEqual(payload.tokens[0].tokenKey, payload.tokens[1].tokenKey);
+    if (withExistingKey) assert.equal(payload.tokens[0].tokenKey, API_KEY);
+    else {
+      assert.equal(payload.tokens[0].tokenName, "GPT");
+      assert.match(payload.tokens[0].tokenKey, /^sk-[a-f0-9]{64}$/);
+    }
+    assert.deepEqual(issued.invite.apiConfigs.map((config) => config.groupName), ["openai-default", "anthropic-default"]);
+    const originalKeys = payload.tokens.map((token) => token.tokenKey);
+    await adminTest.updateInvite(env, UUID, {
+      uuid: UUID, username: "alice", email: "alice@example.test", remark: "Updated note",
+      keyGroup: "openai-default",
+      apiConfigs: issued.invite.apiConfigs.map((config) => ({
+        name: config.name, baseUrl: config.baseUrl, existingCredentialId: config.id,
+      })),
+    });
+    assert.deepEqual(payload.tokens.map((token) => token.groupName), ["openai-default", "anthropic-default"]);
+    assert.deepEqual(payload.tokens.map((token) => token.tokenKey), originalKeys);
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
+}
 
 test("public key refresh is session-bound, CSRF-bound, and does not persist keys", async () => {
   const token = "public-key-refresh-session";
