@@ -168,7 +168,9 @@ BEGIN
             policy ? target.table_name
             AND policy -> target.table_name ? target.column_name
         ) THEN
-            RAISE EXCEPTION 'unreviewed content-capable schema field: %.%',
+            -- New upstream fields need review, but must not block upgrades.
+            -- This warning does not certify the unknown field as content-free.
+            RAISE WARNING 'unreviewed content-capable schema field: %.%',
                 target.table_name, target.column_name;
         END IF;
     END LOOP;

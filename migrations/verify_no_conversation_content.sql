@@ -1,8 +1,8 @@
 \set ON_ERROR_STOP on
 
 -- Read-only post-scrub gate. Missing optional tables/columns are accepted;
--- any surviving capture field, content residue, disabled guard, or unreviewed
--- content-capable schema field aborts the check.
+-- known capture fields, content residue, disabled guards and content-capable
+-- non-public schemas abort the check. Unknown public fields only warn.
 DO $$
 DECLARE
     policy jsonb;
@@ -244,8 +244,9 @@ BEGIN
         END IF;
     END IF;
 
-    -- Fail closed on upstream schema drift. All content-capable fields must be
-    -- scrubbed by the shared policy or be an explicitly reviewed exception.
+    -- Unknown public fields warn for manual review instead of blocking upgrades.
+    -- Known content residue and unapproved non-public schemas still fail closed;
+    -- a successful check does not certify unknown fields as content-free.
     FOR target IN
         SELECT namespace.nspname AS schema_name,
                relation.relname AS table_name,
@@ -307,7 +308,7 @@ BEGIN
             policy ? target.table_name
             AND policy -> target.table_name ? target.column_name
         ) THEN
-            RAISE EXCEPTION 'unreviewed content-capable schema field: %.%',
+            RAISE WARNING 'unreviewed content-capable schema field: %.%',
                 target.table_name, target.column_name;
         END IF;
     END LOOP;

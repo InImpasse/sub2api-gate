@@ -39,6 +39,19 @@ run_file() {
     < "$repo_dir/$relative_path"
 }
 
+require_schema_warning() {
+  check_file="$1"
+  expected_field="$2"
+  if ! check_output="$(run_file postgres "$check_file" 2>&1)"; then
+    echo "schema warning unexpectedly blocked verification: $expected_field" >&2
+    exit 1
+  fi
+  if ! printf '%s\n' "$check_output" | grep -Fq "WARNING:  unreviewed content-capable schema field: $expected_field"; then
+    echo "schema warning missing: $expected_field" >&2
+    exit 1
+  fi
+}
+
 # A failure inside the short guard transaction must roll back both DDL and
 # trigger functions. A view deliberately makes trigger installation fail.
 docker exec "$container_name" createdb -U postgres privacy_guard_rollback
@@ -796,10 +809,7 @@ docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
 
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE usage_logs ADD COLUMN future_payload text;'
-if run_file postgres migrations/verify_conversation_guards.sql >/dev/null 2>&1; then
-  echo "guard gate accepted an unreviewed content-capable schema field" >&2
-  exit 1
-fi
+require_schema_warning migrations/verify_conversation_guards.sql usage_logs.future_payload
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE usage_logs DROP COLUMN future_payload;'
 
@@ -1228,94 +1238,64 @@ fi
 run_file postgres migrations/002_scrub_conversation_history.sql >/dev/null
 run_file postgres migrations/verify_no_conversation_content.sql >/dev/null
 
-# Type and schema drift checks remain fail closed.
+# Unknown public fields warn; known content and non-public schemas still block.
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE ops_system_logs ADD COLUMN future_note text;'
-if run_file postgres migrations/verify_no_conversation_content.sql >/dev/null 2>&1; then
-  echo "privacy gate accepted an unreviewed text logging field" >&2
-  exit 1
-fi
+require_schema_warning migrations/verify_no_conversation_content.sql ops_system_logs.future_note
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE ops_system_logs DROP COLUMN future_note;'
 
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE ops_system_logs ADD COLUMN future_context jsonb;'
-if run_file postgres migrations/verify_no_conversation_content.sql >/dev/null 2>&1; then
-  echo "privacy gate accepted an unreviewed JSON logging field" >&2
-  exit 1
-fi
+require_schema_warning migrations/verify_no_conversation_content.sql ops_system_logs.future_context
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE ops_system_logs DROP COLUMN future_context;'
 
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE usage_logs ADD COLUMN future_attachment bytea;'
-if run_file postgres migrations/verify_no_conversation_content.sql >/dev/null 2>&1; then
-  echo "privacy gate accepted an unreviewed binary logging field" >&2
-  exit 1
-fi
+require_schema_warning migrations/verify_no_conversation_content.sql usage_logs.future_attachment
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE usage_logs DROP COLUMN future_attachment;'
 
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE audit_logs ADD COLUMN future_markup xml;'
-if run_file postgres migrations/verify_no_conversation_content.sql >/dev/null 2>&1; then
-  echo "privacy gate accepted an unreviewed XML logging field" >&2
-  exit 1
-fi
+require_schema_warning migrations/verify_no_conversation_content.sql audit_logs.future_markup
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE audit_logs DROP COLUMN future_markup;'
 
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE ops_system_logs ADD COLUMN future_fragments text[];'
-if run_file postgres migrations/verify_no_conversation_content.sql >/dev/null 2>&1; then
-  echo "privacy gate accepted an unreviewed array logging field" >&2
-  exit 1
-fi
+require_schema_warning migrations/verify_no_conversation_content.sql ops_system_logs.future_fragments
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE ops_system_logs DROP COLUMN future_fragments;'
 
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE usage_logs ALTER COLUMN prompt_tokens TYPE text USING prompt_tokens::text;'
-if run_file postgres migrations/verify_no_conversation_content.sql >/dev/null 2>&1; then
-  echo "privacy gate accepted prompt_tokens after a content-capable type drift" >&2
-  exit 1
-fi
+require_schema_warning migrations/verify_no_conversation_content.sql usage_logs.prompt_tokens
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE usage_logs ALTER COLUMN prompt_tokens TYPE bigint USING prompt_tokens::bigint;'
 
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE batch_image_jobs ADD COLUMN future_response text;'
-if run_file postgres migrations/verify_no_conversation_content.sql >/dev/null 2>&1; then
-  echo "privacy gate accepted an unreviewed batch-image response field" >&2
-  exit 1
-fi
+require_schema_warning migrations/verify_no_conversation_content.sql batch_image_jobs.future_response
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE batch_image_jobs DROP COLUMN future_response;'
 
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE usage_billing_dedup ADD COLUMN future_fingerprint text;'
-if run_file postgres migrations/verify_no_conversation_content.sql >/dev/null 2>&1; then
-  echo "privacy gate accepted an unreviewed billing fingerprint field" >&2
-  exit 1
-fi
+require_schema_warning migrations/verify_no_conversation_content.sql usage_billing_dedup.future_fingerprint
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE usage_billing_dedup DROP COLUMN future_fingerprint;'
 
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE batch_image_jobs ADD COLUMN future_hash varchar;'
-if run_file postgres migrations/verify_no_conversation_content.sql >/dev/null 2>&1; then
-  echo "privacy gate accepted an unreviewed batch-image hash field" >&2
-  exit 1
-fi
+require_schema_warning migrations/verify_no_conversation_content.sql batch_image_jobs.future_hash
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE batch_image_jobs DROP COLUMN future_hash;'
 
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE batch_image_items ADD COLUMN future_ref text;'
-if run_file postgres migrations/verify_no_conversation_content.sql >/dev/null 2>&1; then
-  echo "privacy gate accepted an unreviewed batch-image reference field" >&2
-  exit 1
-fi
+require_schema_warning migrations/verify_no_conversation_content.sql batch_image_items.future_ref
 docker exec "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'ALTER TABLE batch_image_items DROP COLUMN future_ref;'
 
@@ -1323,10 +1303,7 @@ docker exec -i "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1
 CREATE DOMAIN private_note_domain AS text;
 ALTER TABLE ops_system_logs ADD COLUMN future_domain private_note_domain;
 SQL
-if run_file postgres migrations/verify_no_conversation_content.sql >/dev/null 2>&1; then
-  echo "privacy gate accepted a content-capable domain field" >&2
-  exit 1
-fi
+require_schema_warning migrations/verify_no_conversation_content.sql ops_system_logs.future_domain
 docker exec -i "$container_name" psql -U postgres -d postgres -v ON_ERROR_STOP=1 <<'SQL'
 ALTER TABLE ops_system_logs DROP COLUMN future_domain;
 DROP DOMAIN private_note_domain;
