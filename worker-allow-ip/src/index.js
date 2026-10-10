@@ -702,12 +702,17 @@ function renderCurrentIpStatus(status) {
 
 function renderApiConfig(config, { csrf = "", uuid = "", action = "/allow-ip", modelExplorer = false } = {}) {
   const key = config.apiKey || "";
-  const curl = `curl ${config.baseUrl}/chat/completions -H "Authorization: Bearer ${key}"`;
-  const maskedCurl = `curl ${config.baseUrl}/chat/completions -H "Authorization: Bearer ${maskSecret(key)}"`;
   const groupLabel = String(config.groupName || "").trim();
+  const anthropic = /^anthropic(?:-|$)/i.test(groupLabel) || (!groupLabel && /claude|anthropic/i.test(config.name || ""));
+  const baseUrl = String(config.baseUrl).replace(/\/$/, "");
+  const example = (apiKey) => anthropic
+    ? `curl ${baseUrl}/messages -H "x-api-key: ${apiKey}" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" -d '{"model":"MODEL_ID","max_tokens":16,"messages":[{"role":"user","content":"Reply OK."}]}'`
+    : `curl ${baseUrl}/chat/completions -H "Authorization: Bearer ${apiKey}"`;
+  const curl = example(key);
+  const maskedCurl = example(maskSecret(key));
   const configId = String(config.id || "sub2api-sync");
   return `
-    <div class="api-card">
+    <div class="api-card" data-api-format="${anthropic ? "anthropic" : "openai"}">
       <strong>${escapeHtml(displayApiName(config.name))}</strong>
       ${groupLabel ? `<p class="hint">Key group: ${escapeHtml(groupLabel)}</p>` : ""}
       <label>Base URL</label>
@@ -718,7 +723,8 @@ function renderApiConfig(config, { csrf = "", uuid = "", action = "/allow-ip", m
         <button class="ghost compact toggle-dashboard-secret" type="button" aria-pressed="false">Show</button>
         <button class="ghost compact copy-value" type="button" data-copy="${escapeHtml(key)}"${key ? "" : " disabled"}>Copy</button>
       </div>
-      <label>OpenAI format</label>
+      <label>${anthropic ? "Claude / Anthropic Messages format" : "OpenAI format"}</label>
+      ${anthropic ? `<p class="hint">Replace MODEL_ID with an available Claude model below.</p>` : ""}
       <div class="copy-line"><code class="secret-format" data-masked-value="${escapeHtml(maskedCurl)}" data-full-value="${escapeHtml(curl)}">${escapeHtml(maskedCurl)}</code><button class="ghost compact copy-value" type="button" data-copy="${escapeHtml(curl)}">Copy</button></div>
       ${csrf && uuid ? `
         <form class="key-test-form" method="post" action="${escapeHtml(action)}">
@@ -772,6 +778,7 @@ function modelExplorerScript() {
     };
     document.querySelectorAll(".model-explorer").forEach((explorer) => {
       const card = explorer.closest(".api-card");
+      const anthropic = card.dataset.apiFormat === "anthropic";
       const key = card.querySelector(".copy-secret")?.value || "";
       const status = explorer.querySelector(".model-status");
       const list = explorer.querySelector(".model-list");
@@ -812,13 +819,18 @@ function modelExplorerScript() {
               const deadline = window.setTimeout(() => probe.abort(), imageModel ? 90000 : 20000);
               const started = performance.now();
               try {
-                const response = await fetch(imageModel ? "/v1/images/generations" : "/v1/chat/completions", {
+                const response = await fetch(imageModel ? "/v1/images/generations" : anthropic ? "/v1/messages" : "/v1/chat/completions", {
                   method: "POST",
-                  headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+                  headers: {
+                    ...(anthropic && !imageModel
+                      ? { "x-api-key": key, "anthropic-version": "2023-06-01" }
+                      : { authorization: "Bearer " + key }),
+                    "content-type": "application/json",
+                  },
                   body: JSON.stringify(imageModel
                     ? { model, prompt: "A solid white square.", size: "1024x1024", n: 1 }
                     : { model, messages: [{ role: "user", content: "Reply OK." }],
-                      [/^gpt-[5-9]/i.test(model) ? "max_completion_tokens" : "max_tokens"]: 16 }),
+                      [!anthropic && /^gpt-[5-9]/i.test(model) ? "max_completion_tokens" : "max_tokens"]: 16 }),
                   credentials: "omit", cache: "no-store", redirect: "error", signal: probe.signal,
                 });
                 await response.body?.cancel().catch(() => {});

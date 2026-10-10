@@ -1406,6 +1406,57 @@ test("account spans both key cards on desktop and keys stack on mobile", async (
   }
 });
 
+test("Claude cards show and test the Anthropic Messages protocol", async ({ page, context }) => {
+  const invites = Array.from({ length: 25 }, (_, index) => makeInvite(index));
+  invites[0].apiConfigs = [{
+    id: "sub2api-sync", name: "Claude", baseUrl: "https://api.example.test/v1",
+    apiKey: "sk-browser-ui-claude-test", groupName: "anthropic-default",
+  }];
+  await seedWorker(invites);
+  try {
+    await context.setExtraHTTPHeaders({ "CF-Connecting-IP": CLIENT_IP });
+    await context.addCookies([{
+      name: "sub2api_allow_uuid", value: PUBLIC_SESSION_TOKEN,
+      url: "https://api.example.test/allow-ip", httpOnly: true, sameSite: "Strict",
+    }]);
+    await page.route("https://api.example.test/allow-ip", async (route) => {
+      if (route.request().method() === "GET") return fulfillWorkerGet(route);
+      return route.fulfill({ status: 502, body: "Unavailable" });
+    });
+    await page.route("https://api.example.test/v1/models", (route) => route.fulfill({
+      json: { data: [{ id: "claude-sonnet-4-5" }] },
+    }));
+    let calls = 0;
+    await page.route("https://api.example.test/v1/messages", async (route) => {
+      calls += 1;
+      const headers = route.request().headers();
+      expect(headers["x-api-key"]).toBe("sk-browser-ui-claude-test");
+      expect(headers["anthropic-version"]).toBe("2023-06-01");
+      expect(headers.authorization).toBeUndefined();
+      expect(route.request().postDataJSON()).toEqual({
+        model: "claude-sonnet-4-5", max_tokens: 16,
+        messages: [{ role: "user", content: "Reply OK." }],
+      });
+      await route.fulfill({ json: {} });
+    });
+    await page.goto("https://api.example.test/allow-ip");
+    const card = page.locator('[data-api-format="anthropic"]');
+    await expect(card.getByText("Claude / Anthropic Messages format", { exact: true })).toBeVisible();
+    await expect(card.locator(".secret-format")).toContainText("/v1/messages");
+    await expect(card.locator(".secret-format")).not.toContainText("sk-browser-ui-claude-test");
+    const copied = await card.locator(".secret-format + button").getAttribute("data-copy");
+    expect(copied).toContain("x-api-key: sk-browser-ui-claude-test");
+    expect(copied).toContain("anthropic-version: 2023-06-01");
+    expect(copied).toContain('"model":"MODEL_ID"');
+    expect(copied).not.toContain("chat/completions");
+    await card.getByRole("button", { name: "Test chat model claude-sonnet-4-5" }).click();
+    await expect(card.locator(".model-row")).toContainText("Available · HTTP 200");
+    expect(calls).toBe(1);
+  } finally {
+    await seedWorker();
+  }
+});
+
 test("public model explorer lists and tests chat and image models on mobile", async ({ page, context }) => {
   const invites = Array.from({ length: 25 }, (_, index) => makeInvite(index));
   invites[0].apiConfigs = [{
