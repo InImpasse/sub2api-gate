@@ -1230,6 +1230,8 @@ def login(payload):
     except urllib.error.HTTPError as error:
         if error.code == 429:
             raise RuntimeError("sub2api_login_rate_limited") from error
+        if error.code >= 500:
+            raise RuntimeError("sub2api_login_upstream_unavailable") from error
         raise RuntimeError("sub2api_login_rejected") from error
     if not isinstance(payload, dict) or payload.get("code") != 0:
         raise RuntimeError("sub2api_login_rejected")

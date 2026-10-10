@@ -44,6 +44,16 @@ class Sub2ApiCompatibilityTests(unittest.TestCase):
                 SYNC.login(payload)
             writes.assert_not_called()
 
+    def test_login_server_failure_is_not_classified_as_rejected_credentials(self):
+        payload = {"uuid": self.UUID, "username": "alice", "email": "alice@example.test", "loginPassword": "password"}
+        user = [9, "alice", "user", "owner", "alice@example.test", "hash", "active"]
+        for status, expected in ((503, "sub2api_login_upstream_unavailable"), (429, "sub2api_login_rate_limited"), (401, "sub2api_login_rejected")):
+            with mock.patch.object(SYNC, "database_transaction", return_value=nullcontext()), \
+                 mock.patch.object(SYNC, "resolve_invite_user", return_value=user), \
+                 mock.patch.object(SYNC.urllib.request, "urlopen", side_effect=SYNC.urllib.error.HTTPError("http://127.0.0.1/login", status, "fixture", {}, None)), \
+                 self.assertRaisesRegex(RuntimeError, expected):
+                SYNC.login(payload)
+
     def test_payload_identity_prefers_clean_display_name(self):
         uuid = "7c484f74-6d93-43d1-9441-00c7d8d4ab11"
         identity = SYNC.payload_identity({"uuid": uuid, "username": "u7c484f746d9", "name": "Alice Example"})
