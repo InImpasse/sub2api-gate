@@ -760,9 +760,15 @@ function modelExplorerScript() {
       for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
       const data = JSON.parse(new TextDecoder().decode(bytes)).data;
       if (!Array.isArray(data)) throw new Error("invalid_response");
-      return [...new Set(data.map((item) => item?.id).filter((id) =>
-        typeof id === "string" && /^[A-Za-z0-9._:/-]{1,128}$/.test(id)
-      ))].sort().slice(0, 256);
+      const models = data.filter((item) =>
+        typeof item?.id === "string" && /^[A-Za-z0-9._:/-]{1,128}$/.test(item.id)
+      );
+      const created = (model) => Number.isSafeInteger(model.created) && model.created > 0 ? model.created : 0;
+      const version = (id) => (id.match(/[0-9]+/g) || []).join(".");
+      models.sort((a, b) => created(b) - created(a)
+        || version(b.id).localeCompare(version(a.id), "en", { numeric: true })
+        || a.id.localeCompare(b.id, "en", { numeric: true }));
+      return [...new Set(models.map((item) => item.id))].slice(0, 256);
     };
     document.querySelectorAll(".model-explorer").forEach((explorer) => {
       const card = explorer.closest(".api-card");

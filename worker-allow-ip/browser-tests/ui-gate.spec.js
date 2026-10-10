@@ -1444,6 +1444,9 @@ test("public model explorer lists and tests chat and image models on mobile", as
         status: 200, contentType: "application/json",
         body: JSON.stringify({ data: [
           { id: "claude-sonnet-4-5" }, { id: "gpt-image-1" }, { id: "bad model" },
+          { id: "gpt-6.1" }, { id: "gpt-6.0" }, { id: "gpt-6.10" },
+          { id: "claude-opus-4-6" }, { id: "gpt-6.1" },
+          { id: "dated-old", created: 1700000000 }, { id: "dated-new", created: 1800000000 },
         ] }),
       });
     });
@@ -1462,18 +1465,20 @@ test("public model explorer lists and tests chat and image models on mobile", as
     await page.goto("https://api.example.test/allow-ip", { waitUntil: "networkidle" });
     await expect(page.locator("#key-refresh-status")).toContainText("Previously loaded keys are still shown");
     expect(refreshAttempts).toBe(1);
-    await expect(page.locator(".model-status")).toHaveText("2 models available");
-    await expect(page.locator(".model-row")).toHaveCount(2);
+    await expect(page.locator(".model-status")).toHaveText("8 models available");
+    await expect(page.locator(".model-row code")).toHaveText([
+      "dated-new", "dated-old", "gpt-6.10", "gpt-6.1", "gpt-6.0", "claude-opus-4-6", "claude-sonnet-4-5", "gpt-image-1",
+    ]);
     await page.getByRole("button", { name: "Test chat model claude-sonnet-4-5" }).click();
     await page.getByRole("button", { name: "Test image model gpt-image-1" }).click();
-    await expect(page.locator(".model-row").first()).toContainText("Available · HTTP 200");
+    await expect(page.locator(".model-row").filter({ has: page.getByText("claude-sonnet-4-5", { exact: true }) })).toContainText("Available · HTTP 200");
     await expect(page.locator(".model-row").last()).toContainText("Available · HTTP 200");
     expect(tested.map((item) => item.path)).toEqual(["chat", "image"]);
     expect(tested.map((item) => item.body.model)).toEqual(["claude-sonnet-4-5", "gpt-image-1"]);
     await page.getByRole("button", { name: "Refresh API keys", exact: true }).click();
     await expect(page.locator("#key-refresh-status")).toHaveText("API keys are up to date.");
     await expect(page.locator(".copy-secret")).toHaveValue("sk-browser-ui-refreshed-key");
-    await expect(page.locator(".model-status")).toHaveText("2 models available");
+    await expect(page.locator(".model-status")).toHaveText("8 models available");
     expect(refreshAttempts).toBe(2);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await page.screenshot({ path: path.join(SCREENSHOT_ROOT, "public-model-explorer-320.png"), fullPage: true });
