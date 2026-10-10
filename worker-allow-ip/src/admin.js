@@ -29,6 +29,7 @@ import {
   rateLimitFingerprint,
   revealInviteCredentials,
   sanitizeInviteForTrash,
+  sub2ApiRecoveryPassword,
   timingSafeTextEqual as timingSafeEqual,
   verifyPbkdf2Password,
 } from "./credential-security.js";
@@ -813,7 +814,7 @@ export async function resetInviteSub2ApiPassword(env, uuid) {
   return invite;
 }
 
-export async function loginInviteToSub2Api(env, invite) {
+export async function loginInviteToSub2Api(env, invite, allowRecovery = false) {
   const sync = invite.sub2apiSync || {};
   const username = String(sync.username || "");
   const canonicalUsername = desiredSub2ApiUsername(
@@ -821,17 +822,29 @@ export async function loginInviteToSub2Api(env, invite) {
     invite.uuid,
   );
   const email = String(sync.email || (username ? `${username}@sub2api.local` : ""));
-  const password = String(sync.loginPassword || "");
-  if (!email || !password) {
+  const recoverLoginPassword = allowRecovery && !sync.loginPassword;
+  const password = recoverLoginPassword
+    ? await sub2ApiRecoveryPassword(env.INVITE_ACCESS_HMAC_KEY, invite.uuid)
+    : String(sync.loginPassword || "");
+  if ((!email && !recoverLoginPassword) || !password) {
     throw new Error("Sub2API login is not ready for this UUID");
   }
-  return await callSub2ApiSync(env, "login", {
-    uuid: invite.uuid,
-    username: canonicalUsername,
-    sub2apiUserId: safePositiveIdentifier(sync.userId),
-    email,
-    loginPassword: password,
-  });
+  try {
+    return await callSub2ApiSync(env, "login", {
+      uuid: invite.uuid,
+      username: canonicalUsername,
+      sub2apiUserId: safePositiveIdentifier(sync.userId),
+      email,
+      loginPassword: password,
+      ...(recoverLoginPassword ? { recoverLoginPassword: true } : {}),
+    });
+  } catch (error) {
+    const failure = sub2ApiSyncFailureMetadata(error);
+    if (allowRecovery && !recoverLoginPassword && failure?.code === "upstream_invalid_response" && failure.retryable === false) {
+      return loginInviteToSub2Api(env, { ...invite, sub2apiSync: { ...sync, loginPassword: "" } }, true);
+    }
+    throw error;
+  }
 }
 
 async function handleAdminLogin(form, env, request) {

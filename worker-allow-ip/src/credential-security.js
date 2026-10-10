@@ -64,6 +64,10 @@ export async function accessKeyHmac(secret, accessKey) {
   return hmacHex(secret, `invite-access:${String(accessKey || "")}`);
 }
 
+export async function sub2ApiRecoveryPassword(secret, uuid) {
+  return hmacHex(secret, `sub2api-login-recovery:v1:${uuid}`);
+}
+
 export async function rateLimitFingerprint(secret, scope, value) {
   const normalizedScope = String(scope || "").trim();
   if (!normalizedScope || !/^[a-z0-9_-]{1,64}$/i.test(normalizedScope)) {

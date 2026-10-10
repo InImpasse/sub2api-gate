@@ -1036,7 +1036,7 @@ test("Sub2API bridge verifies the issued session before redirecting", async ({ p
       body: JSON.stringify({ code: 0, data: { id: 11, role: "user" } }),
     });
   });
-  await page.route("**/login", async (route) => {
+  await page.route("**/dashboard", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "text/html; charset=utf-8",
@@ -1093,6 +1093,13 @@ test("Sub2API bridge clears partial auth and exposes a bounded verification requ
     localStorage.getItem("token_expires_at"),
     localStorage.getItem("auth_user"),
   ])).toEqual([null, null, null, null]);
+  await page.route("**/api/v1/auth/me", (route) => route.fulfill({
+    json: { code: 0, data: { id: 999, role: "user" } },
+  }));
+  await page.goto("https://api.example.test/allow-ip/sub2api-login", { waitUntil: "networkidle" });
+  await expect(page.locator("#login-status")).toContainText("could not establish a Sub2API session");
+  expect(page.url()).toContain("/allow-ip/sub2api-login");
+  expect(await page.evaluate(() => localStorage.getItem("auth_token"))).toBeNull();
 });
 
 test("public Turnstile load failure is visible and retryable without shifting the form", async ({ page, context }) => {
@@ -1406,7 +1413,7 @@ test("account spans both key cards on desktop and keys stack on mobile", async (
   }
 });
 
-test("Open Sub2API stays visible for accounts without automatic login credentials", async ({ page, context }) => {
+test("Open Sub2API signs in accounts without stored login credentials", async ({ page, context }) => {
   await context.setExtraHTTPHeaders({ "CF-Connecting-IP": CLIENT_IP });
   await context.addCookies([{
     name: "sub2api_allow_uuid", value: PUBLIC_SESSION_TOKEN,
@@ -1419,8 +1426,11 @@ test("Open Sub2API stays visible for accounts without automatic login credential
     });
     await route.fulfill({ status: response.status, headers: Object.fromEntries(response.headers), body: await response.text() });
   });
-  await page.route("https://api.example.test/login", (route) => route.fulfill({
-    contentType: "text/html", body: "<h1>Sub2API sign in</h1>",
+  await page.route("https://api.example.test/dashboard", (route) => route.fulfill({
+    contentType: "text/html", body: "<h1>Sub2API dashboard</h1>",
+  }));
+  await page.route("**/api/v1/auth/me", (route) => route.fulfill({
+    json: { code: 0, data: { id: 11, role: "user" } },
   }));
   try {
     for (const noAccountMetadata of [false, true]) {
@@ -1430,14 +1440,14 @@ test("Open Sub2API stays visible for accounts without automatic login credential
       await seedWorker(invites);
       await page.goto("https://api.example.test/allow-ip");
       await expect(page.locator("#key-refresh-status")).toHaveText("API keys are up to date.");
-      const entry = page.getByRole("link", { name: "Open Sub2API", exact: true });
+      const entry = page.getByRole("button", { name: "Open Sub2API", exact: true });
       await expect(entry).toBeVisible();
-      await expect(entry).toHaveAttribute("href", "https://api.example.test/login");
-      await expect(page.locator(".account-card")).toContainText("Automatic sign-in is unavailable");
+      await expect(page.locator(".account-card")).toContainText("sign in automatically");
       await page.getByRole("button", { name: "Refresh API keys", exact: true }).click();
       await expect(entry).toBeVisible();
       await entry.click();
-      await expect(page).toHaveURL("https://api.example.test/login");
+      await expect(page).toHaveURL("https://api.example.test/dashboard");
+      expect(await page.evaluate(() => JSON.parse(localStorage.getItem("auth_user")).id)).toBe(11);
     }
   } finally {
     await seedWorker();

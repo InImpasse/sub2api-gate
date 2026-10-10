@@ -3,12 +3,106 @@ import test from "node:test";
 
 import worker, { getCurrentAllowStatus } from "../src/index.js";
 import { protectInviteCredentials } from "../src/credential-security.js";
+import { loginInviteToSub2Api } from "../src/admin.js";
 
 
 const UUID = "7c484f74-6d93-43d1-9441-00c7d8d4ab11";
 const OTHER_UUID = "8d595f85-7e04-44e2-a552-11d8e9c5bc22";
 const AES_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 const HMAC_KEY = "test-only-hmac-key-with-at-least-32-bytes";
+
+test("stale passwords recover once on credential rejection, never on transport or identity failures", async () => {
+  const invite = { uuid: UUID, username: "alice", sub2apiSync: {
+    userId: 17, username: "alice", email: "alice@example.test", loginPassword: "stale-password",
+  } };
+  const env = { INVITE_ACCESS_HMAC_KEY: HMAC_KEY, ALLOWED_HOSTNAMES: "api.example.test",
+    SUB2API_SYNC_URL: "https://api.example.test/_sub2api-sync/provision", SUB2API_SYNC_SECRET: "s".repeat(32) };
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const [code, retryable, recover] of [
+      ["upstream_invalid_response", false, true], ["upstream_invalid_response", true, false],
+      ["invite_identity_mismatch", false, false],
+    ]) {
+      const payloads = [];
+      globalThis.fetch = async (_url, init) => {
+        payloads.push(JSON.parse(init.body));
+        if (payloads.length === 1) return Response.json({ ok: false, action: "login", error: code,
+          retryable, requestId: "test-rejection" }, { status: 502 });
+        return Response.json({ ok: true, action: "login", uuid: UUID,
+          auth: { access_token: "recovered-token", user: { id: 17, role: "user" } } });
+      };
+      if (recover) {
+        assert.equal((await loginInviteToSub2Api(env, invite, true)).auth.user.id, 17);
+        assert.equal(payloads.length, 2);
+        assert.equal(payloads[1].recoverLoginPassword, true);
+        assert.match(payloads[1].loginPassword, /^[a-f0-9]{64}$/);
+      } else {
+        await assert.rejects(loginInviteToSub2Api(env, invite, true));
+        assert.equal(payloads.length, 1);
+      }
+      assert.equal(payloads[0].recoverLoginPassword, undefined);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("missing login credentials recover only on a CSRF-protected session-bound click", async () => {
+  const token = "recovery-session";
+  const sessionKey = `uuid-session:${await sha256Hex(token)}`;
+  const storedInvite = await protectInviteCredentials({
+    uuid: UUID, credentialVersion: 2, accessCredentialVersion: 1, username: "alice",
+    sub2apiSync: { userId: 17, username: "alice", email: "alice@example.test" },
+  }, AES_KEY, HMAC_KEY);
+  const values = new Map([
+    ["invites", JSON.stringify([storedInvite])],
+    [sessionKey, JSON.stringify({ uuid: UUID, csrf: "csrf-token", authenticationMethod: "access_key",
+      accessCredentialVersion: 1, expiresAt: Date.now() + 60_000 })],
+  ]);
+  const env = {
+    INVITE_STORE: memoryKv(values), ALLOWED_HOSTNAMES: "api.example.test",
+    CREDENTIAL_ENCRYPTION_KEY: AES_KEY, INVITE_ACCESS_HMAC_KEY: HMAC_KEY,
+    SUB2API_SYNC_URL: "https://api.example.test/_sub2api-sync/provision", SUB2API_SYNC_SECRET: "s".repeat(32),
+    ACCOUNT_ID: "test", IP_LIST_ID: "test", TURNSTILE_SITE_KEY: "test", TURNSTILE_SECRET_KEY: "test", CLOUDFLARE_API_TOKEN: "test",
+    AUTH_RATE_LIMITER: { getByName: () => ({ consume: async () => ({ allowed: true, retryAfterSeconds: 0, resetAt: Date.now() + 1000 }) }) },
+  };
+  const originalFetch = globalThis.fetch;
+  const payloads = [];
+  globalThis.fetch = async (_url, init) => {
+    payloads.push(JSON.parse(init.body));
+    return Response.json({ ok: true, action: "login", uuid: UUID,
+      auth: { access_token: "recovered-token", user: { id: 17, role: "user" } } });
+  };
+  try {
+    const post = (csrf, cookie = token) => worker.fetch(new Request("https://api.example.test/allow-ip", {
+      method: "POST", headers: { cookie: `sub2api_allow_uuid=${cookie}`, "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ action: "open_sub2api", csrf }),
+    }), env);
+    assert.equal((await post("wrong")).status, 403);
+    assert.equal((await post("csrf-token", "invalid-session")).status, 403);
+    const get = await worker.fetch(new Request("https://api.example.test/allow-ip/sub2api-login", {
+      headers: { cookie: `sub2api_allow_uuid=${token}` },
+    }), env);
+    assert.match(await get.text(), /login unavailable/);
+    assert.equal(payloads.length, 0);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await post("csrf-token");
+      assert.equal(response.status, 200);
+      const body = await response.text();
+      assert.match(body, /recovered-token/);
+      assert.match(body, /verifiedUser.data\?\.id !== 17/);
+      assert.match(body, /window.location.replace\("\/dashboard"\)/);
+      assert.doesNotMatch(body, /loginPassword|recoverLoginPassword/);
+    }
+    assert.equal(payloads[0].recoverLoginPassword, true);
+    assert.match(payloads[0].loginPassword, /^[a-f0-9]{64}$/);
+    assert.equal(payloads[0].loginPassword, payloads[1].loginPassword);
+    assert.equal(payloads[0].sub2apiUserId, 17);
+    assert.equal(payloads[0].uuid, UUID);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 function kvWithRecords(records) {
   const reads = [];

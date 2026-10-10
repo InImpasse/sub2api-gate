@@ -139,7 +139,7 @@ async function handleSubmit(request, env, uuidSession) {
     ), 400);
   }
   const action = String(form.get("action") || "");
-  if (action !== "" && action !== "logout_uuid" && action !== "test_api_key" && action !== "refresh_keys") {
+  if (action !== "" && action !== "logout_uuid" && action !== "test_api_key" && action !== "refresh_keys" && action !== "open_sub2api") {
     return html(renderMessage(
       "Unknown form action",
       "Refresh the page and use one of the available actions.",
@@ -154,6 +154,17 @@ async function handleSubmit(request, env, uuidSession) {
     CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN,
     INVITE_ACCESS_HMAC_KEY: env.INVITE_ACCESS_HMAC_KEY,
   });
+
+  if (action === "open_sub2api") {
+    if (!uuidSession?.invite || !(await timingSafeEqual(String(form.get("csrf") || ""), uuidSession.csrf))) {
+      return html(renderMessage("Invalid request", "Sign in and try again."), 403);
+    }
+    const attemptKey = await keyTestAttemptKey(env, uuidSession.invite.uuid);
+    if (!(await consumeAuthAttempt(env, "keytest", attemptKey))) {
+      return html(renderMessage("Too many sign-in attempts", "Try again later."), 429);
+    }
+    return html(await renderSub2ApiAutoLogin(env, uuidSession.invite, new URL(request.url), true));
+  }
 
   if (action === "logout_uuid") {
     if (uuidSession && !(await timingSafeEqual(String(form.get("csrf") || ""), uuidSession.csrf))) {
@@ -413,7 +424,7 @@ function renderDashboard(env, url, invite, request, notice = "", currentStatus =
         <button id="submit-button" type="submit" disabled>Link current network to this user</button>
       </form>` : ""}
       <div class="api-list">
-        ${renderSub2ApiLogin(invite, url)}
+        ${renderSub2ApiLogin(invite, url, csrf)}
         ${configs.length ? configs.map((config) => renderApiConfig(config, { csrf, uuid: invite.uuid, action: url.pathname, modelExplorer: new URL(config.baseUrl).origin === url.origin && new URL(config.baseUrl).pathname === "/v1" })).join("") : `<p class="lede">No OpenAI API link has been configured for this UUID.</p>`}
       </div>
       <form id="refresh-keys-form" method="post" action="${escapeHtml(url.pathname)}">
@@ -871,34 +882,36 @@ function sub2ApiLoginUrl(sync, requestUrl) {
   return hasSameOrigin(sync.loginUrl, requestUrl) ? sync.loginUrl : new URL("/login", requestUrl).href;
 }
 
-function renderSub2ApiLogin(invite, requestUrl) {
+function renderSub2ApiLogin(invite, requestUrl, csrf = "") {
   const sync = invite.sub2apiSync || {};
   const loginUrl = sub2ApiLoginUrl(sync, requestUrl);
-  const hasLogin = Boolean((sync.email || sync.username) && sync.loginPassword
-    && (!sync.loginUrl || hasSameOrigin(sync.loginUrl, requestUrl)));
 
   return `
     <div class="api-card account-card">
       <strong>Sub2API account</strong>
-      <p class="lede">${hasLogin ? "Open Sub2API and sign in automatically." : "Open the Sub2API sign-in page. Automatic sign-in is unavailable for this account; contact the administrator to restore it."}</p>
-      <a class="ghost-wide" href="${hasLogin ? "/allow-ip/sub2api-login" : escapeHtml(loginUrl)}">Open Sub2API</a>
+      <p class="lede">Open Sub2API and sign in automatically.</p>
+      <form method="post" action="/allow-ip">
+        <input type="hidden" name="action" value="open_sub2api" />
+        <input type="hidden" name="csrf" value="${escapeHtml(csrf)}" />
+        <button class="ghost-wide" type="submit">Open Sub2API</button>
+      </form>
       <div class="copy-line"><code title="${escapeHtml(loginUrl)}">${escapeHtml(loginUrl)}</code><button class="ghost compact copy-value" type="button" data-copy="${escapeHtml(loginUrl)}">Copy URL</button></div>
     </div>
   `;
 }
 
-async function renderSub2ApiAutoLogin(env, invite, requestUrl) {
+async function renderSub2ApiAutoLogin(env, invite, requestUrl, allowRecovery = false) {
   const sync = invite.sub2apiSync || {};
   const username = sync.username || "";
   const email = sync.email || (username ? `${username}@sub2api.local` : "");
   const password = sync.loginPassword || "";
   const loginUrl = sub2ApiLoginUrl(sync, requestUrl);
-  if (!email || !password || (sync.loginUrl && !hasSameOrigin(sync.loginUrl, requestUrl))) {
+  if ((!allowRecovery && (!email || !password)) || (sync.loginUrl && !hasSameOrigin(sync.loginUrl, requestUrl))) {
     return renderMessage("Sub2API login unavailable", "This UUID is not ready for direct Sub2API login. Contact the administrator to refresh this account.");
   }
   let auth;
   try {
-    const result = await loginInviteToSub2Api(env, invite);
+    const result = await loginInviteToSub2Api(env, invite, allowRecovery);
     auth = result.auth || {};
   } catch (error) {
     const failure = sub2ApiSyncFailureMetadata(error);
@@ -962,7 +975,11 @@ async function renderSub2ApiAutoLogin(env, invite, requestUrl) {
             fallback.textContent = "Open Sub2API";
             return;
           }
-          window.location.replace(${jsString(loginUrl)});
+          const verifiedUser = await verification.json();
+          if (verifiedUser.code !== 0 || verifiedUser.data?.id !== ${auth.user.id}) {
+            throw new Error("Sub2API session identity mismatch");
+          }
+          window.location.replace("/dashboard");
         } catch (error) {
           clearPartialAuth();
           status.setAttribute("role", "alert");

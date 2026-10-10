@@ -103,3 +103,17 @@ must never fall back to `INVITE_STORE` for authentication.
 The AuthState object is a low-volume `/allow-ip` coordination boundary. It is
 not referenced by Nginx or the `/v1/*` request path and cannot add Sub2API API
 latency.
+
+## Automatic Sub2API sign-in
+
+Open Sub2API submits a session-bound, CSRF-protected POST. Existing recoverable
+passwords use the normal login action. For accounts without a usable
+password, the signed sync login action restores only the owned active user's
+password, leaving balance, API keys, groups and subscriptions unchanged. The
+recovery password uses a separate HMAC domain and is stable across retries;
+neither it nor its hash is rendered. This replaces any unavailable manual
+password for that account. The browser verifies the issued session's user ID
+before opening `/dashboard` and clears partial authentication on failure.
+
+Deploy the compatible sync service through its private-TTY canary gates before
+publishing this Worker; an older sync service cannot recover missing passwords.
