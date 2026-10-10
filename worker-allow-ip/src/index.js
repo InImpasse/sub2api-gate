@@ -1800,4 +1800,5 @@ export function jsString(value) {
 export const __test = Object.freeze({
   html,
   renderTrustedHtml,
+  renderApiConfig,
 });
